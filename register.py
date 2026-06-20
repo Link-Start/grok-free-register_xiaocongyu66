@@ -96,6 +96,10 @@ P_BATCH_MAX     = max(1, _env_int("P_BATCH_MAX", 4))
 P_SEND_CAP      = _env_int("P_SEND_CAP", 0)           # >0=显式限制并发 P 发送页面;0=不额外建模
 PAGE_GOTO_WAIT_UNTIL = os.environ.get("PAGE_GOTO_WAIT_UNTIL", "domcontentloaded").strip() or "domcontentloaded"
 PAGE_POST_WAIT_MS = _env_int("PAGE_POST_WAIT_MS", 500)
+PAGE_BLOCK_STATIC_ASSETS = (
+    os.environ.get("PAGE_BLOCK_STATIC_ASSETS", "0").strip().lower()
+    in ("1", "true", "yes")
+)
 
 SITE_KEY = None
 ACTION_ID = None
@@ -340,10 +344,24 @@ async def grpc_create_code(page, email):
 
 
 async def _prepare_signup_page(page, *, redirect=True, timeout=30000):
+    if PAGE_BLOCK_STATIC_ASSETS:
+        await page.route("**/*", _route_static_asset_filter)
     url = f'{SITE_URL}/sign-up?redirect=grok-com' if redirect else f'{SITE_URL}/sign-up'
     await page.goto(url, timeout=timeout, wait_until=PAGE_GOTO_WAIT_UNTIL)
     if PAGE_POST_WAIT_MS > 0:
         await page.wait_for_timeout(PAGE_POST_WAIT_MS)
+
+
+async def _route_static_asset_filter(route):
+    req = route.request
+    if (
+        req.resource_type in ("image", "font", "media", "stylesheet")
+        or "/_next/static/" in req.url
+        or "analytics" in req.url
+    ):
+        await route.abort()
+        return
+    await route.continue_()
 
 
 async def grpc_verify_code(page, email, code):

@@ -30,6 +30,7 @@ class FakePage:
         self.goto_calls = []
         self.waits = []
         self.evaluations = []
+        self.route_calls = []
 
     async def set_viewport_size(self, size):
         self.viewport = size
@@ -55,6 +56,9 @@ class FakePage:
     async def close(self):
         self.closed = True
         pass
+
+    async def route(self, pattern, handler):
+        self.route_calls.append({"pattern": pattern, "handler": handler})
 
 
 class FakeContext:
@@ -693,6 +697,23 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(page.goto_calls[-1]["wait_until"], "domcontentloaded")
         self.assertEqual(page.waits[-1], 500)
+
+    async def test_prepare_signup_page_can_block_static_assets(self):
+        page = FakePage()
+
+        old_block_assets = getattr(register, "PAGE_BLOCK_STATIC_ASSETS", None)
+        try:
+            register.PAGE_BLOCK_STATIC_ASSETS = True
+
+            await register._prepare_signup_page(page, redirect=True)
+        finally:
+            if old_block_assets is None:
+                delattr(register, "PAGE_BLOCK_STATIC_ASSETS")
+            else:
+                register.PAGE_BLOCK_STATIC_ASSETS = old_block_assets
+
+        self.assertEqual(len(page.route_calls), 1)
+        self.assertEqual(page.route_calls[0]["pattern"], "**/*")
 
     async def test_default_solver_and_page_latency_profile_matches_accepted_optimization(self):
         self.assertEqual(register.SOLVER_INITIAL_WAIT_MS, 500)
