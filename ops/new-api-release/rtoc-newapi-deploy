@@ -307,9 +307,12 @@ start_slot() {
 
 verify_image() {
     local image="$1"
-    local expected_id="$2"
+    local expected_digest="$2"
     local expected_revision="$3"
-    local actual_id actual_revision platform
+    local actual_id actual_revision platform image_digest
+    image_digest="${image##*@}"
+    [[ "${expected_digest}" = "${image_digest}" ]] \
+        || die "candidate image digest does not match immutable image reference"
     actual_id="$("${DOCKER}" image inspect "${image}" --format '{{.Id}}')"
     actual_revision="$(
         "${DOCKER}" image inspect "${image}" \
@@ -318,12 +321,12 @@ verify_image() {
     platform="$(
         "${DOCKER}" image inspect "${image}" --format '{{.Os}}/{{.Architecture}}'
     )"
-    [[ "${actual_id}" = "${expected_id}" ]] \
-        || die "candidate image ID does not match expected ID"
+    validate_image_id "${actual_id}"
     [[ "${actual_revision}" = "${expected_revision}" ]] \
         || die "candidate revision label does not match expected revision"
     [[ "${platform}" = "linux/amd64" ]] \
         || die "candidate platform must be linux/amd64"
+    printf '%s\n' "${actual_id}"
 }
 
 record_evidence() {
@@ -388,11 +391,11 @@ show_status() {
 
 prepare_release() {
     local image="$1"
-    local expected_id="$2"
+    local expected_digest="$2"
     local revision="$3"
     local release="$4"
     validate_candidate_image "${image}"
-    validate_image_id "${expected_id}"
+    validate_image_id "${expected_digest}"
     validate_revision "${revision}"
     validate_release "${release}"
 
@@ -411,7 +414,7 @@ prepare_release() {
         load_prepared
         if [[ "${PREPARED_RELEASE}" = "${release}" \
             && "${PREPARED_IMAGE}" = "${image}" \
-            && "$(container_image_id "${PREPARED_SLOT}")" = "${expected_id}" ]]; then
+            && "$(container_image_id "${PREPARED_SLOT}")" = "${PREPARED_IMAGE_ID}" ]]; then
             "${JQ}" -n \
                 --arg release "${release}" \
                 --arg prepared_slot "${PREPARED_SLOT}" \
@@ -423,7 +426,8 @@ prepare_release() {
     fi
 
     "${DOCKER}" pull "${image}" >/dev/null
-    verify_image "${image}" "${expected_id}" "${revision}"
+    local actual_image_id
+    actual_image_id="$(verify_image "${image}" "${expected_digest}" "${revision}")"
 
     old_image="$(container_image_ref "${inactive}")"
     mkdir -p "${STATE_DIR}"
@@ -433,7 +437,7 @@ prepare_release() {
     if ! {
         set_compose_service_image "${service}" "${image}"
         start_slot "${inactive}" >/dev/null
-        [[ "$(container_image_id "${inactive}")" = "${expected_id}" ]]
+        [[ "$(container_image_id "${inactive}")" = "${actual_image_id}" ]]
         [[ "$(container_revision "${inactive}")" = "${revision}" ]]
         wait_slot "${inactive}"
         [[ "$(active_slot_from_status "$(runtime_status)")" = "${active}" ]]
@@ -448,7 +452,7 @@ prepare_release() {
     write_state_file "${PREPARED_FILE}" \
         PREPARED_SLOT "${inactive}" \
         PREPARED_IMAGE "${image}" \
-        PREPARED_IMAGE_ID "${expected_id}" \
+        PREPARED_IMAGE_ID "${actual_image_id}" \
         PREPARED_REVISION "${revision}" \
         PREPARED_RELEASE "${release}" \
         SOURCE_ACTIVE_SLOT "${active}" \
@@ -461,7 +465,8 @@ prepare_release() {
         --arg prepared_slot "${inactive}" \
         --arg active_slot "${active}" \
         --arg image "${image}" \
-        --arg image_id "${expected_id}" \
+        --arg image_digest "${expected_digest}" \
+        --arg image_id "${actual_image_id}" \
         '{
             ok:true,
             operation:"prepare",
@@ -469,6 +474,7 @@ prepare_release() {
             active_slot:$active_slot,
             prepared_slot:$prepared_slot,
             image:$image,
+            image_digest:$image_digest,
             image_id:$image_id
         }'
 }

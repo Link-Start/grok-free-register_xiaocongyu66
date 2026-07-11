@@ -17,6 +17,12 @@ rtoc-newapi-deploy rollback
 recreates only the current HAProxy weight-zero slot. `cutover` and `rollback`
 restore their original HAProxy weights if stable or public health checks fail.
 
+`IMAGE_ID` is the same top-level `sha256:<digest>` carried by `IMAGE`. The
+controller verifies that stable OCI identity before pulling, then records the
+production Docker engine's local image ID separately. This avoids assuming that
+Docker's `.Id` is always the OCI config digest; containerd-backed image stores
+may expose the top-level index digest instead.
+
 `rtoc-newapi-deploy-dispatch` is intended for an SSH `authorized_keys`
 forced-command entry. It accepts n8n's `cd / ; COMMAND` wrapper and rejects
 arbitrary shell syntax or extra arguments.

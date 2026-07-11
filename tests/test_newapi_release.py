@@ -290,11 +290,10 @@ class NewApiReleaseTest(unittest.TestCase):
 
     def prepare_candidate(self, digest="c", release="release-c"):
         digest_value = digest * 64
-        id_value = {"c": "3", "d": "4"}[digest] * 64
         result = self.run_deploy(
             "prepare",
             f"ghcr.io/hechuyi/new-api-rtoc@sha256:{digest_value}",
-            f"sha256:{id_value}",
+            f"sha256:{digest_value}",
             digest * 40,
             release,
         )
@@ -349,6 +348,8 @@ class NewApiReleaseTest(unittest.TestCase):
     def test_prepare_updates_only_inactive_slot(self):
         payload = self.prepare_candidate()
         self.assertEqual(payload["prepared_slot"], "a")
+        self.assertEqual(payload["image_digest"], "sha256:" + "c" * 64)
+        self.assertEqual(payload["image_id"], "sha256:" + "3" * 64)
         compose = self.compose.read_text()
         self.assertIn(
             "new-api-rtoc@sha256:" + "c" * 64,
