@@ -6,6 +6,16 @@
 set -e
 cd "$(dirname "$0")"
 
+# 同一工作目录只允许一个注册进程，避免多次 nohup 同时写账号和日志。
+if command -v flock >/dev/null 2>&1; then
+    mkdir -p logs
+    exec 9>logs/register.lock
+    if ! flock -n 9; then
+        echo "[!] 注册机已经在运行。"
+        exit 1
+    fi
+fi
+
 # 1) 依赖:没有 venv 就自动安装
 if [ ! -d .venv ]; then
     echo "[*] 首次运行,安装依赖..."

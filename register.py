@@ -107,6 +107,12 @@ REGISTRATION_DIAGNOSTICS = (
 REGISTRATION_RATE_LIMIT_COOLDOWN = max(
     60, _env_int("REGISTRATION_RATE_LIMIT_COOLDOWN", 60)
 )
+REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS = max(
+    1, _env_int("REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS", 60)
+)
+REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL = max(
+    1, _env_int("REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL", 3)
+)
 REGISTER_LOG_MODE = (os.environ.get("REGISTER_LOG_MODE") or "user").strip().lower()
 if REGISTER_LOG_MODE not in {"user", "debug"}:
     REGISTER_LOG_MODE = "user"
@@ -153,12 +159,23 @@ class RegistrationRateLimited(RuntimeError):
 class RegistrationRateLimitCircuit:
     """在检测到注册限流后暂停新的 C 阶段提交。"""
 
-    def __init__(self, cooldown_seconds, clock=time.monotonic):
+    def __init__(
+        self,
+        cooldown_seconds,
+        recovery_seconds=60,
+        recovery_interval=3,
+        clock=time.monotonic,
+    ):
         self.cooldown_seconds = cooldown_seconds
+        self.recovery_seconds = recovery_seconds
+        self.recovery_interval = recovery_interval
         self._clock = clock
         self._blocked_until = 0.0
         self._tripped_at = None
         self._probe_active = False
+        self._probe_token = None
+        self._recovering_until = 0.0
+        self._next_recovery_submit = 0.0
 
     def remaining_seconds(self):
         return max(0, int(self._blocked_until - self._clock() + 0.999))
@@ -167,47 +184,103 @@ class RegistrationRateLimitCircuit:
         return self.remaining_seconds() > 0
 
     def trip(self):
-        was_open = self.is_open()
-        if not was_open:
+        starts_new_window = not self.is_open()
+        if self._tripped_at is None:
             self._tripped_at = self._clock()
-            self._probe_active = False
+        self._recovering_until = 0.0
+        self._next_recovery_submit = 0.0
+        self._probe_active = False
+        self._probe_token = None
         self._blocked_until = max(
             self._blocked_until,
             self._clock() + self.cooldown_seconds,
         )
-        return not was_open
+        return starts_new_window
 
     async def wait(self):
-        waited = False
-        while self.is_open() or (self._tripped_at is not None and self._probe_active):
+        while True:
             if self.is_open():
-                waited = True
                 await asyncio.sleep(min(self.remaining_seconds(), 5))
                 continue
+            if self._tripped_at is None:
+                if not self._recovering_until:
+                    return False
+                if self._probe_active:
+                    await asyncio.sleep(0.2)
+                    continue
+                if self._clock() >= self._recovering_until:
+                    self._recovering_until = 0.0
+                    self._next_recovery_submit = 0.0
+                    return False
+                recovery_wait = self._next_recovery_submit - self._clock()
+                if recovery_wait > 0:
+                    await asyncio.sleep(min(recovery_wait, 0.5))
+                    continue
             if not self._probe_active:
-                break
+                self._probe_active = True
+                self._probe_token = object()
+                return self._probe_token
             await asyncio.sleep(0.2)
-        if self._tripped_at is not None and not self._probe_active:
-            self._probe_active = True
-            return True
-        return waited
 
-    def consume_recovery_seconds(self):
+    def can_submit(self, probe_token=False):
+        """仅允许正常态任务或当前恢复探针发起注册提交。"""
+        if self._tripped_at is None and not self._recovering_until:
+            return True
+        return (
+            probe_token is not False
+            and probe_token is self._probe_token
+            and not self.is_open()
+        )
+
+    def consume_recovery_seconds(self, probe_token=None):
         if self._tripped_at is None:
+            self.complete_recovery_submission(probe_token)
+            return None
+        if probe_token is not None and probe_token is not self._probe_token:
             return None
         elapsed = self._clock() - self._tripped_at
         self._tripped_at = None
         self._blocked_until = 0.0
         self._probe_active = False
+        self._probe_token = None
+        self._recovering_until = self._clock() + self.recovery_seconds
+        self._next_recovery_submit = self._clock() + self.recovery_interval
         return elapsed
 
-    def release_probe(self):
-        if self._tripped_at is not None:
+    def complete_recovery_submission(self, probe_token):
+        """完成恢复期内的一次成功提交，并按固定节奏放行下一项。"""
+        if probe_token is not self._probe_token or not self._recovering_until:
+            return False
+        self._probe_active = False
+        self._probe_token = None
+        self._next_recovery_submit = self._clock() + self.recovery_interval
+        return True
+
+    def release_probe(self, probe_token):
+        """提交前资源已失效时让出探针，不额外增加冷却窗口。"""
+        if probe_token is self._probe_token:
             self._probe_active = False
+            self._probe_token = None
+
+    def defer_probe(self, probe_token):
+        """真正的探针失败后重新进入完整冷却。"""
+        if probe_token is not self._probe_token:
+            return
+        self._probe_active = False
+        self._probe_token = None
+        if self._tripped_at is not None:
+            self._blocked_until = max(
+                self._blocked_until,
+                self._clock() + self.cooldown_seconds,
+            )
+        elif self._recovering_until:
+            self._next_recovery_submit = self._clock() + self.recovery_interval
 
 
 REGISTRATION_RATE_LIMIT_CIRCUIT = RegistrationRateLimitCircuit(
-    REGISTRATION_RATE_LIMIT_COOLDOWN
+    REGISTRATION_RATE_LIMIT_COOLDOWN,
+    recovery_seconds=REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS,
+    recovery_interval=REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL,
 )
 
 def _signup_response_markers(text):
@@ -480,7 +553,26 @@ async def grpc_verify_code(page, email, code):
         log(f'[C] verify rejected grpc_status={s}')
     return s == '0'
 
-async def server_action_register(page, email, password, code, turnstile_token):
+
+def auth_cookie_snapshot(cookies):
+    """保留认证所需 Cookie 的原始作用域；不写入邮箱密码。"""
+    fields = ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
+    return [
+        {field: cookie[field] for field in fields if field in cookie}
+        for cookie in cookies
+        if cookie.get("name") in {"sso", "sso-rw"}
+    ]
+
+
+async def server_action_register(
+    page,
+    email,
+    password,
+    code,
+    turnstile_token,
+    *,
+    include_session=False,
+):
     payload = json.dumps([{
         "emailValidationCode": code,
         "createUserAndSessionRequest": {
@@ -523,6 +615,8 @@ async def server_action_register(page, email, password, code, turnstile_token):
             cookies = await page.context.cookies()
             sso = next((c['value'] for c in cookies if c['name'] == 'sso'), None)
             if sso:
+                if include_session:
+                    return sso, auth_cookie_snapshot(cookies)
                 return sso
         except asyncio.CancelledError:
             raise
@@ -540,6 +634,10 @@ async def server_action_register(page, email, password, code, turnstile_token):
     sso = next((c['value'] for c in cookies if c['name'] == 'sso'), None)
     if REGISTRATION_DIAGNOSTICS and not sso:
         log('[C] signup set-cookie completed without sso cookie')
+    if not sso:
+        return None
+    if include_session:
+        return sso, auth_cookie_snapshot(cookies)
     return sso
 
 # solver 预热页面池:复用已停在 sign-up 的页面,省掉每次 page.goto 的重型 SPA 加载
@@ -1222,23 +1320,25 @@ async def _poll_and_admit_q(
 ):
     """等待单个 Q 返回并入库；每个请求独立释放 pending/inflight。"""
     loop = asyncio.get_event_loop()
-    terminal = False
+    release_reservation = True
     try:
         try:
             code = await asyncio.wait_for(
                 _poll_code_async(loop, request["handle"]),
                 timeout=P_REQUEST_TIMEOUT,
             )
+        except asyncio.CancelledError:
+            # poll_code 仍在运行时取消，底层轮询可能继续持有该请求；此处
+            # 不能提前归还 pending/inflight，否则新请求会超量进入。
+            release_reservation = False
+            raise
         except asyncio.TimeoutError:
             code = None
-            terminal = True
 
         if code is None:
-            terminal = True
             metrics.q_discarded += 1
             return False
 
-        terminal = True
         metrics.q_returned += 1
         returned_at = time.time()
         q_env = None
@@ -1264,10 +1364,11 @@ async def _poll_and_admit_q(
             if q_env is not None and not q_env.released:
                 q_env.discard()
             metrics.q_discarded += 1
-            terminal = True
             return False
     finally:
-        if terminal:
+        if release_reservation:
+            # poll 已终止（含超时/网络/解析异常），或 Q 已返回后任务在
+            # 入库阶段取消：请求所有权已经回到本协程，必须归还许可。
             q_pending_sem.release()
             if q_batch_lease is not None:
                 await q_batch_lease.release_one()
@@ -1557,7 +1658,24 @@ async def p_worker(
         await asyncio.sleep(0.2)
 
 
-async def _consume_pair(browser, physical_sem, pair, metrics, task_id=None):
+def _pair_is_expired(pair, now=None):
+    """检查已 claim 的 T/Q 是否在等待期间失效。"""
+    now = time.time() if now is None else now
+    return any(
+        bool(check(now))
+        for envelope in (pair.t, pair.q)
+        if (check := getattr(envelope, "is_expired", None)) is not None
+    )
+
+
+async def _consume_pair(
+    browser,
+    physical_sem,
+    pair,
+    metrics,
+    task_id=None,
+    recovery_probe=None,
+):
     """执行一次 C 消费。返回 True 表示业务成功,False 表示消费失败。"""
     global success_count
     email = pair.q.value['email']
@@ -1565,29 +1683,59 @@ async def _consume_pair(browser, physical_sem, pair, metrics, task_id=None):
     code = pair.q.value['code']
     token = pair.t.value
 
-    recovery_probe = await REGISTRATION_RATE_LIMIT_CIRCUIT.wait()
+    # c_worker 在单次消费超时开始前完成冷却等待。保留这里的默认路径，
+    # 供直接调用者使用，同时避免把 60 秒冷却计入 60 秒消费超时。
+    if recovery_probe is None:
+        recovery_probe = await REGISTRATION_RATE_LIMIT_CIRCUIT.wait()
 
-    physical_wait_started = time.time()
-    await physical_sem.acquire()
-    physical_hold_started = time.time()
-    metrics.c_physical_count += 1
-    metrics.c_physical_wait_seconds += physical_hold_started - physical_wait_started
-    t0 = time.time()
+    # 直接调用路径也可能在 circuit.wait() 中跨过资源有效期。尚未开始
+    # 注册时只让出探针，不把本地过期误判成一次恢复探测失败。
+    if _pair_is_expired(pair):
+        if recovery_probe:
+            REGISTRATION_RATE_LIMIT_CIRCUIT.release_probe(recovery_probe)
+        return False
+
+    physical_acquired = False
+    physical_hold_started = None
     recovery_completed = False
     try:
+        physical_wait_started = time.time()
+        await physical_sem.acquire()
+        physical_acquired = True
+        physical_hold_started = time.time()
+        metrics.c_physical_count += 1
+        metrics.c_physical_wait_seconds += physical_hold_started - physical_wait_started
+        t0 = time.time()
         try:
             async with _c_page_lease(browser, metrics) as page:
                 sso = None
+                session_cookies = []
                 verify_started = time.time()
                 try:
                     verified = await grpc_verify_code(page, email, code)
                 finally:
                     metrics.c_verify_count += 1
                     metrics.c_verify_seconds += time.time() - verify_started
-                if verified:
+                # 限流可能由另一项并发任务在本任务验证码校验期间触发。
+                # 非当前 probe 不得在 circuit 打开后开始新的注册提交；同时
+                # 避免使用校验过程中刚过期的 T/Q。
+                if (
+                    verified
+                    and not _pair_is_expired(pair)
+                    and REGISTRATION_RATE_LIMIT_CIRCUIT.can_submit(recovery_probe)
+                ):
                     register_started = time.time()
                     try:
-                        sso = await server_action_register(page, email, password, code, token)
+                        registration = await server_action_register(
+                            page,
+                            email,
+                            password,
+                            code,
+                            token,
+                            include_session=True,
+                        )
+                        if registration:
+                            sso, session_cookies = registration
                     finally:
                         metrics.c_register_count += 1
                         metrics.c_register_seconds += time.time() - register_started
@@ -1608,6 +1756,10 @@ async def _consume_pair(browser, physical_sem, pair, metrics, task_id=None):
                     f.write(sso + "\n")
                 with open("keys/accounts.txt", "a") as f:
                     f.write(f"{email}:{password}:{sso}\n")
+                if session_cookies:
+                    with open("keys/auth-sessions.jsonl", "a") as f:
+                        f.write(json.dumps({"email": email, "cookies": session_cookies}, separators=(",", ":")) + "\n")
+                    os.chmod("keys/auth-sessions.jsonl", 0o600)
                 metrics.success_count += 1
                 success_count = metrics.success_count
                 count = metrics.success_count
@@ -1622,7 +1774,9 @@ async def _consume_pair(browser, physical_sem, pair, metrics, task_id=None):
                 )
             )
             if recovery_probe:
-                recovered_after = REGISTRATION_RATE_LIMIT_CIRCUIT.consume_recovery_seconds()
+                recovered_after = REGISTRATION_RATE_LIMIT_CIRCUIT.consume_recovery_seconds(
+                    recovery_probe
+                )
                 recovery_completed = True
                 if recovered_after is not None:
                     log(
@@ -1632,29 +1786,47 @@ async def _consume_pair(browser, physical_sem, pair, metrics, task_id=None):
                     )
             return True
 
-        if recovery_probe:
-            REGISTRATION_RATE_LIMIT_CIRCUIT.release_probe()
         log(format_user_registration_event("failed", task_id=task_id))
         return False
     finally:
         if recovery_probe and not recovery_completed:
-            REGISTRATION_RATE_LIMIT_CIRCUIT.release_probe()
-        metrics.c_physical_hold_seconds += time.time() - physical_hold_started
-        physical_sem.release()
+            REGISTRATION_RATE_LIMIT_CIRCUIT.defer_probe(recovery_probe)
+        if physical_acquired:
+            metrics.c_physical_hold_seconds += time.time() - physical_hold_started
+            physical_sem.release()
 
 
 async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gate=None):
     """C_Worker: claim pair 并执行注册。"""
     while not STOP.is_set():
+        recovery_probe = False
         try:
             async with inventory.claim_pair() as pair:
                 task_id = metrics.pair_claimed
-                log(format_user_registration_event("started", task_id=task_id))
                 if admission_gate is not None:
                     await admission_gate.notify_changed()
+
+                # 必须先 claim，再通过冷却闸门。否则多个 worker 会在限流前
+                # 通过闸门，随后于冷却期陆续拿到 pair 并漏闸。等待发生在
+                # wait_for 之外，因此不计入单次 C 消费超时。
+                recovery_probe = await REGISTRATION_RATE_LIMIT_CIRCUIT.wait()
+                if _pair_is_expired(pair):
+                    if recovery_probe:
+                        REGISTRATION_RATE_LIMIT_CIRCUIT.release_probe(recovery_probe)
+                        recovery_probe = False
+                    continue
+
+                log(format_user_registration_event("started", task_id=task_id))
                 try:
                     ok = await asyncio.wait_for(
-                        _consume_pair(browser, physical_sem, pair, metrics, task_id=task_id),
+                        _consume_pair(
+                            browser,
+                            physical_sem,
+                            pair,
+                            metrics,
+                            task_id=task_id,
+                            recovery_probe=recovery_probe,
+                        ),
                         timeout=C_CONSUME_TIMEOUT,
                     )
                     if ok:
@@ -1670,6 +1842,11 @@ async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gat
         except Exception as e:
             log(f'[C] {wid} err: {str(e)[:60]}')
             metrics.pair_consumed_fail += 1
+        finally:
+            if recovery_probe:
+                # 覆盖等待 pair、获取物理许可或其他边界处的取消/异常。
+                # 已成功或已延期的 probe 在这里会是幂等 no-op。
+                REGISTRATION_RATE_LIMIT_CIRCUIT.defer_probe(recovery_probe)
         await asyncio.sleep(0.2)
 
 
