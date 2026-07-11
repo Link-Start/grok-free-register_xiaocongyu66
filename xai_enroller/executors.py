@@ -2,7 +2,8 @@ import asyncio
 import glob
 import importlib
 import os
-from urllib.parse import urlparse
+from contextlib import suppress
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -33,11 +34,14 @@ class HTTPProbeExecutor:
             return AuthorizationResult(AuthorizationStatus.NEEDS_BROWSER, "challenge")
         if response.status_code in {301, 302, 303, 307, 308}:
             return AuthorizationResult(AuthorizationStatus.NEEDS_INTERACTION, "redirect")
-        return AuthorizationResult(AuthorizationStatus.NEEDS_INTERACTION, "http_probe_inconclusive")
+        return AuthorizationResult(
+            AuthorizationStatus.NEEDS_INTERACTION, "http_probe_inconclusive"
+        )
 
 
 class PlaywrightExecutor:
     ALLOWED_CONTROLS = frozenset({"Authorize", "Allow", "Continue", "Confirm"})
+    CLOSE_TIMEOUT_SECONDS = 5.0
 
     def __init__(self, concurrency=1, playwright_factory=None, executable_path=None):
         self.concurrency = concurrency
@@ -46,6 +50,7 @@ class PlaywrightExecutor:
         self._playwright = None
         self._browser = None
         self._semaphore = asyncio.Semaphore(concurrency)
+        self._lifecycle_lock = asyncio.Lock()
 
     @staticmethod
     def _find_executable_path():
@@ -63,25 +68,50 @@ class PlaywrightExecutor:
         return sorted(candidates)[-1] if candidates else None
 
     async def start(self):
-        if self._browser is not None:
-            return
-        factory = self.playwright_factory
-        if factory is None:
-            module = importlib.import_module("playwright.async_api")
-            factory = module.async_playwright
-        self._playwright = await factory().start()
-        options = {"headless": True}
-        if self.executable_path:
-            options["executable_path"] = self.executable_path
-        self._browser = await self._playwright.chromium.launch(**options)
+        async with self._lifecycle_lock:
+            if self._browser is not None:
+                is_connected = getattr(self._browser, "is_connected", None)
+                if not callable(is_connected) or is_connected():
+                    return
+                await self._close_unlocked()
+            factory = self.playwright_factory
+            if factory is None:
+                module = importlib.import_module("playwright.async_api")
+                factory = module.async_playwright
+            playwright = await factory().start()
+            options = {"headless": True}
+            if self.executable_path:
+                options["executable_path"] = self.executable_path
+            try:
+                browser = await playwright.chromium.launch(**options)
+            except BaseException:
+                with suppress(Exception):
+                    await asyncio.wait_for(
+                        playwright.stop(), timeout=self.CLOSE_TIMEOUT_SECONDS
+                    )
+                raise
+            self._playwright = playwright
+            self._browser = browser
 
     async def close(self):
-        if self._browser is not None:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
+        async with self._lifecycle_lock:
+            await self._close_unlocked()
+
+    async def _close_unlocked(self):
+        browser = self._browser
+        playwright = self._playwright
+        self._browser = None
+        self._playwright = None
+        try:
+            if browser is not None:
+                await asyncio.wait_for(
+                    browser.close(), timeout=self.CLOSE_TIMEOUT_SECONDS
+                )
+        finally:
+            if playwright is not None:
+                await asyncio.wait_for(
+                    playwright.stop(), timeout=self.CLOSE_TIMEOUT_SECONDS
+                )
 
     async def __aenter__(self):
         await self.start()
@@ -90,40 +120,358 @@ class PlaywrightExecutor:
     async def __aexit__(self, exc_type, exc, tb):
         await self.close()
 
+    @staticmethod
+    async def _click_visible_exact(page, names):
+        for name in names:
+            try:
+                button = page.get_by_role("button", name=name, exact=True)
+            except TypeError:
+                button = page.get_by_role("button", name=name)
+            for index in range(await button.count()):
+                candidate = button.nth(index) if hasattr(button, "nth") else button.first
+                is_visible = getattr(candidate, "is_visible", None)
+                if is_visible is None or await is_visible():
+                    await candidate.click()
+                    return True
+        return False
+
+    @staticmethod
+    async def _click_visible_turnstile(page):
+        """Click a visible Turnstile widget using the registration solver motion."""
+        for selector in (
+            ".cf-turnstile",
+            "iframe[src*='challenges.cloudflare.com']",
+            "iframe[src*='turnstile']",
+        ):
+            locator = page.locator(selector).first
+            if not await locator.count() or not await locator.is_visible():
+                continue
+            box = await locator.bounding_box()
+            if not box:
+                continue
+            x = box["x"] + box["width"] / 2
+            y = box["y"] + box["height"] / 2
+            await page.mouse.move(max(0, x - 25), max(0, y - 8))
+            await page.mouse.move(x, y, steps=8)
+            await page.mouse.down()
+            await asyncio.sleep(0.05)
+            await page.mouse.up()
+            return True
+        return False
+
+    @staticmethod
+    def _expanded_cookies(source):
+        allowed = {
+            "name",
+            "value",
+            "url",
+            "domain",
+            "path",
+            "expires",
+            "httpOnly",
+            "secure",
+            "sameSite",
+        }
+        cookies = []
+        for source_cookie in source.cookies:
+            cookie = {
+                key: value for key, value in source_cookie.items() if key in allowed
+            }
+            if cookie.get("domain"):
+                cookie.pop("url", None)
+            elif cookie.get("url"):
+                cookie.pop("domain", None)
+                cookie.pop("path", None)
+            cookies.append(cookie)
+        if not cookies:
+            cookies = [
+                {
+                    "name": "sso",
+                    "value": source.sso_token,
+                    "domain": "accounts.x.ai",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                }
+            ]
+        seen = {
+            (cookie.get("name"), cookie.get("domain"), cookie.get("path", "/"))
+            for cookie in cookies
+        }
+        for cookie in list(cookies) if source.cookies else ():
+            name = cookie.get("name", "")
+            if not name.startswith("sso"):
+                continue
+            key = (name, ".x.ai", cookie.get("path", "/"))
+            if key in seen:
+                continue
+            clone = dict(cookie)
+            clone.pop("url", None)
+            clone["domain"] = ".x.ai"
+            clone.setdefault("path", "/")
+            cookies.append(clone)
+            seen.add(key)
+        return cookies
+
     async def confirm(self, source: SourceRecord, flow: DeviceFlow):
         await self.start()
         async with self._semaphore:
             context = None
             page = None
+            code_submitted = False
+            consent_submitted = False
+            challenge_clicks = 0
             try:
                 context = await self._browser.new_context()
                 page = await context.new_page()
-                await context.add_cookies(
-                    [{
-                        "name": "sso",
-                        "value": source.sso_token,
-                        "domain": "accounts.x.ai",
-                        "path": "/",
-                        "secure": True,
-                        "httpOnly": True,
-                    }]
-                )
+                await context.add_cookies(self._expanded_cookies(source))
                 await page.goto(flow.verification_url, wait_until="domcontentloaded")
-                text = (await page.locator("body").inner_text()).lower()
-                if any(marker in text for marker in ("sign in", "login", "mfa", "captcha", "challenge")):
-                    return AuthorizationResult(AuthorizationStatus.NEEDS_INTERACTION, "blocking_page")
-                for name in self.ALLOWED_CONTROLS:
-                    button = page.get_by_role("button", name=name)
-                    if await button.count():
-                        await button.first.click()
-                        return AuthorizationResult(AuthorizationStatus.AUTHORIZED, "confirmed")
-                return AuthorizationResult(AuthorizationStatus.NEEDS_INTERACTION, "unknown_page")
+                deadline = asyncio.get_running_loop().time() + 35
+                unknown_since = None
+                while asyncio.get_running_loop().time() < deadline:
+                    parsed = urlparse(page.url)
+                    if parsed.scheme != "https" or not parsed.hostname or not (
+                        parsed.hostname == "x.ai"
+                        or parsed.hostname.endswith(".x.ai")
+                    ):
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION, "unsafe_page"
+                        )
+                    query_error = parse_qs(parsed.query).get("error", [None])[0]
+                    text = await page.locator("body").inner_text()
+                    text_lower = text.lower()
+                    page_title = getattr(page, "title", None)
+                    title_lower = (
+                        (await page_title()).lower() if page_title is not None else ""
+                    )
+
+                    if query_error == "rate_limited":
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION, "rate_limited"
+                        )
+                    if query_error:
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION, "device_verify_failed"
+                        )
+                    if any(
+                        marker in text_lower
+                        for marker in ("rate limit", "too many requests", "请求过于频繁")
+                    ):
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION, "rate_limited"
+                        )
+                    if (
+                        "attention required" in title_lower
+                        and "cloudflare" in title_lower
+                    ) or any(
+                        marker in text_lower
+                        for marker in (
+                            "sorry, you have been blocked",
+                            "unable to access x.ai",
+                            "cloudflare ray id",
+                        )
+                    ):
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION,
+                            "challenge_required",
+                        )
+                    if "/oauth2/device/done" in parsed.path or any(
+                        marker in text_lower
+                        for marker in ("device authorized", "设备已授权")
+                    ):
+                        return AuthorizationResult(
+                            AuthorizationStatus.AUTHORIZED, "confirmed"
+                        )
+
+                    cookie_clicked = await self._click_visible_exact(
+                        page,
+                        (
+                            "全部拒绝",
+                            "拒绝全部",
+                            "Reject all",
+                            "Reject All",
+                        ),
+                    )
+                    if cookie_clicked:
+                        unknown_since = None
+                        await page.wait_for_timeout(600)
+                        continue
+
+                    if "/oauth2/device/consent" in parsed.path or any(
+                        marker in text_lower
+                        for marker in ("authorize grok build", "授权 grok build")
+                    ):
+                        if not consent_submitted:
+                            allowed = await self._click_visible_exact(
+                                page, ("允许", "Allow", "Authorize", "Approve")
+                            )
+                            if allowed:
+                                consent_submitted = True
+                                unknown_since = None
+                                await page.wait_for_timeout(800)
+                                continue
+                        else:
+                            await page.wait_for_timeout(500)
+                            continue
+
+                    code_input = page.locator('input[name="user_code"]')
+                    try:
+                        code_input_count = await code_input.count()
+                    except AttributeError:
+                        if await self._click_visible_exact(
+                            page, self.ALLOWED_CONTROLS
+                        ):
+                            return AuthorizationResult(
+                                AuthorizationStatus.AUTHORIZED,
+                                "confirmed",
+                            )
+                        code_input_count = 0
+                    if code_input_count and await code_input.first.is_visible():
+                        if code_submitted:
+                            await page.wait_for_timeout(500)
+                            continue
+                        unknown_since = None
+                        current = await code_input.first.input_value()
+                        if flow.user_code.replace("-", "") not in current.replace("-", ""):
+                            await code_input.first.fill("")
+                            await code_input.first.press_sequentially(flow.user_code)
+                        submit = page.locator(
+                            'button[type="submit"], input[type="submit"]'
+                        )
+                        if not await submit.count():
+                            return AuthorizationResult(
+                                AuthorizationStatus.NEEDS_INTERACTION,
+                                "submit_missing",
+                            )
+                        predicate = lambda response: (
+                            urlparse(response.url).hostname == "auth.x.ai"
+                            and urlparse(response.url).path == "/oauth2/device/verify"
+                        )
+                        async with page.expect_response(
+                            predicate, timeout=15000
+                        ) as response_info:
+                            code_submitted = True
+                            await submit.first.click()
+                            response = await response_info.value
+                        location = urlparse(response.headers.get("location", ""))
+                        error = parse_qs(location.query).get("error", [None])[0]
+                        if error == "rate_limited":
+                            return AuthorizationResult(
+                                AuthorizationStatus.NEEDS_INTERACTION,
+                                "rate_limited",
+                            )
+                        if error:
+                            return AuthorizationResult(
+                                AuthorizationStatus.NEEDS_INTERACTION,
+                                "device_verify_failed",
+                            )
+                        await page.wait_for_timeout(800)
+                        continue
+
+                    if any(
+                        marker in text_lower
+                        for marker in (
+                            "continue with email",
+                            "sign in with email",
+                            "使用邮箱登录",
+                        )
+                    ) or await page.locator('input[type="password"]').count():
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION,
+                            "login_required",
+                        )
+
+                    if any(
+                        marker in text_lower
+                        for marker in (
+                            "captcha",
+                            "verify you are human",
+                            "security challenge",
+                            "turnstile",
+                            "人机验证",
+                            "安全验证",
+                        )
+                    ):
+                        if (
+                            challenge_clicks < 3
+                            and await self._click_visible_turnstile(page)
+                        ):
+                            challenge_clicks += 1
+                            unknown_since = None
+                            await page.wait_for_timeout(1200)
+                            continue
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION,
+                            "challenge_required",
+                        )
+
+                    if any(
+                        marker in text_lower
+                        for marker in (
+                            "multi-factor",
+                            "two-factor",
+                            "authentication code",
+                            "verification code",
+                            "双重验证",
+                            "验证码",
+                        )
+                    ):
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION,
+                            "mfa_required",
+                        )
+
+                    if await self._click_visible_exact(page, self.ALLOWED_CONTROLS):
+                        return AuthorizationResult(
+                            AuthorizationStatus.AUTHORIZED,
+                            "confirmed",
+                        )
+
+                    now = asyncio.get_running_loop().time()
+                    if unknown_since is None:
+                        unknown_since = now
+                    elif now - unknown_since >= 3:
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION, "unknown_page"
+                        )
+
+                    await page.wait_for_timeout(500)
+
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "confirmation_timeout"
+                )
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                return AuthorizationResult(AuthorizationStatus.NEEDS_INTERACTION, "browser_error")
+            except Exception as error:
+                is_timeout = (
+                    error.__class__.__name__ == "TimeoutError"
+                    and error.__class__.__module__.startswith("playwright")
+                )
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION,
+                    "confirmation_timeout" if is_timeout else "browser_error",
+                )
             finally:
-                if page is not None:
-                    await page.close()
-                if context is not None:
-                    await context.close()
+                async def close_session():
+                    if page is not None:
+                        with suppress(Exception):
+                            await asyncio.wait_for(
+                                page.close(), timeout=self.CLOSE_TIMEOUT_SECONDS
+                            )
+                    if context is not None:
+                        with suppress(Exception):
+                            await asyncio.wait_for(
+                                context.close(), timeout=self.CLOSE_TIMEOUT_SECONDS
+                            )
+
+                cleanup = asyncio.create_task(close_session())
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        # Repeated operator cancellation must not strand a browser
+                        # context.  The original cancellation propagates after the
+                        # finally block completes.
+                        continue
+                with suppress(Exception):
+                    cleanup.result()

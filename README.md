@@ -237,30 +237,44 @@ export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
 
 ### 注册机同步模式
 
-注册机和认证服务分开运行时，服务器保留原始的 `keys/accounts.txt`，本地认证服务
-通过 SSH 调用 `scripts/export_registered_sso.py`。导出器只传回 `邮箱<TAB>SSO`，不会
-输出或保存账号密码。
+注册机和认证服务分开运行时，服务器继续写入 `keys/accounts.txt`，本地认证服务通过
+一条常驻 SSH 连接同步已有账号和后续新增账号。认证使用本机 CloakBrowser Chromium，
+成功结果写入 `~/Downloads/grok-free-register-auth/`，文件格式可以直接供 CPA 使用。
 
-先把当前仓库中的导出器同步到注册机同路径的 `scripts/` 目录，然后在本地配置：
+先把导出器同步到注册机的 `scripts/` 目录：
 
 ```bash
-export XAI_AUTH_SERVICE_SSH_HOST=ubuntu@your-server
-export XAI_AUTH_SERVICE_SSH_IDENTITY=/path/to/ssh-key.pem  # 使用 ssh-agent 时可省略
-export XAI_AUTH_SERVICE_REMOTE_ROOT=/opt/grok-free-register
-export XAI_AUTH_SERVICE_SYNC_SEC=30
-export XAI_ENROLLER_SOURCE_SALT=<随机盐>
-export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
+scp scripts/export_registered_sessions.py user@your-server:/opt/grok-free-register/scripts/
 ```
 
-该模式默认使用 Playwright 自动完成已有 SSO 会话的授权确认，并在新账号同步后常驻
-运行：
+然后在本地配置 SSH 连接：
+
+```bash
+export XAI_AUTH_SERVICE_SSH_HOST=user@your-server
+export XAI_AUTH_SERVICE_SSH_IDENTITY=/path/to/ssh-key.pem  # 使用 ssh-agent 时可省略
+export XAI_AUTH_SERVICE_REMOTE_ROOT=/opt/grok-free-register
+```
+
+启动认证服务：
 
 ```bash
 bash auth-service.sh
 ```
 
-终端只在同步到新账号或认证状态变化时输出。`s` 查看一次状态，`p` 暂停，`r` 恢复，
-`c` 取消当前批次，`q` 退出；`Ctrl-C` 同样会退出。
+默认每次认证至少间隔 10 秒；实测该值比无间隔运行有更高的长期平均成功速率。限流后
+每 60 秒只进行一次恢复探测。需要覆盖时使用：
+
+```bash
+export XAI_AUTH_SERVICE_MIN_INTERVAL_SEC=10
+export XAI_AUTH_SERVICE_RETRY_SEC=60
+```
+
+终端只在账号开始、认证结果、限流状态或控制状态变化时输出。`s` 查看状态，`p` 暂停，
+`r` 恢复，`c` 取消当前账号，`q` 退出；`Ctrl-C` 同样会退出。累计结果保存在：
+
+```text
+~/Downloads/grok-free-register-auth/
+```
 
 ### 配置 CPA 导入
 

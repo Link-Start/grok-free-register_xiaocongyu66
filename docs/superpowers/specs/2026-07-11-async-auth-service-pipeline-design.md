@@ -25,6 +25,24 @@ The current live process shows:
 The dominant local bottleneck is therefore orchestration, not CPU, memory,
 credential serialization, or the OAuth browser interaction itself.
 
+The deployed pipeline was then measured with cooldowns and failures included
+in wall-clock time:
+
+| Minimum authorization interval | Effective imports/minute |
+|---:|---:|
+| unrestricted, 15-minute baseline | 2.93 |
+| 9 seconds, one complete steady cycle | 3.31 |
+| 10 seconds, complete process window | 3.37 |
+| 10 seconds, two steady cycles | 3.66 / 3.87 |
+| 12 seconds, one complete cooldown cycle | 2.54 |
+| 30 seconds | 1.03 |
+| 45 seconds | 0.98 |
+
+The selected default is therefore 10 seconds. It does not eliminate upstream
+rate limits; it maximizes completed imports per wall-clock minute among the
+measured settings. Slower settings reduce bursts but lose more throughput than
+they recover from shorter cooldown exposure.
+
 ## Architecture
 
 ```text
@@ -116,11 +134,21 @@ while the persistent service is running. Pre-device transport errors,
 `browser_error`, confirmation timeout, and sink transport failures retry at most
 three times for the same source session with 5, 15, and 30-second delays.
 Login-required, explicit OAuth denial/rejection/expiry, invalid source, and
-unsafe/unknown pages are terminal for that source session. Operator `c` settles
+unsafe pages are terminal for that source session. A Cloudflare challenge or
+unknown transient page receives the same bounded 5/15/30-second retry budget as
+other browser failures. Operator `c` settles
 the active attempt as `cancelled` and places the source at the back of the retry
 queue after 60 seconds; it does not immediately select the same source again.
 
 ## Rate-Limit Gate
+
+Every actual authorization start first passes a process-wide minimum-start
+interval of 10 seconds. The interval is measured between browser confirmation
+starts, not between SSH records, device-flow creation, token polling, or sink
+writes. Enabling pacing also delays the first authorization after process start
+by one complete interval, so restarting the service cannot create an immediate
+extra submission. `XAI_AUTH_SERVICE_MIN_INTERVAL_SEC` may override the measured
+default.
 
 Only an authorization-stage browser result whose reason is `rate_limited` opens
 the process-wide authorization gate. No new browser confirmation is submitted
@@ -160,8 +188,8 @@ identifiers or credentials.
 
 ## Metrics and User Output
 
-Output remains event-driven. A completed result reports total imports, a
-five-minute rolling wall-clock import rate, and eventual account success rate.
+Output remains event-driven. A completed result reports total imports, the
+process-lifetime wall-clock import rate, and eventual account success rate.
 Rate limiting reports the wait and the measured recovery interval. The `s`
 command reports source/prepared/completion queue depths, active stage,
 imported/attempted unique accounts, temporary rate-limit count, five-minute

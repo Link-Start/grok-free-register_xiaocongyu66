@@ -7,9 +7,10 @@ from typing import Optional
 class SourceRecord:
     source_id: str
     sso_token: str
+    cookies: tuple[dict, ...] = ()
 
     def __repr__(self) -> str:
-        return f"SourceRecord(source_id={self.source_id!r})"
+        return "SourceRecord(<redacted>)"
 
 
 @dataclass(frozen=True)
@@ -22,10 +23,7 @@ class DeviceFlow:
     token_endpoint: str = "https://auth.x.ai/oauth2/token"
 
     def __repr__(self) -> str:
-        return (
-            f"DeviceFlow(user_code={self.user_code!r}, "
-            f"verification_url={self.verification_url!r})"
-        )
+        return "DeviceFlow(<redacted>)"
 
 
 @dataclass(frozen=True)
@@ -47,6 +45,9 @@ class OAuthCredential:
 @dataclass(frozen=True)
 class SinkReceipt:
     fingerprint: str
+
+    def __repr__(self) -> str:
+        return "SinkReceipt(<redacted>)"
 
 
 class AuthorizationStatus(str, Enum):
@@ -85,6 +86,42 @@ class JobResult:
 
     def __repr__(self) -> str:
         return (
-            f"JobResult(source_id={self.source_id!r}, status={self.status.value!r}, "
+            f"JobResult(source_id=<redacted>, status={self.status.value!r}, "
             f"reason_code={self.reason_code!r}, attempt_number={self.attempt_number})"
+        )
+
+
+class PipelineState(str, Enum):
+    QUEUED = "queued"
+    PREPARED = "prepared"
+    ACTIVE = "active"
+    RETRY_WAITING = "retry_waiting"
+    IMPORTED = "imported"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class PreparedJob:
+    source: SourceRecord
+    source_fingerprint: str
+    flow: DeviceFlow
+    flow_created_monotonic: float
+    job_id: int
+    attempt_number: int
+
+    def __repr__(self) -> str:
+        return (
+            "PreparedJob(source=<redacted>, flow=<redacted>, "
+            f"attempt_number={self.attempt_number})"
+        )
+
+
+@dataclass(frozen=True)
+class CompletionJob:
+    prepared: PreparedJob
+
+    def __repr__(self) -> str:
+        return (
+            "CompletionJob(source=<redacted>, flow=<redacted>, "
+            f"attempt_number={self.prepared.attempt_number})"
         )

@@ -1,11 +1,57 @@
-"""本地注册账号同步与认证服务的事件驱动核心。"""
+"""Interactive composition for the asynchronous local authentication service."""
 
 import asyncio
 import os
+import secrets
 import shlex
+import sys
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 
 from .models import SourceRecord
+from .remote_stream import parse_session_document
+
+
+DEFAULT_LOCAL_AUTH_DIR = Path.home() / "Downloads" / "grok-free-register-auth"
+
+
+def prepare_local_service_environment(env=None):
+    """Create private local persistence defaults without storing secrets in the repo."""
+    merged = dict(os.environ if env is None else env)
+    destination = Path(
+        merged.get("XAI_ENROLLER_LOCAL_AUTH_DIR", DEFAULT_LOCAL_AUTH_DIR)
+    ).expanduser()
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(destination, 0o700)
+    merged["XAI_ENROLLER_SINK"] = "local"
+    merged["XAI_ENROLLER_LOCAL_AUTH_DIR"] = str(destination)
+    merged.setdefault(
+        "XAI_ENROLLER_LEDGER_PATH", str(destination / "enrollment-ledger.db")
+    )
+    if not merged.get("XAI_ENROLLER_SOURCE_SALT"):
+        salt_file = destination / ".ledger-salt"
+        try:
+            salt = salt_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            salt = secrets.token_hex(32)
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=".ledger-salt.", suffix=".tmp", dir=destination, text=True
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(salt + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_name, salt_file)
+            finally:
+                if os.path.exists(temporary_name):
+                    os.unlink(temporary_name)
+        os.chmod(salt_file, 0o600)
+        merged["XAI_ENROLLER_SOURCE_SALT"] = salt
+    return merged
 
 
 @dataclass(frozen=True)
@@ -13,7 +59,9 @@ class AuthServiceSettings:
     ssh_host: str
     remote_root: str
     identity_file: str | None
-    sync_seconds: int
+    sync_seconds: int = 30
+    retry_seconds: int = 60
+    min_authorization_interval_seconds: float = 10.0
 
     @classmethod
     def from_environ(cls, env=None):
@@ -27,22 +75,39 @@ class AuthServiceSettings:
         identity_file = (env.get("XAI_AUTH_SERVICE_SSH_IDENTITY") or "").strip() or None
         try:
             sync_seconds = int(env.get("XAI_AUTH_SERVICE_SYNC_SEC", "30"))
+            retry_seconds = int(env.get("XAI_AUTH_SERVICE_RETRY_SEC", "60"))
+            min_authorization_interval_seconds = float(
+                env.get("XAI_AUTH_SERVICE_MIN_INTERVAL_SEC", "10")
+            )
         except ValueError as exc:
-            raise ValueError("XAI_AUTH_SERVICE_SYNC_SEC must be an integer") from exc
+            raise ValueError("auth service intervals must be numeric") from exc
         if not 5 <= sync_seconds <= 3600:
             raise ValueError("XAI_AUTH_SERVICE_SYNC_SEC must be between 5 and 3600")
-        return cls(ssh_host, remote_root, identity_file, sync_seconds)
+        if not 30 <= retry_seconds <= 86400:
+            raise ValueError("XAI_AUTH_SERVICE_RETRY_SEC must be between 30 and 86400")
+        if not 0 <= min_authorization_interval_seconds <= 3600:
+            raise ValueError(
+                "XAI_AUTH_SERVICE_MIN_INTERVAL_SEC must be between 0 and 3600"
+            )
+        return cls(
+            ssh_host,
+            remote_root,
+            identity_file,
+            sync_seconds,
+            retry_seconds,
+            min_authorization_interval_seconds,
+        )
 
 
 def parse_registered_accounts(lines):
-    """将注册机的 ``email:password:sso`` 输出转换为认证输入。"""
+    """Parse legacy ``source:discarded-password:sso`` records."""
     seen = set()
     for line_number, line in enumerate(lines, 1):
         raw = line.rstrip("\r\n")
         if not raw:
             continue
         try:
-            source_id, _password, sso_token = raw.rsplit(":", 2)
+            source_id, _discarded_password, sso_token = raw.rsplit(":", 2)
         except ValueError as exc:
             raise ValueError(f"invalid registered account line {line_number}") from exc
         if not source_id or not sso_token or source_id in seen:
@@ -52,7 +117,7 @@ def parse_registered_accounts(lines):
 
 
 def parse_exported_records(lines):
-    """解析远端导出器的 ``email<TAB>sso`` 输出。"""
+    """Parse the historical tab-delimited redacted exporter format."""
     seen = set()
     for line_number, line in enumerate(lines, 1):
         raw = line.rstrip("\r\n")
@@ -68,8 +133,25 @@ def parse_exported_records(lines):
         yield SourceRecord(source_id, sso_token)
 
 
+def parse_exported_sessions(lines):
+    """Parse exact redacted session documents while preserving Cookie scope."""
+    seen = set()
+    for line_number, line in enumerate(lines, 1):
+        raw = line.rstrip("\r\n")
+        if not raw:
+            continue
+        try:
+            record = parse_session_document(raw)
+        except ValueError as exc:
+            raise ValueError(f"invalid registered session line {line_number}") from exc
+        if record.source_id in seen:
+            continue
+        seen.add(record.source_id)
+        yield record
+
+
 class SSHRegisteredSource:
-    """从注册机拉取已经脱敏为邮箱与 SSO 的账户记录。"""
+    """Compatibility facade for the former one-shot account exporter."""
 
     def __init__(
         self,
@@ -105,7 +187,7 @@ class SSHRegisteredSource:
 
 
 class AuthService:
-    """在发现新账号或认证结果变化时才产生事件。"""
+    """Compatibility facade for the former polling enrollment service."""
 
     def __init__(self, source, enroller, emit):
         self.source = source
@@ -124,16 +206,146 @@ class AuthService:
         self.emit(("sync", {"new": len(fresh)}))
         results = await self.enroller.run_records(fresh)
         for result in results:
-            self.emit(("result", {
-                "source_id": result.source_id,
-                "status": result.status.value,
-                "reason": result.reason_code,
-            }))
+            self.emit(
+                (
+                    "result",
+                    {
+                        "source_id": result.source_id,
+                        "status": result.status.value,
+                        "reason": result.reason_code,
+                    },
+                )
+            )
         return results
 
 
+class EventTerminal:
+    """Render only aggregate, classified events; identifiers and credentials stay hidden."""
+
+    @staticmethod
+    def _percentage(value):
+        return f"{100.0 * float(value):.1f}%"
+
+    def emit(self, event):
+        kind, data = event
+        message = None
+        if kind == "service_started":
+            message = (
+                "• service: running; "
+                f"min_interval={data['min_authorization_interval_seconds']:.1f}s"
+            )
+        elif kind == "service_stopped":
+            message = "• service: stopped"
+        elif kind == "source_connected":
+            message = "• source: stream connected"
+        elif kind == "source_disconnected":
+            message = f"⚠ source: {data['reason']}; reconnecting"
+        elif kind == "source_record_rejected":
+            message = "⚠ source: invalid record rejected"
+        elif kind == "rate_limited":
+            message = (
+                "⏸ authentication rate limited; "
+                f"next single probe in {data['wait_seconds']}s"
+            )
+        elif kind == "rate_limit_cleared":
+            message = (
+                "▶ authentication rate limit cleared after "
+                f"{data['elapsed_seconds']}s"
+            )
+        elif kind == "authorization_started":
+            message = (
+                "→ authentication: next task started; "
+                f"task={data['task_number']}; attempt={data['attempt_number']}; "
+                f"queued={data['source_queue']}"
+            )
+        elif kind == "result":
+            if data["status"] == "imported":
+                message = (
+                    "✓ authentication: imported; "
+                    f"total={data['imported_unique']}, "
+                    f"avg_rate={data['lifetime_imports_per_minute']:.2f}/min, "
+                    f"attempt_success={self._percentage(data['attempt_success'])}, "
+                    f"eventual_success={self._percentage(data['eventual_success'])}"
+                )
+            elif data["reason"] == "rate_limited":
+                message = None
+            else:
+                message = (
+                    f"⚠ authentication: {data['status']} ({data['reason']}); "
+                    f"attempt={data['attempt_number']}; "
+                    f"avg_rate={data['lifetime_imports_per_minute']:.2f}/min"
+                )
+        elif kind == "control":
+            message = f"• service: {data['state']}"
+        elif kind == "status":
+            message = (
+                f"• status: {data['state']}; "
+                f"queues={data['source_queue']}/{data['prepared_queue']}/"
+                f"{data['completion_queue']}; active={data['active_stage']}; "
+                f"retry_waiting={data['retry_waiting']}; "
+                f"next_retry={data['next_retry_seconds']:.1f}s; "
+                f"started={data['authorization_starts']}; "
+                f"cooldown={str(data['cooldown']).lower()}; "
+                f"cooldown_remaining={data['cooldown_remaining_seconds']:.1f}s; "
+                f"probe={str(data['probe_in_flight']).lower()}; "
+                f"min_interval={data['min_authorization_interval_seconds']:.1f}s; "
+                f"pace_remaining={data['pacing_remaining_seconds']:.1f}s; "
+                f"imported={data['imported_unique']}; "
+                f"attempted={data['attempted_unique']}; "
+                f"rate_limited={data['rate_limited']}; "
+                f"5m_rate={data['five_minute_imports_per_minute']:.2f}/min; "
+                f"lifetime_rate={data['lifetime_imports_per_minute']:.2f}/min"
+            )
+        elif kind == "pipeline_error":
+            message = (
+                f"⚠ service: {data['stage']} stage stopped ({data['reason']})"
+            )
+        if message is not None:
+            print(message, flush=True)
+
+
+class AuthPipelineRunner:
+    """Map interactive controls onto the persistent pipeline lifecycle."""
+
+    def __init__(self, pipeline, emit, *, interval_seconds=None):
+        self.pipeline = pipeline
+        self.emit = emit
+        self.paused = False
+        self.current_cycle = None
+
+    async def handle_command(self, command):
+        command = command.strip().lower()
+        if command == "p":
+            self.paused = True
+            self.pipeline.pause()
+            self.emit(("control", {"state": "paused"}))
+        elif command == "r":
+            self.paused = False
+            self.pipeline.resume()
+            self.emit(("control", {"state": "running"}))
+        elif command == "s":
+            self.emit(("status", self.pipeline.status()))
+        elif command == "c":
+            cancelled = await self.pipeline.cancel_active()
+            self.emit(
+                ("control", {"state": "cancelling" if cancelled else "idle"})
+            )
+        elif command in {"q", "quit", "exit"}:
+            self.pipeline.request_stop()
+            self.emit(("control", {"state": "stopping"}))
+            return False
+        return True
+
+    async def run(self):
+        self.current_cycle = asyncio.create_task(self.pipeline.run())
+        try:
+            await self.current_cycle
+        finally:
+            self.current_cycle = None
+
+
 class AuthServiceRunner:
-    """认证服务的常驻控制循环；仅在命令或生命周期事件时输出。"""
+    """Compatibility runner for the former polling service API."""
 
     def __init__(self, service, emit, *, interval_seconds):
         self.service = service
@@ -159,7 +371,15 @@ class AuthServiceRunner:
             self.emit(("control", {"state": "running"}))
         elif command == "s":
             active = self.current_cycle is not None and not self.current_cycle.done()
-            self.emit(("status", {"state": "paused" if self.paused else "running", "active": active}))
+            self.emit(
+                (
+                    "status",
+                    {
+                        "state": "paused" if self.paused else "running",
+                        "active": active,
+                    },
+                )
+            )
         elif command == "c":
             if self.current_cycle is not None and not self.current_cycle.done():
                 self.current_cycle.cancel()
@@ -193,117 +413,115 @@ class AuthServiceRunner:
                 break
             self._wake.clear()
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=self.interval_seconds)
+                await asyncio.wait_for(
+                    self._wake.wait(), timeout=self.interval_seconds
+                )
             except TimeoutError:
                 pass
 
 
-class EventTerminal:
-    """将认证生命周期事件输出为简洁、无敏感凭证的终端日志。"""
-
-    def emit(self, event):
-        kind, data = event
-        if kind == "sync":
-            message = f"✓ sync: found {data['new']} new registered account(s)"
-        elif kind == "device_flow":
-            message = (
-                f"🔑 device flow: {data['source_id']} code={data['user_code']} "
-                f"url={data['verification_url']}"
-            )
-        elif kind == "result":
-            symbol = "✓" if data["status"] == "imported" else "⚠"
-            message = (
-                f"{symbol} {data['source_id']}: {data['status']} "
-                f"({data['reason']})"
-            )
-        elif kind == "control":
-            message = f"• service: {data['state']}"
-        elif kind == "status":
-            message = f"• status: {data['state']}; active={str(data['active']).lower()}"
-        else:
-            message = "⚠ sync: failed"
-        print(message, flush=True)
-
-
 async def _run_interactive(runner):
-    print("commands: s=status, p=pause, r=resume, c=cancel batch, q=quit", flush=True)
+    print(
+        "commands: s=status, p=pause, r=resume, c=cancel active, q=quit",
+        flush=True,
+    )
+    loop = asyncio.get_running_loop()
+    commands = asyncio.Queue()
+    stdin_fd = sys.stdin.fileno()
+
+    def stdin_ready():
+        line = sys.stdin.readline()
+        if line == "":
+            loop.remove_reader(stdin_fd)
+            commands.put_nowait(None)
+            return
+        commands.put_nowait(line)
+
+    loop.add_reader(stdin_fd, stdin_ready)
     worker = asyncio.create_task(runner.run())
     try:
-        while True:
-            command = await asyncio.to_thread(input)
-            if not command:
+        while not worker.done():
+            command_task = asyncio.create_task(commands.get())
+            done, _pending = await asyncio.wait(
+                {worker, command_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if worker in done:
+                command_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await command_task
+                await worker
+                break
+            command = command_task.result()
+            if command is None:
                 command = "q"
             if not await runner.handle_command(command):
                 break
+    except asyncio.CancelledError:
+        runner.pipeline.request_stop()
+        raise
     finally:
-        await runner.handle_command("q")
-        await worker
+        loop.remove_reader(stdin_fd)
+        runner.pipeline.request_stop()
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 async def main_async():
     import httpx
 
+    from .auth_pipeline import AuthPipeline
     from .config import Settings
-    from .coordinator import EnrollmentCoordinator
-    from .executors import HTTPProbeExecutor, PlaywrightExecutor
+    from .executors import PlaywrightExecutor
+    from .ledger import Ledger
     from .protocol import XAIProfile, XAIProtocol
-    from .sinks import CPAAuthFileSink
+    from .remote_stream import RemoteSessionStream
+    from .sinks import LocalAuthFileSink
 
     service_settings = AuthServiceSettings.from_environ()
-    merged = dict(os.environ)
+    merged = prepare_local_service_environment()
     merged["XAI_ENROLLER_SOURCE_KIND"] = "remote"
-    merged.setdefault("XAI_ENROLLER_AUTH_EXECUTOR", "playwright")
+    merged["XAI_ENROLLER_AUTH_EXECUTOR"] = "playwright"
+    merged["XAI_ENROLLER_CONCURRENCY"] = "1"
     settings = Settings.from_environ(merged)
     terminal = EventTerminal()
-    source = SSHRegisteredSource(
-        service_settings.ssh_host,
-        remote_root=service_settings.remote_root,
-        identity_file=service_settings.identity_file,
-    )
     client = httpx.AsyncClient()
-    sink_client = None
+    pipeline = None
     try:
+        source = RemoteSessionStream(
+            service_settings.ssh_host,
+            remote_root=service_settings.remote_root,
+            identity_file=service_settings.identity_file,
+            event_callback=lambda kind, data: terminal.emit((kind, data)),
+        )
         protocol = XAIProtocol(
             client,
             XAIProfile.default(),
             default_poll_interval=settings.poll_interval,
         )
-        executor = (
-            HTTPProbeExecutor(client)
-            if settings.executor == "http"
-            else PlaywrightExecutor(settings.concurrency)
+        executor = PlaywrightExecutor(concurrency=1)
+        sink = LocalAuthFileSink(
+            settings.local_auth_dir,
+            name_secret=settings.source_salt,
         )
-        sink = None
-        if settings.sink == "cpa":
-            sink_client = httpx.AsyncClient()
-            sink = CPAAuthFileSink(
-                settings.cpa_base_url,
-                settings.cpa_management_secret,
-                sink_client,
-            )
-        coordinator = EnrollmentCoordinator(
-            source=None,
+        ledger = Ledger(settings.ledger_path, settings.source_salt)
+        pipeline = AuthPipeline(
+            source=source,
             protocol=protocol,
             executor=executor,
             sink=sink,
-            ledger_path=settings.ledger_path,
-            ledger_salt=settings.source_salt,
-            concurrency=settings.concurrency,
+            ledger=ledger,
             timeout=settings.timeout_sec,
-            retry_attempts=settings.retry_attempts,
+            min_authorization_interval=(
+                service_settings.min_authorization_interval_seconds
+            ),
             event_callback=lambda kind, data: terminal.emit((kind, data)),
         )
-        service = AuthService(source, coordinator, terminal.emit)
-        runner = AuthServiceRunner(
-            service,
-            terminal.emit,
-            interval_seconds=service_settings.sync_seconds,
-        )
+        pipeline.rate_gate.COOLDOWN_SECONDS = float(service_settings.retry_seconds)
+        runner = AuthPipelineRunner(pipeline, terminal.emit)
         await _run_interactive(runner)
     finally:
+        if pipeline is not None:
+            pipeline.request_stop()
         await client.aclose()
-        if sink_client is not None:
-            await sink_client.aclose()
 
 
 def main():

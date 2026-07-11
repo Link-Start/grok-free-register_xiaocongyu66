@@ -35,6 +35,7 @@ class Settings:
     sink: str | None = None
     cpa_base_url: str | None = None
     cpa_management_secret: str | None = None
+    local_auth_dir: Path | None = None
 
     @classmethod
     def from_environ(cls, env=None):
@@ -71,10 +72,15 @@ class Settings:
             raise ValueError("poll interval must be positive")
         if executor not in {"http", "playwright"}:
             raise ValueError("executor must be http or playwright")
-        if sink not in {None, "cpa"}:
-            raise ValueError("sink must be cpa")
+        if sink not in {None, "cpa", "local"}:
+            raise ValueError("sink must be cpa or local")
         cpa_url = env.get("XAI_ENROLLER_CPA_BASE_URL") or None
         cpa_secret = env.get("XAI_ENROLLER_CPA_MANAGEMENT_SECRET") or None
+        local_auth_dir = (
+            Path(env["XAI_ENROLLER_LOCAL_AUTH_DIR"]).expanduser()
+            if env.get("XAI_ENROLLER_LOCAL_AUTH_DIR")
+            else None
+        )
         if sink == "cpa":
             if not cpa_url or not cpa_secret:
                 raise ValueError("CPA base URL and management secret are required")
@@ -82,6 +88,8 @@ class Settings:
             is_private = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
             if parsed.scheme != "https" and not is_private:
                 raise ValueError("CPA base URL must use HTTPS")
+        if sink == "local" and local_auth_dir is None:
+            raise ValueError("local auth directory is required")
         return cls(
             source_kind=source_kind,
             source_file=source_file,
@@ -97,6 +105,7 @@ class Settings:
             sink=sink,
             cpa_base_url=cpa_url,
             cpa_management_secret=cpa_secret,
+            local_auth_dir=local_auth_dir,
         )
 
     def redacted_dict(self):
@@ -113,6 +122,7 @@ class Settings:
             "executor": self.executor,
             "sink": self.sink,
             "cpa_base_url": self.cpa_base_url,
+            "local_auth_dir": str(self.local_auth_dir) if self.local_auth_dir else None,
         }
 
 

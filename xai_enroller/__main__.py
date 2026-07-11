@@ -78,8 +78,8 @@ async def main_async(args=None):
             retry_attempts=settings.retry_attempts,
         )
         results = await coordinator.run(settings.target)
-        for result in results:
-            print(f"{result.source_id}: {result.status.value} ({result.reason_code})")
+        for index, result in enumerate(results, 1):
+            print(f"job {index}: {result.status.value} ({result.reason_code})")
     finally:
         await client.aclose()
         if sink_client:
