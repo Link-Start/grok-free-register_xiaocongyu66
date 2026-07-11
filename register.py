@@ -104,6 +104,9 @@ REGISTRATION_DIAGNOSTICS = (
     os.environ.get("REGISTRATION_DIAGNOSTICS", "0").strip().lower()
     in ("1", "true", "yes")
 )
+REGISTRATION_RATE_LIMIT_COOLDOWN = max(
+    60, _env_int("REGISTRATION_RATE_LIMIT_COOLDOWN", 900)
+)
 
 SITE_KEY = None
 ACTION_ID = None
@@ -120,6 +123,42 @@ POLL_EXECUTOR = ThreadPoolExecutor(max_workers=32)
 
 def log(msg): print(msg, flush=True)
 def rand_str(n=15): return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+
+class RegistrationRateLimited(RuntimeError):
+    """注册提交被目标站点的限流页替代。"""
+
+
+class RegistrationRateLimitCircuit:
+    """在检测到注册限流后暂停新的 C 阶段提交。"""
+
+    def __init__(self, cooldown_seconds, clock=time.monotonic):
+        self.cooldown_seconds = cooldown_seconds
+        self._clock = clock
+        self._blocked_until = 0.0
+
+    def remaining_seconds(self):
+        return max(0, int(self._blocked_until - self._clock() + 0.999))
+
+    def is_open(self):
+        return self.remaining_seconds() > 0
+
+    def trip(self):
+        was_open = self.is_open()
+        self._blocked_until = max(
+            self._blocked_until,
+            self._clock() + self.cooldown_seconds,
+        )
+        return not was_open
+
+    async def wait(self):
+        while self.is_open():
+            await asyncio.sleep(min(self.remaining_seconds(), 5))
+
+
+REGISTRATION_RATE_LIMIT_CIRCUIT = RegistrationRateLimitCircuit(
+    REGISTRATION_RATE_LIMIT_COOLDOWN
+)
 
 def _signup_response_markers(text):
     """将失败响应归类为固定标签，诊断时不输出任何服务端正文。"""
@@ -417,12 +456,15 @@ async def server_action_register(page, email, password, code, turnstile_token):
     if not m:
         m = re.search(r'(https://[^" \s\\]+set-cookie\?q=[A-Za-z0-9_.\-]+)', text)
     if not m:
+        markers = _signup_response_markers(result_text)
         if diagnostic is not None:
             log(
                 f"[C] signup no session http_status={diagnostic['status']} "
                 f"retry_after={diagnostic['retryAfter'] or '-'} response_bytes={len(result_text)} "
-                f"markers={_signup_response_markers(result_text)}"
+                f"markers={markers}"
             )
+        if "rate_limited" in markers:
+            raise RegistrationRateLimited("signup_rate_limited")
         return None
     url = m.group(1)
     if C_SET_COOKIE_VIA_REQUEST:
@@ -1473,6 +1515,8 @@ async def _consume_pair(browser, physical_sem, pair, metrics):
     code = pair.q.value['code']
     token = pair.t.value
 
+    await REGISTRATION_RATE_LIMIT_CIRCUIT.wait()
+
     physical_wait_started = time.time()
     await physical_sem.acquire()
     physical_hold_started = time.time()
@@ -1480,21 +1524,30 @@ async def _consume_pair(browser, physical_sem, pair, metrics):
     metrics.c_physical_wait_seconds += physical_hold_started - physical_wait_started
     t0 = time.time()
     try:
-        async with _c_page_lease(browser, metrics) as page:
-            sso = None
-            verify_started = time.time()
-            try:
-                verified = await grpc_verify_code(page, email, code)
-            finally:
-                metrics.c_verify_count += 1
-                metrics.c_verify_seconds += time.time() - verify_started
-            if verified:
-                register_started = time.time()
+        try:
+            async with _c_page_lease(browser, metrics) as page:
+                sso = None
+                verify_started = time.time()
                 try:
-                    sso = await server_action_register(page, email, password, code, token)
+                    verified = await grpc_verify_code(page, email, code)
                 finally:
-                    metrics.c_register_count += 1
-                    metrics.c_register_seconds += time.time() - register_started
+                    metrics.c_verify_count += 1
+                    metrics.c_verify_seconds += time.time() - verify_started
+                if verified:
+                    register_started = time.time()
+                    try:
+                        sso = await server_action_register(page, email, password, code, token)
+                    finally:
+                        metrics.c_register_count += 1
+                        metrics.c_register_seconds += time.time() - register_started
+        except RegistrationRateLimited:
+            if REGISTRATION_RATE_LIMIT_CIRCUIT.trip():
+                log(
+                    "[C] signup rate limited; pausing new registration submissions "
+                    f"for {REGISTRATION_RATE_LIMIT_CIRCUIT.remaining_seconds()}s"
+                )
+            log(f'[✗] {email} register rate limited')
+            return False
 
         if sso:
             elapsed = time.time() - t0

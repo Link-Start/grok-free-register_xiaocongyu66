@@ -392,6 +392,35 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [{"url": "https://auth.grokipedia.com/set-cookie?q=abc", "timeout": 15000}],
         )
 
+    async def test_server_action_raises_a_distinct_error_for_a_rate_limited_signup_page(self):
+        page = FakePage()
+
+        async def rate_limited_response(_script):
+            return "Too many requests. Please try again later."
+
+        page.evaluate = rate_limited_response
+        register.STATE_TREE = "state"
+        register.ACTION_ID = "action"
+
+        with self.assertRaises(register.RegistrationRateLimited):
+            await register.server_action_register(
+                page, "e@example.test", "pw", "123456", "token"
+            )
+
+    async def test_rate_limit_circuit_opens_for_the_configured_cooldown(self):
+        now = [100.0]
+        circuit = register.RegistrationRateLimitCircuit(
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+        )
+
+        circuit.trip()
+
+        self.assertTrue(circuit.is_open())
+        self.assertEqual(circuit.remaining_seconds(), 60)
+        now[0] = 160.0
+        self.assertFalse(circuit.is_open())
+
     async def test_monitor_uses_metrics_snapshot(self):
         register.STOP = asyncio.Event()
         register.TARGET = 1
