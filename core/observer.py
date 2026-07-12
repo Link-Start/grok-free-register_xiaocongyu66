@@ -4,6 +4,7 @@ Observer — 只读观测层
 只记录指标、生成日志。不修改 Semaphore,不调度 Worker,不释放资源。
 """
 import time
+from collections import deque
 
 
 class Metrics:
@@ -30,9 +31,14 @@ class Metrics:
         'q_send_batches', 'q_send_batch_items',
         'pair_claimed', 'pair_consumed_ok', 'pair_consumed_fail',
         'success_count',
+        'registration_starts',
+        '_clock', 'started_monotonic', 'recent_success_times',
     )
 
-    def __init__(self):
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self.started_monotonic = clock()
+        self.recent_success_times = deque()
         self.start_time = time.time()
         # T 生命周期
         self.t_produced = 0
@@ -88,6 +94,25 @@ class Metrics:
         self.pair_consumed_fail = 0
         # 成功数
         self.success_count = 0
+        self.registration_starts = 0
+
+    def next_registration_task(self):
+        self.registration_starts += 1
+        return self.registration_starts
+
+    def record_success(self):
+        self.success_count += 1
+        self.recent_success_times.append(self._clock())
+
+    def five_minute_success_rate(self):
+        now = self._clock()
+        cutoff = now - 300.0
+        while self.recent_success_times and self.recent_success_times[0] < cutoff:
+            self.recent_success_times.popleft()
+        if not self.recent_success_times:
+            return None if self.success_count == 0 else 0.0
+        elapsed = max(1.0, min(300.0, now - self.started_monotonic))
+        return len(self.recent_success_times) * 60.0 / elapsed
 
     def snapshot(self, inventory, sems):
         """生成一行监控日志。"""

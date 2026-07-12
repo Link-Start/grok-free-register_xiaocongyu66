@@ -113,9 +113,7 @@ REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS = max(
 REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL = max(
     1, _env_int("REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL", 3)
 )
-REGISTER_LOG_MODE = (os.environ.get("REGISTER_LOG_MODE") or "user").strip().lower()
-if REGISTER_LOG_MODE not in {"user", "debug"}:
-    REGISTER_LOG_MODE = "user"
+REGISTER_LOG_MODE = "user"
 
 SITE_KEY = None
 ACTION_ID = None
@@ -130,25 +128,64 @@ STOP = asyncio.Event()
 SOLVE, PRODUCE, CONSUME, IDLE = 'SOLVE', 'PRODUCE', 'CONSUME', 'IDLE'
 POLL_EXECUTOR = ThreadPoolExecutor(max_workers=32)
 
-def log(msg): print(msg, flush=True)
+def resolve_register_log_mode(argv=None, env=None):
+    argv = list([] if argv is None else argv)
+    env = dict(os.environ if env is None else env)
+    mode = (env.get("REGISTER_LOG_MODE") or "user").strip().lower()
+    if "--debug" in argv:
+        mode = "debug"
+    if mode not in {"user", "debug"}:
+        raise ValueError("REGISTER_LOG_MODE must be user or debug")
+    return mode
+
+
+def _terminal_output(msg):
+    print(msg, flush=True)
+
+
+def log(msg):
+    try:
+        _terminal_output(msg)
+    except Exception:
+        return
+
+
 def debug_log(msg):
     if REGISTER_LOG_MODE == "debug":
         log(msg)
 def rand_str(n=15): return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
 
 
-def format_user_registration_event(kind, *, task_id=None, count=None, rate_per_minute=None, wait_seconds=None):
-    label = f"task #{task_id}" if task_id is not None else "task"
+def sanitize_terminal_error(error):
+    return type(error).__name__
+
+
+def format_user_registration_event(
+    kind,
+    *,
+    task_id=None,
+    count=None,
+    rate_per_minute=None,
+    wait_seconds=None,
+    remaining=None,
+):
+    if kind == "service_started":
+        progress = f"剩余 {remaining}" if remaining is not None else "持续运行"
+        return f"[✓] 注册服务已启动 | {progress}"
     if kind == "started":
-        return f"[→] {label} started"
+        suffix = f" | 剩余 {remaining}" if remaining is not None else ""
+        return f"[→] 开始注册 #{task_id}{suffix}"
     if kind == "success":
-        return f"[✓] {label} success | avg:{rate_per_minute:.1f}/min | total:{count}"
+        rate = "—" if rate_per_minute is None else f"{rate_per_minute:.1f}/分"
+        return f"[✓] 注册成功 #{task_id} | 近5分钟 {rate} | 累计 {count}"
     if kind == "failed":
-        return f"[✗] {label} failed"
+        return f"[✗] 注册失败 #{task_id} | 已跳过，继续下一任务"
     if kind == "rate_limited":
-        return f"[⏸] rate limited | waiting:{wait_seconds}s"
+        return f"[⏸] 触发限流 | {wait_seconds}秒后恢复探测"
     if kind == "recovered":
-        return f"[▶] rate limit cleared | recovered:{wait_seconds}s"
+        return f"[▶] 限流解除 | 实际等待 {wait_seconds}秒"
+    if kind == "stopped":
+        return f"[■] 注册服务已停止 | 累计 {count or 0}"
     raise ValueError(f"unknown user registration event: {kind}")
 
 
@@ -550,7 +587,7 @@ async def grpc_verify_code(page, email, code):
     fb64 = base64.b64encode(frame).decode()
     s = await page.evaluate(f"(async()=>{{var fb=Uint8Array.from(atob('{fb64}'),c=>c.charCodeAt(0));var r=await fetch('{SITE_URL}/auth_mgmt.AuthManagement/VerifyEmailValidationCode',{{method:'POST',headers:{{'content-type':'application/grpc-web+proto','x-grpc-web':'1','x-user-agent':'connect-es/2.1.1'}},body:fb.buffer}});return r.headers.get('grpc-status')||'0';}})()")
     if REGISTRATION_DIAGNOSTICS and s != '0':
-        log(f'[C] verify rejected grpc_status={s}')
+        debug_log('[C] verify rejected')
     return s == '0'
 
 
@@ -600,7 +637,7 @@ async def server_action_register(
     if not m:
         markers = _signup_response_markers(result_text)
         if diagnostic is not None:
-            log(
+            debug_log(
                 f"[C] signup no session http_status={diagnostic['status']} "
                 f"retry_after={diagnostic['retryAfter'] or '-'} response_bytes={len(result_text)} "
                 f"markers={markers}"
@@ -633,7 +670,7 @@ async def server_action_register(
     cookies = await page.context.cookies()
     sso = next((c['value'] for c in cookies if c['name'] == 'sso'), None)
     if REGISTRATION_DIAGNOSTICS and not sso:
-        log('[C] signup set-cookie completed without sso cookie')
+        debug_log('[C] signup set-cookie completed without sso cookie')
     if not sso:
         return None
     if include_session:
@@ -1097,7 +1134,7 @@ async def _wait_turnstile_challenge(item):
     finally:
         timeline = item.get("timeline")
         if timeline is not None:
-            log("[solver_timeline] " + json.dumps(timeline["events"], separators=(",", ":")))
+            debug_log("[solver_timeline] " + json.dumps(timeline["events"], separators=(",", ":")))
         await _put_solver_page(item, ok)
 
 
@@ -1379,7 +1416,7 @@ async def _poll_and_admit_q(
                 expires_at=returned_at + Q_MAX_AGE,
             )
             await inventory.put_q(q_env)
-            log(f'[P] {request["email"]} code={code} admitted')
+            debug_log('[P] verification code admitted')
             return True
         except asyncio.CancelledError:
             if q_env is not None and not q_env.released:
@@ -1408,7 +1445,7 @@ def _observe_background_task(task):
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        log(f'[P] background settle err: {str(e)[:60]}')
+        debug_log(f'[P] background settle err: {sanitize_terminal_error(e)}')
 
 
 # ──────────────────────────────────────────────
@@ -1553,7 +1590,7 @@ async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, a
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    debug_log(f'[S] {wid} solver error: {type(exc).__name__}: {str(exc)[:80]}')
+                    debug_log(f'[S] {wid} solver error: {sanitize_terminal_error(exc)}')
             finally:
                 solve_elapsed = time.time() - solve_started
                 _record_solver_trace(metrics, trace, solve_elapsed, token)
@@ -1593,7 +1630,7 @@ async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, a
             # A single browser/page failure must not terminate the permanent
             # producer.  The next iteration acquires a fresh solver page.
             metrics.t_discarded += 1
-            debug_log(f'[S] {wid} worker error: {type(exc).__name__}: {str(exc)[:80]}')
+            debug_log(f'[S] {wid} worker error: {sanitize_terminal_error(exc)}')
         finally:
             if t_lease is not None:
                 await t_lease.release()
@@ -1641,7 +1678,7 @@ async def p_worker(
                 except Exception as e:
                     metrics.p_email_create_count += 1
                     metrics.p_email_create_seconds += time.time() - email_started
-                    log(f'[P] {wid} create email err: {str(e)[:60]}')
+                    debug_log(f'[P] {wid} create email err: {sanitize_terminal_error(e)}')
                     metrics.q_discarded += 1
                     q_pending_sem.release()
                     pending_owned -= 1
@@ -1692,7 +1729,7 @@ async def p_worker(
                     await q_lease.release_one()
             raise
         except Exception as e:
-            log(f'[P] {wid} err: {str(e)[:60]}')
+            debug_log(f'[P] {wid} err: {sanitize_terminal_error(e)}')
             metrics.q_discarded += 1
             for _ in range(pending_owned):
                 q_pending_sem.release()
@@ -1803,17 +1840,15 @@ async def _consume_pair(
                     with open("keys/auth-sessions.jsonl", "a") as f:
                         f.write(json.dumps({"email": email, "cookies": session_cookies}, separators=(",", ":")) + "\n")
                     os.chmod("keys/auth-sessions.jsonl", 0o600)
-                metrics.success_count += 1
+                metrics.record_success()
                 success_count = metrics.success_count
                 count = metrics.success_count
-            runtime = time.time() - metrics.start_time
-            rate = count / (runtime / 60) if runtime > 0 else 0
             log(
                 format_user_registration_event(
                     "success",
                     task_id=task_id,
                     count=count,
-                    rate_per_minute=rate,
+                    rate_per_minute=metrics.five_minute_success_rate(),
                 )
             )
             if recovery_probe:
@@ -1843,9 +1878,9 @@ async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gat
     """C_Worker: claim pair 并执行注册。"""
     while not STOP.is_set():
         recovery_probe = False
+        task_id = None
         try:
             async with inventory.claim_pair() as pair:
-                task_id = metrics.pair_claimed
                 if admission_gate is not None:
                     await admission_gate.notify_changed()
 
@@ -1859,7 +1894,14 @@ async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gat
                         recovery_probe = False
                     continue
 
-                log(format_user_registration_event("started", task_id=task_id))
+                task_id = metrics.next_registration_task()
+                log(
+                    format_user_registration_event(
+                        "started",
+                        task_id=task_id,
+                        remaining=max(TARGET - metrics.success_count, 0) if TARGET else None,
+                    )
+                )
                 try:
                     ok = await asyncio.wait_for(
                         _consume_pair(
@@ -1883,7 +1925,9 @@ async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gat
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log(f'[C] {wid} err: {str(e)[:60]}')
+            if task_id is not None:
+                log(format_user_registration_event("failed", task_id=task_id))
+            debug_log(f'[C] {wid} err: {sanitize_terminal_error(e)}')
             metrics.pair_consumed_fail += 1
         finally:
             if recovery_probe:
@@ -1934,9 +1978,9 @@ async def main():
 
     # 校验邮箱模式配置
     if EMAIL_MODE not in ('tempmail', 'custom'):
-        log(f"[!] EMAIL_MODE 非法: {EMAIL_MODE}(应为 tempmail 或 custom)"); sys.exit(1)
+        log("[!] 配置错误：EMAIL_MODE 应为 tempmail 或 custom"); return 2
     if EMAIL_MODE == 'custom' and not EMAIL_DOMAIN:
-        log("[!] custom 模式需在 .env 设置 EMAIL_DOMAIN(并运行 email_server.py)"); sys.exit(1)
+        log("[!] 配置错误：custom 模式需在 .env 设置 EMAIL_DOMAIN"); return 2
 
     debug_log("=" * 50)
     debug_log(f"  Grok Free Register (CSP Architecture)")
@@ -1944,7 +1988,7 @@ async def main():
     debug_log(f"  MaxMemForAuto: {resources['max_mem']}MB  MemReserve: {MIN_FREE_MEM_MB}MB  PhysicalMemBudget: {PHYSICAL_MEM_MB}MB")
     if capacity_profile:
         debug_log(f"  CapacityProfile: {CAPACITY_PROFILE} physical_cap={capacity_profile.get('physical_cap')}")
-    debug_log(f"  EmailMode: {EMAIL_MODE}" + (f" ({EMAIL_DOMAIN})" if EMAIL_MODE == 'custom' else ""))
+    debug_log(f"  EmailMode: {EMAIL_MODE}")
     debug_log(f"  Physical_Sem={physical_cap}  T_Slot={T_SLOT_CAP}  Q_Slot={Q_SLOT_CAP}  Q_Pending={Q_PENDING_CAP}")
     debug_log(
         f"  Admission: T_LOW/HIGH={admission_watermarks['t_low']}/{admission_watermarks['t_high']}  "
@@ -2036,16 +2080,34 @@ async def main():
         tasks.append(asyncio.create_task(monitor(inventory, sems, metrics)))
 
         debug_log(f'[*] CSP up: S={s_workers} P={p_workers} C={c_workers} workers')
+        log(
+            format_user_registration_event(
+                "service_started",
+                remaining=max(TARGET - metrics.success_count, 0) if TARGET else None,
+            )
+        )
 
         try:
             await asyncio.gather(*tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
-            log('[*] Shutting down...')
+            pass
         finally:
             for t in tasks:
                 t.cancel()
             await _close_c_hot_page_pool()
             await browser.close()
+            log(format_user_registration_event("stopped", count=metrics.success_count))
+    return 0
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        REGISTER_LOG_MODE = resolve_register_log_mode(sys.argv[1:])
+    except ValueError:
+        log("[!] 配置错误：REGISTER_LOG_MODE 应为 user 或 debug")
+        raise SystemExit(2)
+    try:
+        exit_code = asyncio.run(main())
+    except ValueError as exc:
+        log(f"[!] 配置错误：{sanitize_terminal_error(exc)}")
+        exit_code = 2
+    raise SystemExit(exit_code)

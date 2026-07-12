@@ -477,26 +477,71 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_event_format_reports_only_registration_outcomes(self):
         self.assertEqual(
             register.format_user_registration_event("started", task_id=7),
-            "[→] task #7 started",
+            "[→] 开始注册 #7",
         )
         self.assertEqual(
             register.format_user_registration_event(
                 "success", task_id=7, count=5, rate_per_minute=12.34
             ),
-            "[✓] task #7 success | avg:12.3/min | total:5",
+            "[✓] 注册成功 #7 | 近5分钟 12.3/分 | 累计 5",
         )
         self.assertEqual(
             register.format_user_registration_event("failed", task_id=7),
-            "[✗] task #7 failed",
+            "[✗] 注册失败 #7 | 已跳过，继续下一任务",
         )
         self.assertEqual(
             register.format_user_registration_event("rate_limited", wait_seconds=60),
-            "[⏸] rate limited | waiting:60s",
+            "[⏸] 触发限流 | 60秒后恢复探测",
         )
         self.assertEqual(
             register.format_user_registration_event("recovered", wait_seconds=61),
-            "[▶] rate limit cleared | recovered:61s",
+            "[▶] 限流解除 | 实际等待 61秒",
         )
+
+    async def test_debug_flag_overrides_environment_and_invalid_mode_is_rejected(self):
+        self.assertEqual(
+            register.resolve_register_log_mode(["--debug"], {"REGISTER_LOG_MODE": "user"}),
+            "debug",
+        )
+        self.assertEqual(
+            register.resolve_register_log_mode([], {"REGISTER_LOG_MODE": "debug"}),
+            "debug",
+        )
+        with self.assertRaises(ValueError):
+            register.resolve_register_log_mode([], {"REGISTER_LOG_MODE": "verbose"})
+
+    async def test_registration_task_numbers_are_separate_from_pair_claims(self):
+        metrics = Metrics()
+        metrics.pair_claimed = 12
+
+        self.assertEqual(metrics.next_registration_task(), 1)
+        self.assertEqual(metrics.next_registration_task(), 2)
+
+    async def test_five_minute_rate_uses_process_uptime_then_sliding_window(self):
+        now = [0.0]
+        metrics = Metrics(clock=lambda: now[0])
+        self.assertIsNone(metrics.five_minute_success_rate())
+
+        now[0] = 10.0
+        metrics.record_success()
+        now[0] = 20.0
+        metrics.record_success()
+        self.assertEqual(metrics.five_minute_success_rate(), 6.0)
+
+        now[0] = 311.0
+        self.assertAlmostEqual(metrics.five_minute_success_rate(), 0.2)
+        now[0] = 321.0
+        self.assertEqual(metrics.five_minute_success_rate(), 0.0)
+
+    async def test_terminal_output_failure_does_not_escape_log(self):
+        old_output = register._terminal_output
+        try:
+            register._terminal_output = lambda _message: (_ for _ in ()).throw(
+                OSError("closed pipe")
+            )
+            register.log("safe")
+        finally:
+            register._terminal_output = old_output
 
     async def test_rate_limit_circuit_measures_one_recovery_window(self):
         now = [100.0]
@@ -1032,6 +1077,7 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wait_turnstile_logs_timeline_when_present(self):
         messages = []
+        register.REGISTER_LOG_MODE = "debug"
 
         async def fake_poll(_page, **_kwargs):
             return "token-value-long"
@@ -1066,6 +1112,7 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wait_turnstile_timeline_logs_solve_id_and_poll_summary(self):
         messages = []
+        register.REGISTER_LOG_MODE = "debug"
         page = FakePage()
         page.turnstile_token = "token-value-long"
         timeline = register._new_solver_timeline(enabled=True)

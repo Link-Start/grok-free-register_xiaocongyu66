@@ -3,8 +3,19 @@
 # 用法:
 #   bash start.sh              # 首次会引导选模式,之后直接启动
 #   bash start.sh --reconfig   # 重新选择邮箱模式
+#   bash start.sh --debug      # 保留完整调试面板
 set -e
 cd "$(dirname "$0")"
+
+reconfig=0
+register_args=()
+for arg in "$@"; do
+    if [ "$arg" = "--reconfig" ]; then
+        reconfig=1
+    else
+        register_args+=("$arg")
+    fi
+done
 
 # 同一工作目录只允许一个注册进程，避免多次 nohup 同时写账号和日志。
 if command -v flock >/dev/null 2>&1; then
@@ -23,7 +34,7 @@ if [ ! -d .venv ]; then
 fi
 
 # 2) 配置:无 .env 或显式 --reconfig 时进入引导
-if [ ! -f .env ] || [ "${1:-}" = "--reconfig" ]; then
+if [ ! -f .env ] || [ "$reconfig" -eq 1 ]; then
     echo ""
     echo "选择邮箱模式:"
     echo "  [1] 免费临时邮箱           (默认 · 零配置 · 直接回车 · 多 provider 自动 fallback)"
@@ -53,9 +64,6 @@ ENV
     echo "[*] 已写入 .env"
 fi
 
-# --reconfig 不传给 register.py
-[ "${1:-}" = "--reconfig" ] && shift || true
-
 # 3) 运行
-echo "[*] 启动注册机... (Ctrl-C 停止;成功账号写入 keys/accounts.txt)"
-exec .venv/bin/python register.py "$@"
+echo "[*] 启动注册服务... (Ctrl-C 停止)"
+exec .venv/bin/python register.py "${register_args[@]}"
