@@ -114,6 +114,12 @@ class Metrics:
         elapsed = max(1.0, min(300.0, now - self.started_monotonic))
         return len(self.recent_success_times) * 60.0 / elapsed
 
+    def runtime_average_success_rate(self):
+        if self.success_count == 0:
+            return None
+        elapsed = max(1.0, self._clock() - self.started_monotonic)
+        return self.success_count * 60.0 / elapsed
+
     def snapshot(self, inventory, sems):
         """生成一行监控日志。"""
         elapsed = time.time() - self.start_time

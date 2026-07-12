@@ -344,7 +344,7 @@ class EventTerminal:
             if data.get("status") == "imported":
                 return (
                     f"[✓] 认证成功 #{data.get('task_number', '—')} | "
-                    f"近5分钟 {self._rate(data.get('five_minute_imports_per_minute'))} | "
+                    f"运行平均 {self._rate(data.get('lifetime_imports_per_minute'))} | "
                     f"累计 {data['imported_unique']} | 可用 {data.get('available', '—')}"
                 )
             reason = data.get("reason")
@@ -373,7 +373,7 @@ class EventTerminal:
             return (
                 f"[•] 状态 {state} | 待处理 {self._pending(data.get('pending_total'))} | "
                 f"阶段 {data.get('active_stage', 'idle')} | "
-                f"近5分钟 {self._rate(data.get('five_minute_imports_per_minute'))} | "
+                f"运行平均 {self._rate(data.get('lifetime_imports_per_minute'))} | "
                 f"累计 {data.get('imported_unique', 0)} | "
                 f"可用 {data.get('available', 0)} | 已取用 {data.get('claimed', 0)} | {cooldown}"
             )
@@ -446,6 +446,12 @@ class EventTerminal:
         if kind == "status":
             rate = data.get("five_minute_imports_per_minute")
             rate_text = "unknown" if rate is None else f"{rate:.2f}/min"
+            lifetime_rate = data.get("lifetime_imports_per_minute")
+            lifetime_rate_text = (
+                "unknown"
+                if lifetime_rate is None
+                else f"{lifetime_rate:.2f}/min"
+            )
             return (
                 f"• status: {data['state']}; "
                 f"queues={data['source_queue']}/{data['prepared_queue']}/"
@@ -460,7 +466,7 @@ class EventTerminal:
                 f"pace_remaining={data['pacing_remaining_seconds']:.1f}s; "
                 f"imported={data['imported_unique']}; attempted={data['attempted_unique']}; "
                 f"rate_limited={data['rate_limited']}; 5m_rate={rate_text}; "
-                f"lifetime_rate={data['lifetime_imports_per_minute']:.2f}/min; "
+                f"lifetime_rate={lifetime_rate_text}; "
                 f"available={data['available']}; claiming={data['claiming']}; "
                 f"claimed={data['claimed']}"
             )

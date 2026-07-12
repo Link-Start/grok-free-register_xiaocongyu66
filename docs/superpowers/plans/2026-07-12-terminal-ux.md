@@ -90,7 +90,7 @@ Keep queue sizes as Debug diagnostics. Compute the keyed-set difference for expl
 
 Add a `task_number: int | None = None` field to `PreparedJob`. Allocate it exactly when authorization starts, replace the immutable prepared job with that value, and carry it through `CompletionJob`, retry/failure paths and `_emit_result()`. Every `result` event contains the matching task number; the renderer must never infer it from the most recently started task.
 
-Change authentication five-minute metrics to return `None` until the first process success. After at least one success, an empty pruned window returns `0.0`, preserving the distinction between “尚无成功” and “最近五分钟无成功”.
+Keep the authentication five-minute metric as a Debug diagnostic. Normal output uses the process-lifetime average and returns `None` until the first process success; all cooldown time remains in its denominator.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -196,7 +196,7 @@ Update the existing event contract to:
 
 ```text
 [→] 开始注册 #7 | 剩余 95
-[✓] 注册成功 #7 | 近5分钟 12.3/分 | 累计 5
+[✓] 注册成功 #7 | 运行平均 12.3/分 | 累计 5
 [✗] 注册失败 #7 | 将继续下一任务
 [⏸] 触发限流 | 60秒后恢复探测
 [▶] 限流解除 | 实际等待 61秒

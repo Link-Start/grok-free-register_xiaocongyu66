@@ -882,7 +882,11 @@ class AuthPipeline:
                 if self._process_imports
                 else None
             ),
-            "lifetime_imports_per_minute": self._process_imports * 60.0 / elapsed,
+            "lifetime_imports_per_minute": (
+                self._process_imports * 60.0 / elapsed
+                if self._process_imports
+                else None
+            ),
             "pending_total": self._pending_total(),
         }
 

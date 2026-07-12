@@ -483,7 +483,7 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             register.format_user_registration_event(
                 "success", task_id=7, count=5, rate_per_minute=12.34
             ),
-            "[✓] 注册成功 #7 | 近5分钟 12.3/分 | 累计 5",
+            "[✓] 注册成功 #7 | 运行平均 12.3/分 | 累计 5",
         )
         self.assertEqual(
             register.format_user_registration_event("failed", task_id=7),
@@ -532,6 +532,20 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(metrics.five_minute_success_rate(), 0.2)
         now[0] = 321.0
         self.assertEqual(metrics.five_minute_success_rate(), 0.0)
+
+    async def test_runtime_average_rate_includes_the_entire_cooldown_period(self):
+        now = [0.0]
+        metrics = Metrics(clock=lambda: now[0])
+        self.assertIsNone(metrics.runtime_average_success_rate())
+
+        now[0] = 10.0
+        metrics.record_success()
+        now[0] = 20.0
+        metrics.record_success()
+        self.assertEqual(metrics.runtime_average_success_rate(), 6.0)
+
+        now[0] = 320.0
+        self.assertEqual(metrics.runtime_average_success_rate(), 0.375)
 
     async def test_terminal_output_failure_does_not_escape_log(self):
         old_output = register._terminal_output

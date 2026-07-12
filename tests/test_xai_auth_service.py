@@ -68,6 +68,7 @@ def test_user_terminal_reports_progress_without_internal_or_secret_fields():
                 "reason": "imported",
                 "task_number": 3,
                 "five_minute_imports_per_minute": 4.25,
+                "lifetime_imports_per_minute": 1.75,
                 "imported_unique": 120,
                 "available": 117,
                 "source_id": "secret@example.test",
@@ -78,7 +79,7 @@ def test_user_terminal_reports_progress_without_internal_or_secret_fields():
     assert messages == [
         "[✓] 本地认证服务已启动 | 来源 等待同步 | 输出 authenticated/ | 待处理 — | 可用 7",
         "[→] 开始认证 #3 | 待处理 41",
-        "[✓] 认证成功 #3 | 近5分钟 4.25/分 | 累计 120 | 可用 117",
+        "[✓] 认证成功 #3 | 运行平均 1.75/分 | 累计 120 | 可用 117",
     ]
     rendered = "\n".join(messages)
     assert "source_queue" not in rendered
@@ -86,7 +87,7 @@ def test_user_terminal_reports_progress_without_internal_or_secret_fields():
     assert "do-not-print.example" not in rendered
 
 
-def test_user_status_distinguishes_unknown_rate_from_zero_rate():
+def test_user_status_distinguishes_unknown_runtime_rate_from_zero_rate():
     base = {
         "state": "running",
         "pending_total": None,
@@ -98,11 +99,11 @@ def test_user_status_distinguishes_unknown_rate_from_zero_rate():
     }
     messages = []
     terminal = EventTerminal(mode="user", output=messages.append)
-    terminal.emit(("status", {**base, "five_minute_imports_per_minute": None}))
-    terminal.emit(("status", {**base, "five_minute_imports_per_minute": 0.0}))
+    terminal.emit(("status", {**base, "lifetime_imports_per_minute": None}))
+    terminal.emit(("status", {**base, "lifetime_imports_per_minute": 0.0}))
 
-    assert "近5分钟 —" in messages[0]
-    assert "近5分钟 0.00/分" in messages[1]
+    assert "运行平均 —" in messages[0]
+    assert "运行平均 0.00/分" in messages[1]
     assert "source_queue" not in messages[0]
 
 

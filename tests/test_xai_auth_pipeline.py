@@ -176,6 +176,7 @@ def test_pending_total_uses_current_snapshot_set_difference(tmp_path):
 
     assert pipeline.status()["pending_total"] == 2
     assert pipeline.status()["five_minute_imports_per_minute"] is None
+    assert pipeline.status()["lifetime_imports_per_minute"] is None
 
 
 def test_pending_total_is_unknown_before_first_valid_snapshot(tmp_path):

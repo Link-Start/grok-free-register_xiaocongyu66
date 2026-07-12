@@ -177,7 +177,7 @@ def format_user_registration_event(
         return f"[→] 开始注册 #{task_id}{suffix}"
     if kind == "success":
         rate = "—" if rate_per_minute is None else f"{rate_per_minute:.1f}/分"
-        return f"[✓] 注册成功 #{task_id} | 近5分钟 {rate} | 累计 {count}"
+        return f"[✓] 注册成功 #{task_id} | 运行平均 {rate} | 累计 {count}"
     if kind == "failed":
         return f"[✗] 注册失败 #{task_id} | 已跳过，继续下一任务"
     if kind == "rate_limited":
@@ -1848,7 +1848,7 @@ async def _consume_pair(
                     "success",
                     task_id=task_id,
                     count=count,
-                    rate_per_minute=metrics.five_minute_success_rate(),
+                    rate_per_minute=metrics.runtime_average_success_rate(),
                 )
             )
             if recovery_probe:
