@@ -1,9 +1,12 @@
-"""Persistent, redacted SSH snapshot/follow source for registered sessions."""
+"""Atomic local snapshots of password-free registration sessions."""
 
 import asyncio
 import json
+import os
 import shlex
+import tempfile
 from contextlib import suppress
+from pathlib import Path
 
 from .models import SourceRecord
 
@@ -12,6 +15,260 @@ MAX_SESSION_RECORD_BYTES = 256 * 1024
 
 class RemoteStreamError(RuntimeError):
     """A classified stream failure whose text never includes remote output."""
+
+
+class SSHSnapshotSynchronizer:
+    """Atomically refresh one validated, password-free local JSONL snapshot."""
+
+    MAX_STDERR_BYTES = 16 * 1024
+
+    def __init__(
+        self,
+        host,
+        destination,
+        *,
+        remote_root="/opt/grok-free-register",
+        identity_file=None,
+        process_factory=asyncio.create_subprocess_exec,
+    ):
+        self.host = host
+        self.destination = Path(destination)
+        self.remote_root = remote_root
+        self.identity_file = identity_file
+        self.process_factory = process_factory
+        self._process = None
+
+    def _command(self):
+        return (
+            f"cd {shlex.quote(self.remote_root)} && "
+            "python3 scripts/export_registered_sessions.py "
+            "keys/auth-sessions.jsonl keys/accounts.txt"
+        )
+
+    def _args(self):
+        args = [
+            "ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+        ]
+        if self.identity_file:
+            args.extend(["-i", self.identity_file])
+        args.extend(["--", self.host, self._command()])
+        return args
+
+    async def _read_stderr(self, stream):
+        retained = 0
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            retained = min(self.MAX_STDERR_BYTES, retained + len(chunk))
+
+    async def _terminate(self, process):
+        if process is None or process.returncode is not None:
+            return
+        with suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except TimeoutError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+
+    async def close(self):
+        await self._terminate(self._process)
+
+    async def sync_once(self):
+        self.destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.destination.parent, 0o700)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.destination.name}.",
+            suffix=".tmp",
+            dir=self.destination.parent,
+        )
+        process = None
+        stderr_task = None
+        try:
+            os.fchmod(fd, 0o600)
+            process = await self.process_factory(
+                *self._args(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=MAX_SESSION_RECORD_BYTES + 1,
+            )
+            self._process = process
+            stderr_task = asyncio.create_task(self._read_stderr(process.stderr))
+            with os.fdopen(fd, "wb") as stream:
+                fd = -1
+                record_count = 0
+                while True:
+                    try:
+                        raw = await process.stdout.readline()
+                    except (ValueError, asyncio.LimitOverrunError) as exc:
+                        raise ValueError("invalid remote session snapshot") from exc
+                    if not raw:
+                        break
+                    if (
+                        not raw.endswith(b"\n")
+                        or len(raw) - 1 > MAX_SESSION_RECORD_BYTES
+                    ):
+                        raise ValueError("invalid remote session snapshot")
+                    parse_session_document(raw[:-1])
+                    stream.write(raw)
+                    record_count += 1
+                returncode = await process.wait()
+                if stderr_task is not None:
+                    await stderr_task
+                    stderr_task = None
+                if returncode != 0:
+                    raise RemoteStreamError("remote snapshot export failed")
+                if record_count == 0:
+                    raise RemoteStreamError("remote snapshot export was empty")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, self.destination)
+            os.chmod(self.destination, 0o600)
+            directory_fd = os.open(self.destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if stderr_task is not None:
+                if not stderr_task.done():
+                    stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+            with suppress(Exception):
+                await self._terminate(process)
+            if self._process is process:
+                self._process = None
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name)
+
+
+class DiskSnapshotSource:
+    """Consume immutable local snapshot generations under queue backpressure."""
+
+    def __init__(
+        self,
+        path,
+        *,
+        synchronizer=None,
+        sync_seconds=30.0,
+        poll_seconds=0.25,
+        sleep=asyncio.sleep,
+        event_callback=None,
+    ):
+        self.path = Path(path)
+        self.synchronizer = synchronizer
+        self.sync_seconds = float(sync_seconds)
+        self.poll_seconds = float(poll_seconds)
+        self.sleep = sleep
+        self.event_callback = event_callback
+        self._closed = False
+        self._sync_task = None
+        self._last_sync_ok = None
+
+    def _emit(self, kind, data):
+        if self.event_callback is not None:
+            with suppress(Exception):
+                self.event_callback(kind, data)
+
+    async def _sync_loop(self):
+        while not self._closed:
+            refreshed = await self.synchronizer.sync_once()
+            if refreshed != self._last_sync_ok:
+                self._emit(
+                    "source_connected" if refreshed else "source_disconnected",
+                    {} if refreshed else {"reason": "snapshot_sync_failed"},
+                )
+                self._last_sync_ok = refreshed
+            try:
+                await asyncio.wait_for(self._wait_closed(), timeout=self.sync_seconds)
+            except TimeoutError:
+                pass
+
+    async def _wait_closed(self):
+        while not self._closed:
+            await self.sleep(min(0.25, self.sync_seconds))
+
+    async def close(self):
+        self._closed = True
+        if self._sync_task is not None:
+            self._sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._sync_task
+            self._sync_task = None
+        if self.synchronizer is not None:
+            await self.synchronizer.close()
+
+    @staticmethod
+    def _generation(stat_result):
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_mtime_ns,
+            stat_result.st_size,
+        )
+
+    async def records(self):
+        if self.synchronizer is not None and self._sync_task is None:
+            self._sync_task = asyncio.create_task(self._sync_loop())
+        consumed_generation = None
+        while not self._closed:
+            try:
+                current = self.path.stat()
+            except FileNotFoundError:
+                await self.sleep(self.poll_seconds)
+                continue
+            generation = self._generation(current)
+            if generation == consumed_generation:
+                await self.sleep(self.poll_seconds)
+                continue
+            try:
+                stream = self.path.open("rb")
+            except FileNotFoundError:
+                continue
+            with stream:
+                opened_generation = self._generation(os.fstat(stream.fileno()))
+                while not self._closed:
+                    raw = await asyncio.to_thread(
+                        stream.readline, MAX_SESSION_RECORD_BYTES + 2
+                    )
+                    if not raw:
+                        break
+                    if (
+                        not raw.endswith(b"\n")
+                        or len(raw) - 1 > MAX_SESSION_RECORD_BYTES
+                    ):
+                        self._emit(
+                            "source_record_rejected", {"reason": "invalid_record"}
+                        )
+                        break
+                    try:
+                        record = parse_session_document(raw[:-1])
+                    except ValueError:
+                        self._emit(
+                            "source_record_rejected", {"reason": "invalid_record"}
+                        )
+                        continue
+                    yield record
+            consumed_generation = opened_generation
 
 
 def parse_session_document(raw: bytes | str) -> SourceRecord:

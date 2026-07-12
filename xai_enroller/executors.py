@@ -120,6 +120,45 @@ class PlaywrightExecutor:
     async def __aexit__(self, exc_type, exc, tb):
         await self.close()
 
+    @classmethod
+    async def _close_attempt_resources(cls, page, context):
+        async def close_session():
+            closers = []
+            if page is not None:
+                closers.append(page.close())
+            if context is not None:
+                closers.append(context.close())
+            if closers:
+                await asyncio.gather(*closers, return_exceptions=True)
+
+        def consume_result(task):
+            with suppress(BaseException):
+                task.result()
+
+        cleanup = asyncio.create_task(close_session())
+        cancelled = False
+        deadline = asyncio.get_running_loop().time() + cls.CLOSE_TIMEOUT_SECONDS
+        while not cleanup.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait({cleanup}, timeout=remaining)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cleanup.done():
+            consume_result(cleanup)
+        else:
+            # asyncio.wait_for() is not a hard deadline: it cancels the child and
+            # then waits for cancellation to finish, which a wedged Playwright
+            # transport may never do.  Abandon the cleanup task after one real
+            # wall-clock deadline and consume its eventual result asynchronously.
+            cleanup.cancel()
+            cleanup.add_done_callback(consume_result)
+        if cancelled:
+            raise asyncio.CancelledError
+        return cleanup.done()
+
     @staticmethod
     async def _click_visible_exact(page, names):
         for name in names:
@@ -452,26 +491,4 @@ class PlaywrightExecutor:
                     "confirmation_timeout" if is_timeout else "browser_error",
                 )
             finally:
-                async def close_session():
-                    if page is not None:
-                        with suppress(Exception):
-                            await asyncio.wait_for(
-                                page.close(), timeout=self.CLOSE_TIMEOUT_SECONDS
-                            )
-                    if context is not None:
-                        with suppress(Exception):
-                            await asyncio.wait_for(
-                                context.close(), timeout=self.CLOSE_TIMEOUT_SECONDS
-                            )
-
-                cleanup = asyncio.create_task(close_session())
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        # Repeated operator cancellation must not strand a browser
-                        # context.  The original cancellation propagates after the
-                        # finally block completes.
-                        continue
-                with suppress(Exception):
-                    cleanup.result()
+                await self._close_attempt_resources(page, context)

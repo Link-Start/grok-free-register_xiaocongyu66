@@ -46,7 +46,10 @@ they recover from shorter cooldown exposure.
 ## Architecture
 
 ```text
-remote snapshot/follow stream
+30-second one-shot SSH export
+          |
+          v
+atomic local JSONL snapshot
           |
           v
  bounded source queue -- device-flow prefetch (1 ahead)
@@ -74,15 +77,14 @@ initially serialized because current measurements show an upstream rate limit
 and provide no evidence that concurrent confirmations increase sustainable
 throughput.
 
-## Remote Source Stream
+## Local Snapshot Source
 
-The remote exporter gains a newline-delimited follow mode. It opens the exact
-session JSONL once in binary mode, parses only newline-terminated records, and
-retains an incomplete final line until more bytes arrive. It emits one complete,
-password-free snapshot containing exact sessions plus historical accounts, then
-continues reading appends from the same open file descriptor and byte position.
-An append between the initial EOF and the follow loop is therefore visible on
-the next read; there is no detach/reattach handoff window.
+Every 30 seconds a short-lived SSH process runs the password-free exporter once.
+The local synchronizer writes its complete JSONL output to a private temporary
+file, validates every newline-terminated record, flushes and `fsync`s it, sets
+mode `0600`, then atomically replaces `source-snapshot.jsonl`. A failed SSH
+process, malformed record, incomplete line, or failed durability operation never
+replaces the preceding valid snapshot.
 
 The full snapshot preserves the current legacy fallback: historical
 `accounts.txt` entries without an exact snapshot are emitted with SSO Cookie
@@ -90,17 +92,17 @@ scope templates learned from exact snapshots. The password field is parsed only
 as a delimiter on the server and is never emitted. If no exact snapshot exists
 from which a safe Cookie scope can be learned, legacy entries are not guessed.
 
-The local source task keeps one SSH child process open, uses SSH keepalives, and
-reconnects after a bounded delay if the stream exits. The remote follower checks
-for path inode replacement or truncation; either condition ends that stream so
-the local task reconnects and obtains a new complete snapshot. At most one SSH
-child is live at a time, although a disconnected child may be replaced.
+The consumer never reads SSH stdout. It opens the current local snapshot and
+yields records under source-queue backpressure. If a synchronization replaces
+the pathname while that descriptor is open, the consumer finishes the old
+descriptor before opening the new inode. It therefore observes complete file
+generations only and never retains the entire source stock in memory.
 
-Every reconnect starts with a complete snapshot. A process-wide keyed state map
+Every file generation is a complete snapshot. A process-wide keyed state map
 tracks each source as `queued`, `prepared`, `active`, `retry_waiting`, or
 `imported`. It suppresses duplicate snapshot/follow records across all live
 states, while ledger `imported` rows suppress completed work across restarts.
-Reconnects therefore require no remote cursor file. The source queue capacity
+Repeated generations therefore require no remote cursor file. The source queue capacity
 is 64; normal pipe backpressure bounds secret-bearing records in memory without
 affecting the independent registration process.
 
@@ -215,11 +217,13 @@ behavior.
 
 ## Verification
 
-No new permanent test files are required for this change. Verification uses
-syntax checks, repository diff checks, one-off bounded diagnostics for queue and
-gate invariants, and a real service run. The live acceptance criteria are:
+Verification uses focused behavior tests for atomic snapshot replacement,
+snapshot-generation ordering, cancellation-safe browser cleanup, and the
+sink/ledger commit boundary, plus syntax and repository diff checks. The live
+acceptance criteria are:
 
-1. one persistent SSH source process and one persistent Chromium process;
+1. no persistent SSH process, at most one short-lived snapshot export, and one
+   persistent Chromium process;
 2. historical accounts continue to drain and new registrations appear without
    restarting the service;
 3. no fixed 30-second gap between successful jobs;
@@ -229,8 +233,6 @@ gate invariants, and a real service run. The live acceptance criteria are:
 6. every output JSON remains valid CPA-compatible data with mode `0600`; and
 7. terminal and ledger inspection reveal no raw identifier or credential.
 
-One-off bounded diagnostics additionally exercise an append that occurs between
-snapshot EOF and follow-loop entry, an incomplete trailing JSONL record,
-snapshot duplicates while a source is queued/active/retrying, and
-rate-limit/probe/pause/cancel transitions. They are runtime diagnostics only and
-do not add permanent test files.
+Bounded diagnostics additionally exercise snapshot duplicates while a source is
+queued, active, or retrying, together with rate-limit, probe, pause, and cancel
+transitions.

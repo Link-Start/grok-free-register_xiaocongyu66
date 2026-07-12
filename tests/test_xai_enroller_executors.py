@@ -1,6 +1,8 @@
 import asyncio
+from contextlib import suppress
 
 import httpx
+import pytest
 
 from xai_enroller.executors import HTTPProbeExecutor, PlaywrightExecutor
 from xai_enroller.models import AuthorizationStatus, DeviceFlow, SourceRecord
@@ -236,3 +238,77 @@ def test_playwright_executor_finds_macos_cloakbrowser_binary(monkeypatch):
     )
 
     assert PlaywrightExecutor._find_executable_path() == macos_binary
+
+
+def test_playwright_attempt_cleanup_defers_repeated_cancellation():
+    class Page:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.closed = False
+
+        async def close(self):
+            self.entered.set()
+            await self.release.wait()
+            self.closed = True
+
+    class Context:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        page = Page()
+        context = Context()
+        task = asyncio.create_task(
+            PlaywrightExecutor._close_attempt_resources(page, context)
+        )
+        await page.entered.wait()
+        task.cancel()
+        task.cancel()
+        await asyncio.sleep(0)
+        page.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert page.closed
+        assert context.closed
+
+    asyncio.run(scenario())
+
+
+def test_playwright_attempt_cleanup_has_a_true_wall_clock_deadline(monkeypatch):
+    class Page:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def close(self):
+            self.entered.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    # Playwright transports can remain stuck while cancellation
+                    # propagates.  A hard deadline must not await that forever.
+                    continue
+
+    async def scenario():
+        monkeypatch.setattr(PlaywrightExecutor, "CLOSE_TIMEOUT_SECONDS", 0.02)
+        page = Page()
+        task = asyncio.create_task(
+            PlaywrightExecutor._close_attempt_resources(page, None)
+        )
+        await page.entered.wait()
+        done, _pending = await asyncio.wait({task}, timeout=0.10)
+        completed_within_deadline = task in done
+
+        page.release.set()
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        assert completed_within_deadline
+
+    asyncio.run(scenario())

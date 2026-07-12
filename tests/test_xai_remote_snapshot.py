@@ -1,0 +1,124 @@
+import asyncio
+import json
+import os
+
+from xai_enroller.models import SourceRecord
+from xai_enroller.remote_stream import DiskSnapshotSource, SSHSnapshotSynchronizer
+
+
+def _document(source_id):
+    return json.dumps(
+        {
+            "email": source_id,
+            "cookies": [
+                {
+                    "name": "sso",
+                    "value": "opaque",
+                    "domain": "accounts.x.ai",
+                    "path": "/",
+                }
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+class FakeStream:
+    def __init__(self, lines):
+        self._lines = iter(lines)
+
+    async def readline(self):
+        return next(self._lines, b"")
+
+    async def read(self, _size=-1):
+        return b""
+
+
+class FakeProcess:
+    def __init__(self, lines, returncode=0):
+        self.stdout = FakeStream(lines)
+        self.stderr = FakeStream([])
+        self.returncode = None
+        self._final_returncode = returncode
+
+    async def wait(self):
+        self.returncode = self._final_returncode
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+
+def test_snapshot_sync_atomically_replaces_only_valid_complete_export(tmp_path):
+    async def scenario():
+        destination = tmp_path / "source-snapshot.jsonl"
+        destination.write_bytes(_document("old") + b"\n")
+
+        invalid = FakeProcess([b"not-json\n"])
+
+        async def invalid_factory(*_args, **_kwargs):
+            return invalid
+
+        synchronizer = SSHSnapshotSynchronizer(
+            "host",
+            destination,
+            process_factory=invalid_factory,
+        )
+        assert not await synchronizer.sync_once()
+        assert destination.read_bytes() == _document("old") + b"\n"
+
+        rejected = FakeProcess([_document("rejected") + b"\n"], returncode=1)
+
+        async def rejected_factory(*_args, **_kwargs):
+            return rejected
+
+        synchronizer.process_factory = rejected_factory
+        assert not await synchronizer.sync_once()
+        assert destination.read_bytes() == _document("old") + b"\n"
+
+        empty = FakeProcess([])
+
+        async def empty_factory(*_args, **_kwargs):
+            return empty
+
+        synchronizer.process_factory = empty_factory
+        assert not await synchronizer.sync_once()
+        assert destination.read_bytes() == _document("old") + b"\n"
+
+        valid = FakeProcess([_document("new-a") + b"\n", _document("new-b") + b"\n"])
+
+        async def valid_factory(*_args, **_kwargs):
+            return valid
+
+        synchronizer.process_factory = valid_factory
+        assert await synchronizer.sync_once()
+        assert destination.read_bytes() == _document("new-a") + b"\n" + _document("new-b") + b"\n"
+        assert destination.stat().st_mode & 0o777 == 0o600
+        assert not list(tmp_path.glob(".source-snapshot.jsonl.*.tmp"))
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_consumer_finishes_open_generation_before_replacement(tmp_path):
+    async def scenario():
+        destination = tmp_path / "source-snapshot.jsonl"
+        destination.write_bytes(_document("old-a") + b"\n" + _document("old-b") + b"\n")
+        source = DiskSnapshotSource(destination, poll_seconds=0.01)
+        records = source.records()
+        first = await anext(records)
+        assert isinstance(first, SourceRecord)
+        assert first.source_id == "old-a"
+
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(_document("new-a") + b"\n")
+        os.replace(replacement, destination)
+
+        assert (await anext(records)).source_id == "old-b"
+        assert (await asyncio.wait_for(anext(records), 1)).source_id == "new-a"
+        await source.close()
+        await records.aclose()
+
+    asyncio.run(scenario())

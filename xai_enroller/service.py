@@ -237,9 +237,9 @@ class EventTerminal:
         elif kind == "service_stopped":
             message = "• service: stopped"
         elif kind == "source_connected":
-            message = "• source: stream connected"
+            message = "• source: local snapshot updated"
         elif kind == "source_disconnected":
-            message = f"⚠ source: {data['reason']}; reconnecting"
+            message = f"⚠ source: {data['reason']}; keeping previous snapshot"
         elif kind == "source_record_rejected":
             message = "⚠ source: invalid record rejected"
         elif kind == "rate_limited":
@@ -473,7 +473,7 @@ async def main_async():
     from .executors import PlaywrightExecutor
     from .ledger import Ledger
     from .protocol import XAIProfile, XAIProtocol
-    from .remote_stream import RemoteSessionStream
+    from .remote_stream import DiskSnapshotSource, SSHSnapshotSynchronizer
     from .sinks import LocalAuthFileSink
 
     service_settings = AuthServiceSettings.from_environ()
@@ -486,10 +486,17 @@ async def main_async():
     client = httpx.AsyncClient()
     pipeline = None
     try:
-        source = RemoteSessionStream(
+        snapshot_path = Path(settings.local_auth_dir) / "source-snapshot.jsonl"
+        synchronizer = SSHSnapshotSynchronizer(
             service_settings.ssh_host,
+            snapshot_path,
             remote_root=service_settings.remote_root,
             identity_file=service_settings.identity_file,
+        )
+        source = DiskSnapshotSource(
+            snapshot_path,
+            synchronizer=synchronizer,
+            sync_seconds=service_settings.sync_seconds,
             event_callback=lambda kind, data: terminal.emit((kind, data)),
         )
         protocol = XAIProtocol(

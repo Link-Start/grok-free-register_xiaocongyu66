@@ -237,8 +237,10 @@ export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
 
 ### 注册机同步模式
 
-注册机和认证服务分开运行时，服务器继续写入 `keys/accounts.txt`，本地认证服务通过
-一条常驻 SSH 连接同步已有账号和后续新增账号。认证使用本机 CloakBrowser Chromium，
+注册机和认证服务分开运行时，服务器继续写入 `keys/accounts.txt`，本地认证服务默认
+每 30 秒通过一次性 SSH 导出全量 JSONL 快照。快照经逐行校验、`fsync` 后原子替换到
+`~/Downloads/grok-free-register-auth/source-snapshot.jsonl`；同步失败会继续使用上一份有效快照。
+认证使用本机 CloakBrowser Chromium，
 成功结果写入 `~/Downloads/grok-free-register-auth/`，文件格式可以直接供 CPA 使用。
 
 先把导出器同步到注册机的 `scripts/` 目录：
@@ -253,6 +255,7 @@ scp scripts/export_registered_sessions.py user@your-server:/opt/grok-free-regist
 export XAI_AUTH_SERVICE_SSH_HOST=user@your-server
 export XAI_AUTH_SERVICE_SSH_IDENTITY=/path/to/ssh-key.pem  # 使用 ssh-agent 时可省略
 export XAI_AUTH_SERVICE_REMOTE_ROOT=/opt/grok-free-register
+export XAI_AUTH_SERVICE_SYNC_SEC=30
 ```
 
 启动认证服务：

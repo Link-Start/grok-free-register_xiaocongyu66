@@ -309,12 +309,14 @@ class AuthPipeline:
             and not self._authorization_task.done()
         ):
             task = self._authorization_task
+            self._authorization_cancellable = False
         elif (
             self._completion_cancellable
             and self._completion_task is not None
             and not self._completion_task.done()
         ):
             task = self._completion_task
+            self._completion_cancellable = False
         if task is None:
             return False
         task.cancel()
