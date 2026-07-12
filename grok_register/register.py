@@ -10,12 +10,11 @@ Grok Free Register — CSP 异步并发架构
 两种邮箱模式(EMAIL_MODE):
   - tempmail (默认,零配置): 免费临时邮箱,多 provider 自动 fallback
   - custom: 自建域名邮箱,Cloudflare Email Routing → Worker → 本地 webhook
-            (见 email_server.py / cloudflare/email-worker.js)
+            (见 grok_register/email_server.py / cloudflare/email-worker.js)
 
 配置全部走环境变量 / .env(见 .env.example);CLI: --max-mem 6G --target 100
 用法:
   bash start.sh          # 一键引导
-  python register.py
 """
 import os, json, random, string, time, re, secrets, base64, struct, asyncio, glob, sys, multiprocessing
 try:
@@ -29,10 +28,10 @@ from playwright.async_api import async_playwright
 from concurrent.futures import ThreadPoolExecutor
 
 # CSP 架构组件
-from core.admission import AdmissionGate
-from core.envelope import ResourceEnvelope
-from core.inventory import Inventory
-from core.observer import Metrics
+from grok_register.core.admission import AdmissionGate
+from grok_register.core.envelope import ResourceEnvelope
+from grok_register.core.inventory import Inventory
+from grok_register.core.observer import Metrics
 
 os.makedirs("keys", exist_ok=True)
 SITE_URL = "https://accounts.x.ai"
@@ -1748,6 +1747,32 @@ def _pair_is_expired(pair, now=None):
     )
 
 
+def _append_registration_line(path, line, mode=None, *, durable=False):
+    with open(path, "a") as stream:
+        stream.write(line)
+        if durable:
+            stream.flush()
+            os.fsync(stream.fileno())
+    if mode is not None:
+        os.chmod(path, mode)
+
+
+def _persist_registration(email, password, sso, session_cookies):
+    if session_cookies:
+        document = json.dumps(
+            {"email": email, "cookies": session_cookies},
+            separators=(",", ":"),
+        )
+        _append_registration_line(
+            "keys/auth-sessions.jsonl",
+            document + "\n",
+            mode=0o600,
+            durable=True,
+        )
+    _append_registration_line("keys/accounts.txt", f"{email}:{password}:{sso}\n")
+    _append_registration_line("keys/grok.txt", sso + "\n")
+
+
 async def _consume_pair(
     browser,
     physical_sem,
@@ -1832,14 +1857,7 @@ async def _consume_pair(
         if sso:
             elapsed = time.time() - t0
             async with file_lock:
-                with open("keys/grok.txt", "a") as f:
-                    f.write(sso + "\n")
-                with open("keys/accounts.txt", "a") as f:
-                    f.write(f"{email}:{password}:{sso}\n")
-                if session_cookies:
-                    with open("keys/auth-sessions.jsonl", "a") as f:
-                        f.write(json.dumps({"email": email, "cookies": session_cookies}, separators=(",", ":")) + "\n")
-                    os.chmod("keys/auth-sessions.jsonl", 0o600)
+                _persist_registration(email, password, sso, session_cookies)
                 metrics.record_success()
                 success_count = metrics.success_count
                 count = metrics.success_count

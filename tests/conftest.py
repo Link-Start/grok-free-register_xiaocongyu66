@@ -9,8 +9,8 @@ import pytest
 # 确保项目根目录在 sys.path 中
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.inventory import Inventory
-from core.observer import Metrics
+from grok_register.core.inventory import Inventory
+from grok_register.core.observer import Metrics
 from tests.fakes import (
     FakeTurnstile, FakeEmailService, FakeRegisterAPI,
     Conservation, EventLog,

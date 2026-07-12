@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from core.admission import AdmissionGate
+from grok_register.core.admission import AdmissionGate
 
 
 class FakeInventory:

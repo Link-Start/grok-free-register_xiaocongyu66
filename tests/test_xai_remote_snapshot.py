@@ -3,7 +3,11 @@ import json
 import os
 
 from xai_enroller.models import SourceRecord
-from xai_enroller.remote_stream import DiskSnapshotSource, SSHSnapshotSynchronizer
+from xai_enroller.remote_stream import (
+    DiskSnapshotSource,
+    LocalSnapshotSynchronizer,
+    SSHSnapshotSynchronizer,
+)
 
 
 def _document(source_id):
@@ -108,6 +112,68 @@ def test_snapshot_sync_atomically_replaces_only_valid_complete_export(tmp_path):
         assert synchronizer.snapshot_fingerprints == frozenset(
             {"key:new-a", "key:new-b"}
         )
+
+    asyncio.run(scenario())
+
+
+def test_local_snapshot_accepts_empty_input_and_anchors_exporter_code(tmp_path):
+    async def scenario():
+        registration_root = tmp_path / "registration"
+        destination = tmp_path / "auth" / "source-snapshot.jsonl"
+        captured = []
+        process = FakeProcess([])
+
+        async def factory(*args, **_kwargs):
+            captured.append(args)
+            return process
+
+        synchronizer = LocalSnapshotSynchronizer(
+            registration_root,
+            destination,
+            process_factory=factory,
+        )
+
+        assert await synchronizer.sync_once()
+        assert destination.read_bytes() == b""
+        assert destination.stat().st_mode & 0o777 == 0o600
+        assert synchronizer.snapshot_fingerprints == frozenset()
+        assert captured[0][0]
+        assert captured[0][1] != str(registration_root / "scripts" / "export_registered_sessions.py")
+        assert captured[0][-2:] == (
+            str(registration_root / "keys" / "auth-sessions.jsonl"),
+            str(registration_root / "keys" / "accounts.txt"),
+        )
+
+    asyncio.run(scenario())
+
+
+def test_local_snapshot_rejects_candidate_when_either_input_changes(tmp_path):
+    async def scenario():
+        registration_root = tmp_path / "registration"
+        keys = registration_root / "keys"
+        keys.mkdir(parents=True)
+        sessions = keys / "auth-sessions.jsonl"
+        accounts = keys / "accounts.txt"
+        sessions.write_bytes(_document("old") + b"\n")
+        accounts.write_text("", encoding="utf-8")
+        destination = tmp_path / "auth" / "source-snapshot.jsonl"
+        destination.parent.mkdir()
+        destination.write_bytes(_document("stable") + b"\n")
+
+        process = FakeProcess([_document("candidate") + b"\n"])
+
+        async def factory(*_args, **_kwargs):
+            accounts.write_text("new@example.test:p:sso\n", encoding="utf-8")
+            return process
+
+        synchronizer = LocalSnapshotSynchronizer(
+            registration_root,
+            destination,
+            process_factory=factory,
+        )
+
+        assert not await synchronizer.sync_once()
+        assert destination.read_bytes() == _document("stable") + b"\n"
 
     asyncio.run(scenario())
 

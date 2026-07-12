@@ -7,6 +7,23 @@
 set -e
 cd "$(dirname "$0")"
 
+. scripts/ensure_runtime.sh
+ensure_runtime
+
+if [ "${1:-}" = "--email-service" ]; then
+    shift
+    if command -v flock >/dev/null 2>&1; then
+        mkdir -p logs
+        exec 8>logs/email-service.lock
+        if ! flock -n 8; then
+            echo "[!] 邮箱服务已经在运行。"
+            exit 1
+        fi
+    fi
+    echo "[*] 启动邮箱服务... (Ctrl-C 停止)"
+    exec .venv/bin/python -m grok_register.email_server "$@"
+fi
+
 reconfig=0
 register_args=()
 for arg in "$@"; do
@@ -27,13 +44,7 @@ if command -v flock >/dev/null 2>&1; then
     fi
 fi
 
-# 1) 依赖:没有 venv 就自动安装
-if [ ! -d .venv ]; then
-    echo "[*] 首次运行,安装依赖..."
-    bash setup.sh
-fi
-
-# 2) 配置:无 .env 或显式 --reconfig 时进入引导
+# 1) 配置:无 .env 或显式 --reconfig 时进入引导
 if [ ! -f .env ] || [ "$reconfig" -eq 1 ]; then
     echo ""
     echo "选择邮箱模式:"
@@ -56,7 +67,7 @@ EMAIL_API=${api}
 ENV
         echo ""
         echo "[!] custom 模式还需在另一终端运行收信服务:"
-        echo "      .venv/bin/python email_server.py"
+        echo "      bash start.sh --email-service"
         echo "    并按 README「自建邮箱模式」配置 Cloudflare Email Worker。"
     else
         echo "EMAIL_MODE=tempmail" > .env
@@ -64,6 +75,6 @@ ENV
     echo "[*] 已写入 .env"
 fi
 
-# 3) 运行
+# 2) 运行
 echo "[*] 启动注册服务... (Ctrl-C 停止)"
-exec .venv/bin/python register.py "${register_args[@]}"
+exec .venv/bin/python -m grok_register.register "${register_args[@]}"

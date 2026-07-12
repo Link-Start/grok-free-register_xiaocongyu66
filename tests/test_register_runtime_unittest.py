@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 
-from core.observer import Metrics
+from grok_register.core.observer import Metrics
 
 
 playwright_pkg = types.ModuleType("playwright")
@@ -19,7 +19,33 @@ requests_mod.get = lambda *_args, **_kwargs: None
 requests_mod.post = lambda *_args, **_kwargs: None
 sys.modules.setdefault("requests", requests_mod)
 
-import register
+from grok_register import register
+
+
+def test_registration_persists_exact_session_before_legacy_outputs(monkeypatch):
+    writes = []
+    monkeypatch.setattr(
+        register,
+        "_append_registration_line",
+        lambda path, line, mode=None, durable=False: writes.append(
+            (path, line, mode, durable)
+        ),
+    )
+
+    register._persist_registration(
+        "user@example.test",
+        "password",
+        "sso-token",
+        [{"name": "sso", "value": "opaque", "domain": "accounts.x.ai"}],
+    )
+
+    assert [item[0] for item in writes] == [
+        "keys/auth-sessions.jsonl",
+        "keys/accounts.txt",
+        "keys/grok.txt",
+    ]
+    assert writes[0][2] == 0o600
+    assert [item[3] for item in writes] == [True, False, False]
 
 
 class FakePage:

@@ -17,8 +17,8 @@ import asyncio
 import time
 import pytest
 
-from core.envelope import ResourceEnvelope
-from core.inventory import Inventory, PairLease
+from grok_register.core.envelope import ResourceEnvelope
+from grok_register.core.inventory import Inventory, PairLease
 
 
 # ═══════════════════════════════════════════
@@ -468,7 +468,7 @@ class TestInventory:
     @pytest.mark.asyncio
     async def test_metrics_admitted(self):
         """put 成功时 metrics.t_admitted / q_admitted 递增。"""
-        from core.observer import Metrics
+        from grok_register.core.observer import Metrics
         m = Metrics()
         inv = Inventory(metrics=m)
         t_sem = asyncio.Semaphore(2)
@@ -480,7 +480,7 @@ class TestInventory:
     @pytest.mark.asyncio
     async def test_metrics_expired(self):
         """过期资源 put 时 metrics.t_expired 递增。"""
-        from core.observer import Metrics
+        from grok_register.core.observer import Metrics
         m = Metrics()
         inv = Inventory(metrics=m)
         t_sem = asyncio.Semaphore(2)

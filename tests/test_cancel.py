@@ -11,9 +11,9 @@ import asyncio
 import time
 import pytest
 
-from core.envelope import ResourceEnvelope
-from core.inventory import Inventory
-from core.observer import Metrics
+from grok_register.core.envelope import ResourceEnvelope
+from grok_register.core.inventory import Inventory
+from grok_register.core.observer import Metrics
 from tests.fakes import FakeTurnstile, FakeEmailService, FakeRegisterAPI, Conservation
 
 

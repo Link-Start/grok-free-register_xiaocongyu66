@@ -168,7 +168,7 @@ python3 -m pytest tests -q
 场景 runner：
 
 ```bash
-python3 run_tests.py
+python3 tools/run_tests.py
 ```
 
 重点测试文件：

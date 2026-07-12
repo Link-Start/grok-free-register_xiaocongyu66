@@ -1,6 +1,6 @@
 import unittest
 
-from runtime_log_analyzer import (
+from tools.runtime_log_analyzer import (
     parse_monitor_lines,
     parse_solver_timelines,
     summarize_monitor_rows,

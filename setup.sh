@@ -46,4 +46,5 @@ mkdir -p keys
 echo "[4/4] 安装完成！"
 echo ""
 echo "运行注册服务: bash start.sh"
+echo "运行自建邮箱服务: bash start.sh --email-service"
 echo "运行认证服务: bash auth-service.sh"

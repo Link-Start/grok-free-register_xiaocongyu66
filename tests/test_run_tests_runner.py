@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from core.observer import Metrics
-from run_tests import Inv, Sample, ScenarioConfig, run_scenario, write_report
+from grok_register.core.observer import Metrics
+from tools.run_tests import Inv, Sample, ScenarioConfig, run_scenario, write_report
 
 
 @pytest.mark.asyncio

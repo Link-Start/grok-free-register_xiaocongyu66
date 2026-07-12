@@ -199,7 +199,9 @@ def prepare_local_service_environment(env=None):
 
 @dataclass(frozen=True)
 class AuthServiceSettings:
-    ssh_host: str
+    source_kind: str
+    ssh_host: str | None
+    register_root: str
     remote_root: str
     identity_file: str | None
     sync_seconds: int = 30
@@ -210,10 +212,22 @@ class AuthServiceSettings:
     def from_environ(cls, env=None):
         env = dict(os.environ if env is None else env)
         ssh_host = (env.get("XAI_AUTH_SERVICE_SSH_HOST") or "").strip()
-        if not ssh_host:
+        requested_source = (env.get("XAI_AUTH_SERVICE_SOURCE") or "auto").strip().lower()
+        if requested_source not in {"auto", "local", "ssh"}:
             raise AuthServiceConfigurationError(
-                "XAI_AUTH_SERVICE_SSH_HOST is required"
+                "XAI_AUTH_SERVICE_SOURCE must be auto, local, or ssh"
             )
+        source_kind = (
+            "ssh" if requested_source == "auto" and ssh_host else
+            "local" if requested_source == "auto" else
+            requested_source
+        )
+        if source_kind == "ssh" and not ssh_host:
+            raise AuthServiceConfigurationError("XAI_AUTH_SERVICE_SSH_HOST is required")
+        register_root = (
+            env.get("XAI_AUTH_SERVICE_REGISTER_ROOT")
+            or str(Path(__file__).resolve().parents[1])
+        ).strip()
         remote_root = (
             env.get("XAI_AUTH_SERVICE_REMOTE_ROOT") or "/opt/grok-free-register"
         ).strip()
@@ -241,12 +255,14 @@ class AuthServiceSettings:
                 "XAI_AUTH_SERVICE_MIN_INTERVAL_SEC must be between 0 and 3600"
             )
         return cls(
-            ssh_host,
-            remote_root,
-            identity_file,
-            sync_seconds,
-            retry_seconds,
-            min_authorization_interval_seconds,
+            source_kind=source_kind,
+            ssh_host=ssh_host or None,
+            register_root=register_root,
+            remote_root=remote_root,
+            identity_file=identity_file,
+            sync_seconds=sync_seconds,
+            retry_seconds=retry_seconds,
+            min_authorization_interval_seconds=min_authorization_interval_seconds,
         )
 
 
@@ -437,8 +453,11 @@ class EventTerminal:
 
     def _format_user(self, kind, data):
         if kind == "startup":
+            source = {"local": "本机", "ssh": "远端"}.get(
+                data.get("source_kind"), "等待同步"
+            )
             return (
-                "[✓] 本地认证服务已启动 | 来源 等待同步 | "
+                f"[✓] 本地认证服务已启动 | 来源 {source} | "
                 f"输出 {data['destination']} | 待处理 — | 可用 {data['available']}"
             )
         if kind == "service_started":
@@ -846,7 +865,11 @@ async def main_async(*, log_mode="user"):
     from .inventory import CredentialInventory
     from .ledger import Ledger
     from .protocol import XAIProfile, XAIProtocol
-    from .remote_stream import DiskSnapshotSource, SSHSnapshotSynchronizer
+    from .remote_stream import (
+        DiskSnapshotSource,
+        LocalSnapshotSynchronizer,
+        SSHSnapshotSynchronizer,
+    )
     from .sinks import LocalAuthFileSink
 
     service_settings = AuthServiceSettings.from_environ()
@@ -861,13 +884,20 @@ async def main_async(*, log_mode="user"):
     try:
         ledger = Ledger(settings.ledger_path, settings.source_salt)
         snapshot_path = Path(settings.local_auth_dir) / "source-snapshot.jsonl"
-        synchronizer = SSHSnapshotSynchronizer(
-            service_settings.ssh_host,
-            snapshot_path,
-            remote_root=service_settings.remote_root,
-            identity_file=service_settings.identity_file,
-            fingerprint=ledger.fingerprint,
-        )
+        if service_settings.source_kind == "ssh":
+            synchronizer = SSHSnapshotSynchronizer(
+                service_settings.ssh_host,
+                snapshot_path,
+                remote_root=service_settings.remote_root,
+                identity_file=service_settings.identity_file,
+                fingerprint=ledger.fingerprint,
+            )
+        else:
+            synchronizer = LocalSnapshotSynchronizer(
+                service_settings.register_root,
+                snapshot_path,
+                fingerprint=ledger.fingerprint,
+            )
         source = DiskSnapshotSource(
             snapshot_path,
             synchronizer=synchronizer,
@@ -898,6 +928,7 @@ async def main_async(*, log_mode="user"):
                 "startup",
                 {
                     "destination": f"{AUTHENTICATED_DIRNAME}/",
+                    "source_kind": service_settings.source_kind,
                     **ledger.inventory_counts(),
                 },
             )
@@ -927,7 +958,9 @@ def _known_configuration_key(error):
     message = str(error)
     keys = (
         "XAI_AUTH_SERVICE_LOG_MODE",
+        "XAI_AUTH_SERVICE_SOURCE",
         "XAI_AUTH_SERVICE_SSH_HOST",
+        "XAI_AUTH_SERVICE_REGISTER_ROOT",
         "XAI_AUTH_SERVICE_SYNC_SEC",
         "XAI_AUTH_SERVICE_RETRY_SEC",
         "XAI_AUTH_SERVICE_MIN_INTERVAL_SEC",

@@ -1,7 +1,7 @@
 """
 邮件接收 API 服务器
 ====================
-接收 Cloudflare Email Routing 转发的邮件，供 register.py 查询。
+接收 Cloudflare Email Routing 转发的邮件，供注册服务查询。
 
 端点:
   POST /webhook          — Cloudflare 转发邮件到这里
@@ -10,8 +10,8 @@
   GET  /health           — 健康检查
 
 用法:
-  python email_server.py
-  EMAIL_DOMAIN=your.domain python email_server.py --port 8080
+  bash start.sh --email-service
+  EMAIL_DOMAIN=your.domain bash start.sh --email-service --port 8080
 """
 import os, re, json, time, sys
 try:

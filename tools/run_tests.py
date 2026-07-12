@@ -7,18 +7,19 @@ CSP 架构测试 Runner v2
   Part B — 场景压测: 每场景 ≥120s,完整 CSV 时间序列
 
 用法:
-  python run_tests.py                    # 全部(A+B)
-  python run_tests.py -s steady_state    # 单个场景
-  python run_tests.py --list             # 列出场景
+  python tools/run_tests.py                    # 全部(A+B)
+  python tools/run_tests.py -s steady_state    # 单个场景
+  python tools/run_tests.py --list             # 列出场景
 """
 import asyncio, csv, dataclasses, gc, json, os, random, sys, time
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from core.envelope import ResourceEnvelope
-from core.inventory import Inventory
-from core.observer import Metrics
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+from grok_register.core.envelope import ResourceEnvelope
+from grok_register.core.inventory import Inventory
+from grok_register.core.observer import Metrics
 
 
 # ═══════════════════════════════════════

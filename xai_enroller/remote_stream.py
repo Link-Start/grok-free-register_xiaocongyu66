@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+import sys
 import tempfile
 from contextlib import suppress
 from pathlib import Path
@@ -40,6 +41,15 @@ class SSHSnapshotSynchronizer:
         self.fingerprint = fingerprint or (lambda source_id: source_id)
         self.snapshot_fingerprints = None
         self._process = None
+
+    def _input_generation(self):
+        return None
+
+    def _input_generation_unchanged(self, generation):
+        return True
+
+    def _empty_snapshot_allowed(self):
+        return False
 
     def _command(self):
         return (
@@ -101,6 +111,7 @@ class SSHSnapshotSynchronizer:
         stderr_task = None
         try:
             os.fchmod(fd, 0o600)
+            input_generation = self._input_generation()
             process = await self.process_factory(
                 *self._args(),
                 stdout=asyncio.subprocess.PIPE,
@@ -135,8 +146,10 @@ class SSHSnapshotSynchronizer:
                     stderr_task = None
                 if returncode != 0:
                     raise RemoteStreamError("remote snapshot export failed")
-                if record_count == 0:
+                if record_count == 0 and not self._empty_snapshot_allowed():
                     raise RemoteStreamError("remote snapshot export was empty")
+                if not self._input_generation_unchanged(input_generation):
+                    raise RemoteStreamError("snapshot inputs changed during export")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary_name, self.destination)
@@ -165,6 +178,69 @@ class SSHSnapshotSynchronizer:
                 self._process = None
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name)
+
+
+class LocalSnapshotSynchronizer(SSHSnapshotSynchronizer):
+    """Export registration data from one local project into an atomic snapshot."""
+
+    def __init__(
+        self,
+        register_root,
+        destination,
+        *,
+        process_factory=asyncio.create_subprocess_exec,
+        fingerprint=None,
+        python_executable=sys.executable,
+        exporter_path=None,
+    ):
+        super().__init__(
+            "",
+            destination,
+            process_factory=process_factory,
+            fingerprint=fingerprint,
+        )
+        self.register_root = Path(register_root)
+        self.python_executable = str(python_executable)
+        self.exporter_path = Path(exporter_path or (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "export_registered_sessions.py"
+        ))
+        self.sessions_path = self.register_root / "keys" / "auth-sessions.jsonl"
+        self.accounts_path = self.register_root / "keys" / "accounts.txt"
+
+    @staticmethod
+    def _path_generation(path):
+        try:
+            stat_result = path.stat()
+        except FileNotFoundError:
+            return None
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+        )
+
+    def _input_generation(self):
+        return (
+            self._path_generation(self.sessions_path),
+            self._path_generation(self.accounts_path),
+        )
+
+    def _input_generation_unchanged(self, generation):
+        return self._input_generation() == generation
+
+    def _empty_snapshot_allowed(self):
+        return True
+
+    def _args(self):
+        return [
+            self.python_executable,
+            str(self.exporter_path),
+            str(self.sessions_path),
+            str(self.accounts_path),
+        ]
 
 
 class DiskSnapshotSource:

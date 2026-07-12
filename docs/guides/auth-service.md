@@ -1,6 +1,16 @@
 # 本地认证服务
 
-认证服务把注册机已有的 SSO 会话转换为 CPA 可直接读取的 OAuth 凭据。注册继续在服务器运行，浏览器授权和凭据文件保存在本地。
+认证服务把已有的 SSO 会话转换为 CPA 可直接读取的 OAuth 凭据。注册与认证可以在同一台机器，也可以分开运行。
+
+## 默认同机运行
+
+同一个项目目录已经或正在运行注册服务时，直接启动认证：
+
+```bash
+bash auth-service.sh
+```
+
+未配置 SSH 主机时，认证服务自动读取本项目 `keys/` 中的完整会话与历史账号。注册可以继续追加，认证服务只安装经过校验的完整快照。
 
 ## 配置远端同步
 
@@ -19,6 +29,13 @@ export XAI_AUTH_SERVICE_REMOTE_ROOT=/opt/grok-free-register
 ```
 
 使用 `ssh-agent` 时可省略 `XAI_AUTH_SERVICE_SSH_IDENTITY`。
+
+设置了 `XAI_AUTH_SERVICE_SSH_HOST` 后，默认的 `auto` 模式会选择 SSH。需要明确覆盖时使用：
+
+```bash
+export XAI_AUTH_SERVICE_SOURCE=local  # 强制读取同机注册结果
+export XAI_AUTH_SERVICE_SOURCE=ssh    # 强制使用 SSH，必须配置主机
+```
 
 ## 运行
 
@@ -45,4 +62,4 @@ c       取消当前任务
 q       安全退出
 ```
 
-本地快照默认每 30 秒更新一次；内容无变化时终端保持安静。有效快照和已生成凭据会在重启后继续使用。
+快照默认每 30 秒更新一次；内容无变化时终端保持安静。有效快照和已生成凭据会在重启后继续使用。

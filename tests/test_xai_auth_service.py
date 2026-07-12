@@ -46,6 +46,7 @@ def test_user_terminal_reports_progress_without_internal_or_secret_fields():
                 "available": 7,
                 "claimed": 3,
                 "destination": "authenticated/",
+                "source_kind": "local",
                 "ssh_host": "do-not-print.example",
             },
         )
@@ -79,7 +80,7 @@ def test_user_terminal_reports_progress_without_internal_or_secret_fields():
     )
 
     assert messages == [
-        "[✓] 本地认证服务已启动 | 来源 等待同步 | 输出 authenticated/ | 待处理 — | 可用 7",
+        "[✓] 本地认证服务已启动 | 来源 本机 | 输出 authenticated/ | 待处理 — | 可用 7",
         "[→] 开始认证 #3 | 待处理 41",
         "[✓] 认证成功 #3 | 运行平均 1.75/分 | 累计 120 | 可用 117",
     ]
@@ -204,6 +205,7 @@ def test_auth_service_configuration_errors_are_actionable_without_traceback(tmp_
     environment = os.environ.copy()
     environment.pop("XAI_AUTH_SERVICE_SSH_HOST", None)
     environment.pop("XAI_AUTH_SERVICE_LOG_MODE", None)
+    environment["XAI_AUTH_SERVICE_SOURCE"] = "ssh"
     missing = subprocess.run(
         [sys.executable, "-m", "xai_enroller.service"],
         env=environment,
@@ -227,6 +229,7 @@ def test_auth_service_configuration_errors_are_actionable_without_traceback(tmp_
     assert "Traceback" not in invalid.stderr
 
     environment["XAI_AUTH_SERVICE_LOG_MODE"] = "user"
+    environment.pop("XAI_AUTH_SERVICE_SOURCE", None)
     environment["XAI_AUTH_SERVICE_SSH_HOST"] = "user@example.test"
     environment["XAI_ENROLLER_LOCAL_AUTH_DIR"] = str(tmp_path / "auth")
     environment["XAI_ENROLLER_TIMEOUT_SEC"] = "not-a-number"
@@ -394,17 +397,39 @@ def test_interactive_runner_reports_controls_and_cancels_the_active_cycle():
     ]
 
 
-def test_auth_service_settings_requires_an_ssh_host_and_bounds_polling():
-    settings = AuthServiceSettings.from_environ(
+def test_auth_service_settings_defaults_local_and_preserves_ssh_auto_detection(tmp_path):
+    local = AuthServiceSettings.from_environ(
+        {"XAI_AUTH_SERVICE_REGISTER_ROOT": str(tmp_path)}
+    )
+    remote = AuthServiceSettings.from_environ(
         {
             "XAI_AUTH_SERVICE_SSH_HOST": "ubuntu@example.test",
             "XAI_AUTH_SERVICE_SYNC_SEC": "45",
         }
     )
 
-    assert settings.ssh_host == "ubuntu@example.test"
-    assert settings.sync_seconds == 45
-    assert settings.remote_root == "/opt/grok-free-register"
+    assert local.source_kind == "local"
+    assert local.ssh_host is None
+    assert local.register_root == str(tmp_path)
+    assert remote.source_kind == "ssh"
+    assert remote.ssh_host == "ubuntu@example.test"
+    assert remote.sync_seconds == 45
+    assert remote.remote_root == "/opt/grok-free-register"
+
+
+def test_auth_service_settings_explicit_source_overrides_auto_detection():
+    local = AuthServiceSettings.from_environ(
+        {
+            "XAI_AUTH_SERVICE_SOURCE": "local",
+            "XAI_AUTH_SERVICE_SSH_HOST": "ignored@example.test",
+        }
+    )
+    assert local.source_kind == "local"
+
+    with pytest.raises(ValueError, match="XAI_AUTH_SERVICE_SSH_HOST"):
+        AuthServiceSettings.from_environ({"XAI_AUTH_SERVICE_SOURCE": "ssh"})
+    with pytest.raises(ValueError, match="XAI_AUTH_SERVICE_SOURCE"):
+        AuthServiceSettings.from_environ({"XAI_AUTH_SERVICE_SOURCE": "unknown"})
 
 
 def test_pipeline_runner_takes_a_credential_batch_and_reports_inventory():

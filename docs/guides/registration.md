@@ -46,7 +46,7 @@ EMAIL_API=http://127.0.0.1:8080
 自建模式还需运行：
 
 ```bash
-.venv/bin/python email_server.py
+bash start.sh --email-service
 ```
 
 性能参数默认会根据 CPU 和可用内存估算。除非正在压测，否则保持 `.env.example` 中的默认值即可。

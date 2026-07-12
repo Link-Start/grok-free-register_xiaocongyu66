@@ -2,9 +2,9 @@ import asyncio
 import time
 import unittest
 
-from core.envelope import ResourceEnvelope
-from core.inventory import Inventory
-from core.observer import Metrics
+from grok_register.core.envelope import ResourceEnvelope
+from grok_register.core.inventory import Inventory
+from grok_register.core.observer import Metrics
 
 
 class InventoryUnitTests(unittest.IsolatedAsyncioTestCase):

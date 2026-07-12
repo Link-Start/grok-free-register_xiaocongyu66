@@ -5,6 +5,7 @@ keys/
 *.log
 *.bak
 .venv/
+.setup.lock/
 .DS_Store
 .claude/
 .codex-temp/
