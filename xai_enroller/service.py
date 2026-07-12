@@ -10,6 +10,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from .models import SourceRecord
 from .inventory import InventoryError
 from .remote_stream import parse_session_document
@@ -1004,6 +1006,7 @@ def _print_unexpected_service_failure(error, *, log_mode):
 
 
 def main(argv=None):
+    load_dotenv()
     mode = "user"
     try:
         mode = resolve_auth_log_mode(argv)
