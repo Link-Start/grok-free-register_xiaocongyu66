@@ -241,7 +241,8 @@ export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
 每 30 秒通过一次性 SSH 导出全量 JSONL 快照。快照经逐行校验、`fsync` 后原子替换到
 `~/Downloads/grok-free-register-auth/source-snapshot.jsonl`；同步失败会继续使用上一份有效快照。
 认证使用本机 CloakBrowser Chromium，
-成功结果写入 `~/Downloads/grok-free-register-auth/`，文件格式可以直接供 CPA 使用。
+成功结果写入 `~/Downloads/grok-free-register-auth/authenticated/`，运行状态、同步快照与
+认证文件分开保存；认证文件格式可以直接供 CPA 使用。
 
 先把导出器同步到注册机的 `scripts/` 目录：
 
@@ -276,7 +277,7 @@ export XAI_AUTH_SERVICE_RETRY_SEC=60
 `r` 恢复，`c` 取消当前账号，`q` 退出；`Ctrl-C` 同样会退出。累计结果保存在：
 
 ```text
-~/Downloads/grok-free-register-auth/
+~/Downloads/grok-free-register-auth/authenticated/
 ```
 
 ### 配置 CPA 导入

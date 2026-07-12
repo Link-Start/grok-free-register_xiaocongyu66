@@ -15,6 +15,7 @@ from .remote_stream import parse_session_document
 
 
 DEFAULT_LOCAL_AUTH_DIR = Path.home() / "Downloads" / "grok-free-register-auth"
+AUTHENTICATED_DIRNAME = "authenticated"
 
 
 def prepare_local_service_environment(env=None):
@@ -506,7 +507,7 @@ async def main_async():
         )
         executor = PlaywrightExecutor(concurrency=1)
         sink = LocalAuthFileSink(
-            settings.local_auth_dir,
+            Path(settings.local_auth_dir) / AUTHENTICATED_DIRNAME,
             name_secret=settings.source_salt,
         )
         ledger = Ledger(settings.ledger_path, settings.source_salt)
