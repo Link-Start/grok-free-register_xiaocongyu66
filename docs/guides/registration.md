@@ -25,6 +25,7 @@ bash start.sh --reconfig
 ```
 
 未设置 `--target` 时服务持续运行，按 `Ctrl-C` 安全停止。
+再次执行 `bash start.sh` 即可重启。程序直接使用当前终端，不需要额外的会话管理工具。
 
 ## 配置邮箱
 

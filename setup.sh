@@ -45,5 +45,5 @@ mkdir -p keys
 
 echo "[4/4] 安装完成！"
 echo ""
-echo "运行: .venv/bin/python register.py"
-echo "或:  bash run.sh"
+echo "运行注册服务: bash start.sh"
+echo "运行认证服务: bash auth-service.sh"

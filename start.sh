@@ -17,7 +17,7 @@ for arg in "$@"; do
     fi
 done
 
-# 同一工作目录只允许一个注册进程，避免多次 nohup 同时写账号和日志。
+# 同一工作目录只允许一个注册进程，避免重复启动同时写账号和日志。
 if command -v flock >/dev/null 2>&1; then
     mkdir -p logs
     exec 9>logs/register.lock

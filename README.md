@@ -24,11 +24,13 @@ bash start.sh
 常用命令：
 
 ```bash
-bash run.sh                 # 按当前 .env 运行
-bash run.sh --target 100    # 成功 100 个后停止
-bash run.sh --max-mem 6G    # 自动估算并发时最多使用 6G 内存
+bash start.sh               # 按当前 .env 前台运行
+bash start.sh --target 100  # 成功 100 个后停止
+bash start.sh --max-mem 6G  # 自动估算并发时最多使用 6G 内存
 bash start.sh --reconfig    # 重新选择邮箱模式
 ```
+
+`start.sh` 直接在当前终端显示状态。按 `Ctrl-C` 停止，再次执行同一命令即可重启；不需要额外的会话管理或守护进程依赖。
 
 需要代理时，在 `.env` 中加入：
 
@@ -164,11 +166,10 @@ email:password:sso_token
 ## 项目结构
 
 ```text
-register.py                 主运行入口
+register.py                 注册核心
 email_server.py             custom 模式的本地收信服务
 cloudflare/email-worker.js  Cloudflare Email Routing Worker 示例
 start.sh                    首次配置和运行
-run.sh                      按当前配置运行
 setup.sh                    安装依赖
 .env.example                配置模板
 runtime_log_analyzer.py     运行日志分析工具
@@ -203,44 +204,6 @@ python3 run_tests.py --list
 
 `xai_enroller/` 用于把已有 xAI 账号的 SSO 会话转换为 OAuth 凭据，并导入 CPA
 凭据库。它独立于注册流程运行：注册机不需要启动，已有账号也不需要重新注册。
-
-先执行一次依赖安装：
-
-```bash
-bash setup.sh
-```
-
-### 准备账号来源
-
-支持三种来源。
-
-文件模式每行一个账号，格式为 `账号标识<TAB>SSO`：
-
-```text
-account-001<TAB><sso-token>
-account-002<TAB><sso-token>
-```
-
-```bash
-chmod 600 /path/to/xai-sso.tsv
-export XAI_ENROLLER_SOURCE_KIND=file
-export XAI_ENROLLER_SOURCE_FILE=/path/to/xai-sso.tsv
-export XAI_ENROLLER_SOURCE_SALT=<随机盐>
-```
-
-SQLite 模式会从 `accounts` 表读取仍有效的账号：
-
-```bash
-export XAI_ENROLLER_SOURCE_KIND=sqlite
-export XAI_ENROLLER_SOURCE_DB=/path/to/accounts.db
-export XAI_ENROLLER_SOURCE_SALT=<随机盐>
-```
-
-两种模式都可指定本地运行记录文件：
-
-```bash
-export XAI_ENROLLER_LEDGER_PATH=/path/to/xai-enroller-ledger.db
-```
 
 ### 注册机同步模式
 
@@ -306,36 +269,7 @@ export XAI_AUTH_SERVICE_RETRY_SEC=60
 库存状态保存在 `enrollment-ledger.db` 的 `credential_inventory` 表中，状态为
 `available`、`claiming` 或 `claimed`。每条记录预留 `note` 字段，默认留空。
 
-### 配置 CPA 导入
-
-```bash
-export XAI_ENROLLER_SINK=cpa
-export XAI_ENROLLER_CPA_BASE_URL=https://cpa.example.com
-export XAI_ENROLLER_CPA_MANAGEMENT_SECRET=<管理密钥>
-```
-
-### 运行
-
-先用 HTTP 模式检查单个账号：
-
-```bash
-python -m xai_enroller --source "$XAI_ENROLLER_SOURCE_KIND" --target 1 --executor http
-```
-
-需要浏览器完成授权时，使用 Playwright：
-
-```bash
-python -m xai_enroller --source "$XAI_ENROLLER_SOURCE_KIND" --target 1 --executor playwright --sink cpa
-```
-
-默认并发为 `1`。可用参数：
-
-```bash
-python -m xai_enroller --target 10 --concurrency 2 --retry-attempts 1
-```
-
-运行结果会输出每个账号的状态：`imported` 表示已导入；`needs_browser` 表示需要
-浏览器确认；`needs_interaction` 表示需要人工处理登录、验证或授权页面。
+`auth-service.sh` 首次运行会自动安装项目依赖。正式用户流程只需要这个 Bash 入口；底层 Python 模块保留给开发和测试，不作为另一套使用方式。
 
 ## 开发文档
 

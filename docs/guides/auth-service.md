@@ -20,11 +20,13 @@ export XAI_AUTH_SERVICE_REMOTE_ROOT=/opt/grok-free-register
 
 使用 `ssh-agent` 时可省略 `XAI_AUTH_SERVICE_SSH_IDENTITY`。
 
-## 常驻运行
+## 运行
 
 ```bash
 bash auth-service.sh
 ```
+
+首次运行会自动安装项目依赖。该命令在当前终端持续运行并直接接受控制命令；输入 `q` 或按 `Ctrl-C` 停止，再次执行同一命令即可重启。不需要额外的会话管理工具。
 
 普通模式只在来源连接、发现新账号、任务开始、认证结果、限流和控制状态变化时输出。查看队列、重试、节拍和冷却探针时使用：
 
