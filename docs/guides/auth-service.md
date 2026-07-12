@@ -22,6 +22,8 @@ scp scripts/export_registered_sessions.py user@server.example:/opt/grok-free-reg
 
 在本地终端设置连接信息：
 
+可以直接 `export`，也可以把 `.env.example` 复制为 `.env` 后填写；认证入口会自动读取 `.env`。
+
 ```bash
 export XAI_AUTH_SERVICE_SSH_HOST=user@server.example
 export XAI_AUTH_SERVICE_SSH_IDENTITY=/path/to/key.pem

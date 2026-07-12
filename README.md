@@ -235,6 +235,9 @@ scp scripts/export_registered_sessions.py user@your-server:/opt/grok-free-regist
 
 然后在本地配置 SSH 连接：
 
+下面这些变量既可在终端 `export`，也可写入由 `.env.example` 复制出的 `.env`；
+`auth-service.sh` 会自动读取该文件。
+
 ```bash
 export XAI_AUTH_SERVICE_SSH_HOST=user@your-server
 export XAI_AUTH_SERVICE_SSH_IDENTITY=/path/to/ssh-key.pem  # 使用 ssh-agent 时可省略
