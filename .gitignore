@@ -3,6 +3,7 @@ __pycache__/
 .env
 keys/
 *.log
+logs/
 *.bak
 .venv/
 .setup.lock/
