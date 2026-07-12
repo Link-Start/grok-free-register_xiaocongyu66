@@ -6,6 +6,7 @@ import types
 import unittest
 
 from grok_register.core.observer import Metrics
+from xai_enroller.models import OAuthCredential
 
 
 playwright_pkg = types.ModuleType("playwright")
@@ -20,6 +21,16 @@ requests_mod.post = lambda *_args, **_kwargs: None
 sys.modules.setdefault("requests", requests_mod)
 
 from grok_register import register
+
+
+class Response:
+    def __init__(self, data, status_code=200, text=None):
+        self._data = data
+        self.status_code = status_code
+        self.text = json.dumps(data) if text is None else text
+
+    def json(self):
+        return self._data
 
 
 def test_registration_persists_exact_session_before_legacy_outputs(monkeypatch):
@@ -46,6 +57,445 @@ def test_registration_persists_exact_session_before_legacy_outputs(monkeypatch):
     ]
     assert writes[0][2] == 0o600
     assert [item[3] for item in writes] == [True, False, False]
+
+
+def test_registration_can_disable_legacy_account_exports(monkeypatch):
+    writes = []
+    monkeypatch.setattr(register, "KEY_EXPORT_FORMATS", ("sub2api",))
+    monkeypatch.setattr(
+        register,
+        "_append_registration_line",
+        lambda path, line, mode=None, durable=False: writes.append(
+            (path, line, mode, durable)
+        ),
+    )
+
+    register._persist_registration(
+        "user@example.test",
+        "password",
+        "sso-token",
+        [{"name": "sso", "value": "opaque", "domain": "accounts.x.ai"}],
+    )
+
+    assert [item[0] for item in writes] == ["keys/auth-sessions.jsonl"]
+
+
+def test_local_key_export_sink_writes_cpa_and_sub2api_folders(monkeypatch, tmp_path):
+    monkeypatch.setattr(register, "KEY_EXPORT_DIR", str(tmp_path))
+    credential = OAuthCredential(
+        access_token="access-token",
+        refresh_token="refresh-token",
+        id_token="id-token",
+        token_type="Bearer",
+        expires_in=3600,
+        expires_at="2026-07-11T00:00:00Z",
+        last_refresh="2026-07-11T00:00:00Z",
+        subject="subject-1",
+        token_endpoint="https://auth.x.ai/oauth2/token",
+    )
+
+    asyncio.run(
+        register._LocalKeyExportSink(
+            "user@example.test",
+            ("cpa", "sub2api"),
+            b"name-secret",
+        ).store(credential)
+    )
+
+    cpa_files = list((tmp_path / "cpa").glob("xai-*.json"))
+    assert len(cpa_files) == 1
+    assert json.loads(cpa_files[0].read_text(encoding="utf-8"))["refresh_token"] == "refresh-token"
+
+    sub2api_files = list((tmp_path / "sub2api").glob("xai-*.sub2api.json"))
+    assert len(sub2api_files) == 1
+    merged = json.loads((tmp_path / "sub2api" / "accounts.sub2api.json").read_text(encoding="utf-8"))
+    assert merged["accounts"][0]["platform"] == "grok"
+    assert merged["accounts"][0]["credentials"]["refresh_token"] == "refresh-token"
+    assert merged["accounts"][0]["credentials"]["email"] == "user@example.test"
+
+
+def test_key_export_enrollment_uses_xai_enroller_and_writes_selected_format(monkeypatch, tmp_path):
+    monkeypatch.setattr(register, "KEY_EXPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(register, "KEY_EXPORT_FORMATS", ("sub2api",))
+    monkeypatch.setattr(register, "KEY_EXPORT_ENROLLER", True)
+    monkeypatch.setattr(register, "_pick_grok_proxy", lambda: None)
+
+    class FakeCoordinator:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def run(self, target):
+            credential = OAuthCredential(
+                access_token="access-token",
+                refresh_token="refresh-token",
+                id_token="id-token",
+                token_type="Bearer",
+                expires_in=3600,
+                expires_at="2026-07-11T00:00:00Z",
+                last_refresh="2026-07-11T00:00:00Z",
+                subject="subject-1",
+                token_endpoint="https://auth.x.ai/oauth2/token",
+            )
+            await self.kwargs["sink"].store(credential)
+            return [
+                types.SimpleNamespace(
+                    status=types.SimpleNamespace(value="imported"),
+                    reason_code="imported",
+                )
+            ]
+
+    import xai_enroller.coordinator
+
+    monkeypatch.setattr(xai_enroller.coordinator, "EnrollmentCoordinator", FakeCoordinator)
+
+    asyncio.run(
+        register._run_key_export_enrollment(
+            "user@example.test",
+            "sso-token",
+            [{"name": "sso", "value": "sso-token", "domain": "accounts.x.ai"}],
+        )
+    )
+
+    merged = json.loads((tmp_path / "sub2api" / "accounts.sub2api.json").read_text(encoding="utf-8"))
+    assert merged["accounts"][0]["platform"] == "grok"
+
+
+def test_moemail_url_normalizes_ui_path():
+    assert (
+        register._moemail_url("/api/config", "https://mail.example.test/moe")
+        == "https://mail.example.test/api/config"
+    )
+    assert (
+        register._moemail_url("/api/config", "https://api.example.test/api")
+        == "https://api.example.test/api/config"
+    )
+
+
+def test_moemail_create_uses_api_key_and_config_domain(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(register, "MOEMAIL_API", "https://mail.example.test/moe")
+    monkeypatch.setattr(register, "MOEMAIL_API_KEY", "secret-key")
+    monkeypatch.setattr(register, "MOEMAIL_DOMAIN", "")
+    monkeypatch.setattr(register, "MOEMAIL_EXPIRY_MS", 3600000)
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", "")
+    register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(("GET", url, headers, None, timeout))
+        return Response({"emailDomains": "first.test,second.test"})
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(("POST", url, headers, json, timeout))
+        return Response({"id": "email-id", "email": "oc123@first.test"})
+
+    monkeypatch.setattr(register.req, "get", fake_get)
+    monkeypatch.setattr(register.req, "post", fake_post)
+
+    handle, email = register._moemail_create()
+
+    assert handle == "moe|email-id"
+    assert email == "oc123@first.test"
+    assert calls[0][1] == "https://mail.example.test/api/config"
+    assert calls[0][2]["X-API-Key"] == "secret-key"
+    assert calls[1][1] == "https://mail.example.test/api/emails/generate"
+    assert calls[1][2]["Content-Type"] == "application/json"
+    assert calls[1][3]["domain"] == "first.test"
+
+
+def test_moemail_fetch_participates_in_code_extraction(monkeypatch):
+    monkeypatch.setattr(register, "MOEMAIL_API", "https://mail.example.test")
+    monkeypatch.setattr(register, "MOEMAIL_API_KEY", "secret-key")
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", "")
+    register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
+
+    def fake_get(url, headers=None, timeout=None):
+        assert headers["X-API-Key"] == "secret-key"
+        assert url == "https://mail.example.test/api/emails/email-id"
+        return Response(
+            {
+                "messages": [
+                    {
+                        "id": "message-id",
+                        "subject": "Grok code",
+                        "content": "Your code is <b>ABC-123</b>",
+                        "html": "",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(register.req, "get", fake_get)
+
+    text = register._tempmail_fetch("moe|email-id")
+    assert register._extract_code(text) == "ABC123"
+
+
+def test_moemail_mode_does_not_fallback_to_other_providers(monkeypatch):
+    monkeypatch.setattr(register, "EMAIL_MODE", "moemail")
+    monkeypatch.setattr(register, "_moemail_create", lambda _password: ("moe|id", "u@moe.test"))
+    monkeypatch.setattr(
+        register,
+        "_mailtm_create",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unused")),
+    )
+    monkeypatch.setattr(
+        register,
+        "_lol_create",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unused")),
+    )
+
+    handle, email, password = register.create_email()
+
+    assert handle == "moe|id"
+    assert email == "u@moe.test"
+    assert password
+
+
+def test_proxy_pool_file_rotates_and_normalizes(monkeypatch, tmp_path):
+    proxy_file = tmp_path / "proxy.txt"
+    proxy_file.write_text(
+        "\n".join(
+            [
+                "# local proxy pool",
+                "http://one.example:8080",
+                "socks5://two.example:1080",
+                "three.example:8888",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", str(proxy_file))
+    monkeypatch.setattr(register, "PROXY_POOL_STRATEGY", "round_robin")
+    register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
+
+    assert register._pick_grok_proxy() == "http://one.example:8080"
+    assert register._pick_grok_proxy() == "socks5://two.example:1080"
+    assert register._pick_grok_proxy() == "http://three.example:8888"
+    assert register._pick_grok_proxy() == "http://one.example:8080"
+
+
+def test_proxy_pool_share_link_reuses_existing_relay_node(monkeypatch):
+    link = "vless://node@example.test:443?encryption=none#relay"
+    calls = []
+
+    monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_HOST", "127.0.0.1")
+    monkeypatch.setattr(register, "PROXY_RELAY_PROXY_SCHEME", "auto")
+    register._proxy_relay_link_cache.clear()
+
+    def fake_relay_json(method, path, payload=None):
+        calls.append((method, path, payload))
+        return {
+            "data": {
+                "nodes": [
+                    {
+                        "share_link": link,
+                        "local_port": 19081,
+                        "kernel": "sing-box",
+                    }
+                ]
+            }
+        }
+
+    monkeypatch.setattr(register, "_proxy_relay_json", fake_relay_json)
+
+    assert register._normalize_proxy_line(link) == "http://127.0.0.1:19081"
+    assert register._normalize_proxy_line(link) == "http://127.0.0.1:19081"
+    assert calls == [("GET", "/api/state", None)]
+
+
+def test_proxy_pool_share_link_imports_via_relay(monkeypatch):
+    link = "trojan://secret@example.test:443#relay"
+    calls = []
+
+    monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_KERNEL", "auto")
+    monkeypatch.setattr(register, "PROXY_RELAY_HOST", "127.0.0.1")
+    monkeypatch.setattr(register, "PROXY_RELAY_PROXY_SCHEME", "auto")
+    register._proxy_relay_link_cache.clear()
+
+    def fake_relay_json(method, path, payload=None):
+        calls.append((method, path, payload))
+        if method == "POST":
+            return {"ok": True}
+        if len([call for call in calls if call[0] == "GET"]) == 1:
+            return {"nodes": []}
+        return {"nodes": [{"link": link, "localPort": 19082, "kernel": "sing-box"}]}
+
+    monkeypatch.setattr(register, "_proxy_relay_json", fake_relay_json)
+
+    assert register._normalize_proxy_line(link) == "http://127.0.0.1:19082"
+    assert calls[1] == (
+        "POST",
+        "/api/nodes/import",
+        {"share_link": link, "kernel": "sing-box", "local_port": ""},
+    )
+
+
+def test_proxy_pool_retries_failed_share_link_after_retry_window(monkeypatch, tmp_path):
+    proxy_file = tmp_path / "proxy.txt"
+    proxy_file.write_text("vless://node@example.test:443#relay\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", str(proxy_file))
+    monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_RETRY_SEC", 30)
+    monkeypatch.setattr(register, "PROXY_POOL_STRATEGY", "round_robin")
+    register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
+
+    def fake_from_share_link(link):
+        calls.append(link)
+        return "http://127.0.0.1:19083" if len(calls) > 1 else None
+
+    monkeypatch.setattr(register, "_proxy_from_share_link", fake_from_share_link)
+
+    assert register._pick_grok_proxy() is None
+    assert register._pick_grok_proxy() is None
+    assert len(calls) == 1
+
+    register._proxy_pool_cache["retry_at"] = 0
+
+    assert register._pick_grok_proxy() == "http://127.0.0.1:19083"
+    assert len(calls) == 2
+
+
+def test_proxy_pool_mixes_manual_and_auto_active_proxies(monkeypatch, tmp_path):
+    proxy_file = tmp_path / "proxy.txt"
+    proxy_file.write_text("http://manual.example:8080\n", encoding="utf-8")
+    auto_dir = tmp_path / "auto"
+    auto_dir.mkdir()
+    (auto_dir / "active.txt").write_text("socks5://auto.example:1080\n", encoding="utf-8")
+
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", str(proxy_file))
+    monkeypatch.setattr(
+        register,
+        "PROXY_AUTO_CONFIG",
+        register.ProxyAutoConfig(
+            enabled=True,
+            output_dir=str(auto_dir),
+            active_file="active.txt",
+            export_formats=("raw",),
+        ),
+    )
+    register._proxy_pool_cache.update(
+        {"path": None, "mtime_ns": None, "auto_mtime_ns": None, "items": (), "index": 0}
+    )
+
+    with register._proxy_pool_lock:
+        items = register._load_proxy_pool_locked()
+
+    assert items == ("http://manual.example:8080", "socks5://auto.example:1080")
+
+
+def test_relay_proxy_url_auto_uses_xray_socks(monkeypatch):
+    monkeypatch.setattr(register, "PROXY_RELAY_HOST", "127.0.0.1")
+    monkeypatch.setattr(register, "PROXY_RELAY_PROXY_SCHEME", "auto")
+
+    assert register._relay_proxy_url(10808, "xray") == "socks5://127.0.0.1:10808"
+    assert register._relay_proxy_url(10809, "sing-box") == "http://127.0.0.1:10809"
+
+
+def test_email_http_request_does_not_apply_grok_proxy_pool_by_default(monkeypatch, tmp_path):
+    proxy_file = tmp_path / "proxy.txt"
+    proxy_file.write_text("socks5://proxy.example:1080\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", str(proxy_file))
+    monkeypatch.setattr(register, "PROXY_POOL_STRATEGY", "round_robin")
+    monkeypatch.setattr(register, "CF_ARES_EMAIL_MODE", "0")
+    register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response({"ok": True})
+
+    monkeypatch.setattr(register.req, "get", fake_get)
+
+    response = register._email_get("https://mail.example.test/api/config", timeout=9)
+
+    assert response.json() == {"ok": True}
+    assert calls[0][1]["timeout"] == 9
+    assert "proxies" not in calls[0][1]
+
+
+def test_email_http_request_accepts_explicit_proxy(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(register, "CF_ARES_EMAIL_MODE", "0")
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response({"ok": True})
+
+    monkeypatch.setattr(register.req, "get", fake_get)
+
+    response = register._email_get(
+        "https://mail.example.test/api/config",
+        proxy="socks5://proxy.example:1080",
+        timeout=9,
+    )
+
+    assert response.json() == {"ok": True}
+    assert calls[0][1]["proxies"] == {
+        "http": "socks5://proxy.example:1080",
+        "https": "socks5://proxy.example:1080",
+    }
+
+
+def test_email_http_request_falls_back_to_cf_ares_on_cloudflare_block(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(register, "CF_ARES_EMAIL_MODE", "fallback")
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", "")
+    register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
+    monkeypatch.setattr(
+        register.req,
+        "get",
+        lambda url, **kwargs: Response({}, status_code=403, text="error code: 1010"),
+    )
+
+    def fake_cf_ares(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return Response({"ok": True})
+
+    monkeypatch.setattr(register, "_cf_ares_request", fake_cf_ares)
+
+    response = register._email_get(
+        "https://mail.example.test/api/config",
+        headers={"X-API-Key": "secret-key"},
+        timeout=7,
+    )
+
+    assert response.json() == {"ok": True}
+    assert calls == [
+        (
+            "GET",
+            "https://mail.example.test/api/config",
+            {"headers": {"X-API-Key": "secret-key"}, "timeout": 7},
+        )
+    ]
+
+
+def test_email_http_request_always_mode_skips_requests(monkeypatch):
+    monkeypatch.setattr(register, "CF_ARES_EMAIL_MODE", "always")
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", "")
+    register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
+    monkeypatch.setattr(
+        register.req,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unused")),
+    )
+    monkeypatch.setattr(
+        register,
+        "_cf_ares_request",
+        lambda method, url, **kwargs: Response({"transport": method.lower()}),
+    )
+
+    response = register._email_post("https://mail.example.test/api/emails/generate")
+
+    assert response.json() == {"transport": "post"}
 
 
 class FakePage:
@@ -142,9 +592,10 @@ class FakePage:
 
 
 class FakeContext:
-    def __init__(self):
+    def __init__(self, **kwargs):
         self.pages = []
         self.closed = False
+        self.kwargs = kwargs
         self.clear_cookies_calls = 0
         self.request = types.SimpleNamespace(get=self._request_get)
         self.request_get_calls = []
@@ -187,8 +638,8 @@ class FakeBrowser:
         self.pages.append(page)
         return page
 
-    async def new_context(self):
-        context = FakeContext()
+    async def new_context(self, **kwargs):
+        context = FakeContext(**kwargs)
         self.contexts.append(context)
         return context
 
@@ -224,6 +675,14 @@ class FakeInventory:
         return Claim()
 
 
+class FakeQInventory:
+    def __init__(self):
+        self.q_items = []
+
+    async def put_q(self, item):
+        self.q_items.append(item)
+
+
 class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._old_stop = register.STOP
@@ -233,6 +692,9 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self._old_create_code = register.grpc_create_code
         self._old_poll_code = register.poll_code
         self._old_poll_code_async = register._poll_code_async
+        self._old_poll_code_once_async = register._poll_code_once_async
+        self._old_pick_grok_proxy = register._pick_grok_proxy
+        register._pick_grok_proxy = lambda: None
         self._old_log = register.log
         self._old_target = register.TARGET
         self._old_c_hot_page_pool = getattr(register, "C_HOT_PAGE_POOL", None)
@@ -252,6 +714,8 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         register.grpc_create_code = self._old_create_code
         register.poll_code = self._old_poll_code
         register._poll_code_async = self._old_poll_code_async
+        register._poll_code_once_async = self._old_poll_code_once_async
+        register._pick_grok_proxy = self._old_pick_grok_proxy
         register.log = self._old_log
         register.TARGET = self._old_target
         if self._old_c_hot_page_pool is None and hasattr(register, "C_HOT_PAGE_POOL"):
@@ -804,6 +1268,78 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics.p_send_count, 1)
         self.assertGreaterEqual(metrics.p_physical_wait_seconds, 0)
         self.assertGreaterEqual(metrics.p_physical_hold_seconds, 0)
+
+    async def test_new_grok_page_uses_proxy_context_for_xai_pages(self):
+        old_pick = register._pick_grok_proxy
+        try:
+            register._pick_grok_proxy = lambda: "socks5://user:pass@proxy.example:1080"
+            browser = FakeBrowser()
+
+            context, page = await register._new_grok_page(browser)
+
+            self.assertIs(context, browser.contexts[0])
+            self.assertIs(page, browser.contexts[0].pages[0])
+            self.assertEqual(
+                browser.contexts[0].kwargs["proxy"],
+                {
+                    "server": "socks5://proxy.example:1080",
+                    "username": "user",
+                    "password": "pass",
+                },
+            )
+        finally:
+            register._pick_grok_proxy = old_pick
+
+    async def test_poll_and_admit_q_resends_code_before_admitting(self):
+        old_pick = register._pick_grok_proxy
+        old_timeout = register.P_REQUEST_TIMEOUT
+        old_resends = register.EMAIL_CODE_RESEND_ATTEMPTS
+        old_resend_after = register.EMAIL_CODE_RESEND_AFTER_SEC
+        sent_emails = []
+        polls = [None, None, "123456"]
+
+        async def fake_poll_once(_loop, _handle):
+            return polls.pop(0) if polls else "123456"
+
+        async def fake_create_code(_page, email):
+            sent_emails.append(email)
+            return True
+
+        try:
+            register._pick_grok_proxy = lambda: None
+            register.P_REQUEST_TIMEOUT = 1
+            register.EMAIL_CODE_RESEND_ATTEMPTS = 1
+            register.EMAIL_CODE_RESEND_AFTER_SEC = 0.01
+            register._poll_code_once_async = fake_poll_once
+            register.grpc_create_code = fake_create_code
+
+            q_pending_sem = asyncio.Semaphore(0)
+            q_slot_sem = asyncio.Semaphore(1)
+            metrics = Metrics()
+            inventory = FakeQInventory()
+
+            admitted = await register._poll_and_admit_q(
+                {"handle": "h1", "email": "a@example.test", "password": "pw"},
+                inventory,
+                q_pending_sem,
+                q_slot_sem,
+                metrics,
+                browser=FakeBrowser(),
+                physical_sem=asyncio.Semaphore(1),
+                p_send_sem=asyncio.Semaphore(1),
+            )
+
+            self.assertTrue(admitted)
+            self.assertEqual(sent_emails, ["a@example.test"])
+            self.assertEqual(metrics.q_returned, 1)
+            self.assertEqual(metrics.q_sent, 1)
+            self.assertEqual(q_pending_sem._value, 1)
+            self.assertEqual(inventory.q_items[0].value["code"], "123456")
+        finally:
+            register._pick_grok_proxy = old_pick
+            register.P_REQUEST_TIMEOUT = old_timeout
+            register.EMAIL_CODE_RESEND_ATTEMPTS = old_resends
+            register.EMAIL_CODE_RESEND_AFTER_SEC = old_resend_after
 
     async def test_consume_pair_records_physical_and_stage_metrics(self):
         async def ok_verify(*_args, **_kwargs):

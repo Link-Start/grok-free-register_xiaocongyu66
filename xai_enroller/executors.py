@@ -43,10 +43,17 @@ class PlaywrightExecutor:
     ALLOWED_CONTROLS = frozenset({"Authorize", "Allow", "Continue", "Confirm"})
     CLOSE_TIMEOUT_SECONDS = 5.0
 
-    def __init__(self, concurrency=1, playwright_factory=None, executable_path=None):
+    def __init__(
+        self,
+        concurrency=1,
+        playwright_factory=None,
+        executable_path=None,
+        proxy=None,
+    ):
         self.concurrency = concurrency
         self.playwright_factory = playwright_factory
         self.executable_path = executable_path or self._find_executable_path()
+        self.proxy = proxy
         self._playwright = None
         self._browser = None
         self._semaphore = asyncio.Semaphore(concurrency)
@@ -261,7 +268,8 @@ class PlaywrightExecutor:
             consent_submitted = False
             challenge_clicks = 0
             try:
-                context = await self._browser.new_context()
+                context_kwargs = {"proxy": self.proxy} if self.proxy else {}
+                context = await self._browser.new_context(**context_kwargs)
                 page = await context.new_page()
                 await context.add_cookies(self._expanded_cookies(source))
                 await page.goto(flow.verification_url, wait_until="domcontentloaded")

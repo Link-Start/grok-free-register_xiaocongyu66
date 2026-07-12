@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 .env
+proxy.txt
+代理.txt
+proxy-sources.txt
 keys/
 *.log
 logs/

@@ -7,8 +7,9 @@ Grok Free Register — CSP 异步并发架构
   - C_Worker: claim pair 并执行注册
   - Semaphore 背压控制容量,无需中心调度器
 
-两种邮箱模式(EMAIL_MODE):
+邮箱模式(EMAIL_MODE):
   - tempmail (默认,零配置): 免费临时邮箱,多 provider 自动 fallback
+  - moemail: MoeMail OpenAPI,需要 MOEMAIL_API_KEY
   - custom: 自建域名邮箱,Cloudflare Email Routing → Worker → 本地 webhook
             (见 grok_register/email_server.py / cloudflare/email-worker.js)
 
@@ -16,14 +17,16 @@ Grok Free Register — CSP 异步并发架构
 用法:
   bash start.sh          # 一键引导
 """
-import os, json, random, string, time, re, secrets, base64, struct, asyncio, glob, sys, multiprocessing
+import os, json, random, string, time, re, secrets, base64, struct, asyncio, glob, sys, multiprocessing, atexit, threading, tempfile
+from datetime import datetime, timezone
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 import requests as req
-from urllib.parse import quote
+from pathlib import Path
+from urllib.parse import quote, urlparse, urlunparse
 from playwright.async_api import async_playwright
 from concurrent.futures import ThreadPoolExecutor
 
@@ -32,8 +35,8 @@ from grok_register.core.admission import AdmissionGate
 from grok_register.core.envelope import ResourceEnvelope
 from grok_register.core.inventory import Inventory
 from grok_register.core.observer import Metrics
+from grok_register.proxy_auto import ProxyAutoConfig, ProxyAutoManager, load_active_proxies
 
-os.makedirs("keys", exist_ok=True)
 SITE_URL = "https://accounts.x.ai"
 
 # ── 配置（环境变量 / .env，见 .env.example）──
@@ -52,11 +55,95 @@ def _env_int_or_none(key):
     except ValueError:
         return None
 
-EMAIL_MODE      = (os.environ.get("EMAIL_MODE") or "tempmail").strip().lower()   # tempmail | custom
+def _env_list(key, default=""):
+    raw = os.environ.get(key)
+    if raw is None:
+        raw = default
+    items = []
+    for part in re.split(r"[\n,]+", str(raw)):
+        item = part.strip().lower()
+        if item:
+            items.append(item)
+    return tuple(items)
+
+def _env_bool(key, default=False):
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+def _normalize_key_export_formats(items):
+    normalized = []
+    for item in items:
+        value = (item or "").strip().lower()
+        if value == "sub":
+            value = "sub2api"
+        if value not in {"legacy", "sub2api", "cpa"}:
+            continue
+        if value not in normalized:
+            normalized.append(value)
+    return tuple(normalized)
+
+EMAIL_MODE      = (os.environ.get("EMAIL_MODE") or "tempmail").strip().lower()   # tempmail | moemail | custom
 if EMAIL_MODE == "mailtm":      # 兼容旧名
     EMAIL_MODE = "tempmail"
 LOCAL_EMAIL_API = (os.environ.get("EMAIL_API") or "http://127.0.0.1:8080").strip()
 EMAIL_DOMAIN    = (os.environ.get("EMAIL_DOMAIN") or "").strip()
+MOEMAIL_API     = (
+    os.environ.get("MOEMAIL_API")
+    or os.environ.get("MOEMAIL_API_URL")
+    or "https://moemail.app"
+).strip()
+MOEMAIL_API_KEY = (
+    os.environ.get("MOEMAIL_API_KEY")
+    or os.environ.get("MOEMAIL_TOKEN")
+    or ""
+).strip()
+MOEMAIL_DOMAIN  = (os.environ.get("MOEMAIL_DOMAIN") or "").strip()
+MOEMAIL_EXPIRY_MS = _env_int("MOEMAIL_EXPIRY_MS", 3600000)
+KEY_EXPORT_DIR = str(Path((os.environ.get("KEY_EXPORT_DIR") or "keys").strip() or "keys").expanduser())
+KEY_EXPORT_FORMATS = _normalize_key_export_formats(
+    _env_list("KEY_EXPORT_FORMATS", "legacy,sub2api")
+) or ("legacy",)
+KEY_EXPORT_ENROLLER = _env_bool("KEY_EXPORT_ENROLLER", True)
+KEY_EXPORT_ENROLLER_TIMEOUT = max(30, _env_int("KEY_EXPORT_ENROLLER_TIMEOUT", 1800))
+KEY_EXPORT_ENROLLER_POLL_SEC = max(1, _env_int("KEY_EXPORT_ENROLLER_POLL_SEC", 5))
+KEY_EXPORT_ENROLLER_RETRY_ATTEMPTS = min(
+    3, max(0, _env_int("KEY_EXPORT_ENROLLER_RETRY_ATTEMPTS", 0))
+)
+KEY_EXPORT_ENROLLER_DRAIN_TIMEOUT = max(
+    0, _env_int("KEY_EXPORT_ENROLLER_DRAIN_TIMEOUT", 10)
+)
+os.makedirs(KEY_EXPORT_DIR, exist_ok=True)
+_PROXY_POOL_FILE_ENV = os.environ.get("PROXY_POOL_FILE")
+PROXY_POOL_FILE = (_PROXY_POOL_FILE_ENV if _PROXY_POOL_FILE_ENV is not None else "代理.txt").strip()
+PROXY_POOL_STRATEGY = (os.environ.get("PROXY_POOL_STRATEGY") or "round_robin").strip().lower()
+PROXY_RELAY_ENABLED = (
+    os.environ.get("PROXY_RELAY_ENABLED", "1").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+PROXY_RELAY_URL = (os.environ.get("PROXY_RELAY_URL") or "http://127.0.0.1:18080").strip().rstrip("/")
+PROXY_RELAY_KERNEL = (os.environ.get("PROXY_RELAY_KERNEL") or "auto").strip().lower()
+PROXY_RELAY_HOST = (os.environ.get("PROXY_RELAY_HOST") or "127.0.0.1").strip()
+PROXY_RELAY_PROXY_SCHEME = (os.environ.get("PROXY_RELAY_PROXY_SCHEME") or "auto").strip().lower()
+PROXY_RELAY_TIMEOUT = _env_int("PROXY_RELAY_TIMEOUT", 8)
+PROXY_RELAY_RETRY_SEC = _env_int("PROXY_RELAY_RETRY_SEC", 30)
+PROXY_AUTO_CONFIG = ProxyAutoConfig.from_env(os.environ)
+CF_ARES_EMAIL_MODE = (os.environ.get("CF_ARES_EMAIL") or "0").strip().lower()
+CF_ARES_BROWSER_ENGINE = (os.environ.get("CF_ARES_BROWSER_ENGINE") or "auto").strip()
+CF_ARES_HEADLESS = (
+    os.environ.get("CF_ARES_HEADLESS", "1").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+CF_ARES_PROXY = (
+    os.environ.get("CF_ARES_PROXY")
+    or os.environ.get("HTTPS_PROXY")
+    or os.environ.get("HTTP_PROXY")
+    or ""
+).strip()
+CF_ARES_CHROME_PATH = (os.environ.get("CF_ARES_CHROME_PATH") or "").strip()
+CF_ARES_PATH = (os.environ.get("CF_ARES_PATH") or "").strip()
+CF_ARES_TIMEOUT = _env_int("CF_ARES_TIMEOUT", 30)
 MIN_FREE_MEM_MB = _env_int("MIN_FREE_MEM_MB", 500)   # 自动容量派生时保留的内存(MB)
 T_TARGET        = _env_int("T_TARGET", 4)            # token 池缓冲目标
 Q_TARGET        = _env_int("Q_TARGET", 4)            # 就绪验证码缓冲目标
@@ -73,6 +160,8 @@ Q_PENDING_CAP   = _env_int("Q_PENDING_CAP", 12)       # 外部在途 Q 请求上
 T_MAX_AGE       = _env_int("T_MAX_AGE", 300)          # token 最大年龄(秒)
 Q_MAX_AGE       = _env_int("Q_MAX_AGE", 120)          # 验证码最大年龄(秒)
 P_REQUEST_TIMEOUT = _env_int("P_REQUEST_TIMEOUT", 95) # P 等待 Q 返回超时(秒)
+EMAIL_CODE_RESEND_ATTEMPTS = max(0, _env_int("EMAIL_CODE_RESEND_ATTEMPTS", 2))
+EMAIL_CODE_RESEND_AFTER_SEC = max(1, _env_int("EMAIL_CODE_RESEND_AFTER_SEC", 35))
 C_CONSUME_TIMEOUT = _env_int("C_CONSUME_TIMEOUT", 60) # C 消费完整 pair 超时(秒)
 S_WORKERS       = _env_int("S_WORKERS", 0)            # 0=自动
 P_WORKERS       = _env_int("P_WORKERS", 0)
@@ -511,8 +600,10 @@ async def fetch_config():
     debug_log('[*] Fetching config...')
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
+        context = None
+        page = None
         try:
-            page = await browser.new_page()
+            context, page = await _new_grok_page(browser)
             await page.goto(f'{SITE_URL}/sign-up?redirect=grok-com', timeout=30000)
             await page.wait_for_timeout(5000)
             html = await page.content()
@@ -543,6 +634,7 @@ async def fetch_config():
                     continue
             if ACTION_ID: debug_log(f'[+] ACTION_ID: {ACTION_ID}')
         finally:
+            await _close_grok_page(context, page)
             await browser.close()
     if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
         raise RuntimeError("Config fetch failed")
@@ -841,12 +933,18 @@ async def _get_solver_page(browser):
                 item["reused"] = True
                 item["goto_s"] = 0.0
                 return item
-    p = await browser.new_page()
+    context, p = await _new_grok_page(browser)
     await p.set_viewport_size({"width": 800, "height": 600})
     goto_started = time.time()
     await p.goto(f'{SITE_URL}/sign-up', timeout=20000)
     await p.wait_for_timeout(1000)
-    return {"page": p, "n": 0, "reused": False, "goto_s": time.time() - goto_started}
+    return {
+        "context": context,
+        "page": p,
+        "n": 0,
+        "reused": False,
+        "goto_s": time.time() - goto_started,
+    }
 
 async def _put_solver_page(item, ok):
     p = item["page"]
@@ -871,12 +969,17 @@ async def _put_solver_page(item, ok):
 async def _close_solver_page(item):
     """Bound cleanup so a wedged renderer cannot trap the worker in finally."""
     page = item["page"]
+    context = item.get("context")
+
+    async def close():
+        await _close_grok_page(context, page)
+
     try:
-        await asyncio.wait_for(page.close(), timeout=SOLVER_CLEANUP_TIMEOUT)
+        await asyncio.wait_for(close(), timeout=SOLVER_CLEANUP_TIMEOUT)
     except asyncio.CancelledError:
         # Solver cancellation is expected at the hard deadline.  Give cleanup
         # its own bounded task so the page is not returned to the reuse pool.
-        cleanup = asyncio.create_task(page.close())
+        cleanup = asyncio.create_task(close())
         try:
             await asyncio.wait_for(cleanup, timeout=SOLVER_CLEANUP_TIMEOUT)
         except BaseException:
@@ -1167,13 +1270,526 @@ def _record_solver_trace(metrics, trace, total_seconds, token):
 
 
 # ──────────────────────────────────────────────
-#  邮箱服务:custom(自建 webhook) / tempmail(免费临时邮箱,多 provider fallback)
+#  邮箱服务:custom(自建 webhook) / moemail(OpenAPI) / tempmail(免费临时邮箱)
 # ──────────────────────────────────────────────
 # 免 key 的公共临时邮箱 provider(实测可用,互为 fallback 消灭单点):
 #  - mail.tm 同协议:mail.tm / mail.gw / duckmail.sbs
 #  - 独立 API:tempmail.lol
+# 可选 provider:
+#  - MoeMail OpenAPI:设置 MOEMAIL_API_KEY 后可单独用 EMAIL_MODE=moemail,也会加入 tempmail fallback
 # handle 编码 provider,供 poll_code 分派;新增 provider 只要在这两处加一段即可。
 TEMPMAIL_BASES = ["https://api.mail.tm", "https://api.mail.gw", "https://api.duckmail.sbs"]
+_proxy_pool_cache = {"path": None, "mtime_ns": None, "items": (), "index": 0}
+_proxy_pool_lock = threading.Lock()
+_proxy_relay_link_cache = {}
+_proxy_auto_manager = None
+_proxy_auto_manager_lock = threading.Lock()
+_SHARE_LINK_SCHEMES = ("vmess", "vless", "trojan", "ss", "hy2", "hysteria2", "tuic", "anytls")
+_cf_ares_clients = {}
+_cf_ares_import_error = None
+_cf_ares_lock = threading.Lock()
+
+def _normalize_proxy_line(line):
+    proxy = (line or "").strip()
+    if not proxy or proxy.startswith("#"):
+        return None
+    if _share_link_scheme(proxy):
+        return _proxy_from_share_link(proxy)
+    lowered = proxy.lower()
+    if "://" not in lowered:
+        if ":" not in proxy:
+            return None
+        proxy = f"http://{proxy}"
+        lowered = proxy.lower()
+    if not lowered.startswith(("http://", "https://", "socks4://", "socks5://", "socks5h://")):
+        return None
+    return proxy
+
+def _share_link_scheme(text):
+    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/", (text or "").strip())
+    if not match:
+        return ""
+    scheme = match.group(1).lower()
+    return scheme if scheme in _SHARE_LINK_SCHEMES else ""
+
+def _relay_kernel_candidates(scheme):
+    requested = (PROXY_RELAY_KERNEL or "auto").strip().lower().replace("_", "-")
+    if requested in ("singbox", "sing-box"):
+        return ("sing-box",)
+    if requested == "xray":
+        return ("xray",)
+    if scheme in {"hy2", "hysteria2", "tuic", "anytls"}:
+        return ("sing-box",)
+    return ("sing-box", "xray")
+
+def _relay_proxy_url(local_port, kernel="sing-box"):
+    scheme = (PROXY_RELAY_PROXY_SCHEME or "auto").strip().lower()
+    if scheme == "auto":
+        scheme = "socks5" if (kernel or "").strip().lower() == "xray" else "http"
+    if scheme not in {"http", "socks4", "socks5", "socks5h"}:
+        scheme = "http"
+    host = (PROXY_RELAY_HOST or "127.0.0.1").strip()
+    return f"{scheme}://{host}:{int(local_port)}"
+
+def _proxy_relay_json(method, path, payload=None):
+    if not PROXY_RELAY_URL:
+        raise RuntimeError("PROXY_RELAY_URL 未配置")
+    url = PROXY_RELAY_URL.rstrip("/") + path
+    if hasattr(req, "Session"):
+        session = req.Session()
+        session.trust_env = False
+        response = session.request(
+            method,
+            url,
+            json=payload,
+            timeout=PROXY_RELAY_TIMEOUT,
+        )
+    else:
+        response = getattr(req, method.lower())(
+            url,
+            json=payload,
+            timeout=PROXY_RELAY_TIMEOUT,
+        )
+    data = response.json()
+    status = getattr(response, "status_code", 200)
+    failed = isinstance(data, dict) and data.get("ok") is False
+    if status >= 400 or failed:
+        message = (data.get("error") or data.get("message")) if isinstance(data, dict) else None
+        raise RuntimeError(message or getattr(response, "text", "proxy relay request failed"))
+    return data
+
+def _relay_state_nodes(state):
+    if not isinstance(state, dict):
+        return []
+    nodes = state.get("nodes")
+    if nodes is None and isinstance(state.get("data"), dict):
+        nodes = state["data"].get("nodes")
+    return nodes if isinstance(nodes, list) else []
+
+def _relay_node_value(node, *keys):
+    for key in keys:
+        value = node.get(key) if isinstance(node, dict) else None
+        if value not in (None, ""):
+            return value
+    return None
+
+def _find_relay_node(state, share_link):
+    for node in _relay_state_nodes(state):
+        link = _relay_node_value(node, "link", "share_link", "shareLink", "url")
+        if str(link or "").strip() == share_link:
+            return node
+    return None
+
+def _proxy_from_relay_node(node):
+    if not node:
+        return None
+    try:
+        local_port = _relay_node_value(node, "local_port", "localPort", "listen_port", "listenPort")
+        kernel = _relay_node_value(node, "kernel", "core") or "sing-box"
+        return _relay_proxy_url(int(local_port), kernel)
+    except Exception:
+        return None
+
+def _extract_relay_message_port(message):
+    match = re.search(
+        r"(?:本地端口|起始端口|local\s*port|start(?:ing)?\s*port)\D*(\d+)",
+        message or "",
+        re.I,
+    )
+    return int(match.group(1)) if match else None
+
+def _proxy_from_share_link(share_link):
+    share_link = share_link.strip()
+    if not PROXY_RELAY_ENABLED:
+        return None
+    cached = _proxy_relay_link_cache.get(share_link)
+    if cached:
+        return cached
+
+    scheme = _share_link_scheme(share_link)
+    last_error = None
+    try:
+        state = _proxy_relay_json("GET", "/api/state")
+        proxy = _proxy_from_relay_node(_find_relay_node(state, share_link))
+        if proxy:
+            _proxy_relay_link_cache[share_link] = proxy
+            return proxy
+
+        for kernel in _relay_kernel_candidates(scheme):
+            try:
+                result = _proxy_relay_json(
+                    "POST",
+                    "/api/nodes/import",
+                    {"share_link": share_link, "kernel": kernel, "local_port": ""},
+                )
+                state = _proxy_relay_json("GET", "/api/state")
+                proxy = _proxy_from_relay_node(_find_relay_node(state, share_link))
+                if not proxy:
+                    port = _extract_relay_message_port(result.get("message", ""))
+                    proxy = _relay_proxy_url(port, kernel) if port else None
+                if proxy:
+                    _proxy_relay_link_cache[share_link] = proxy
+                    return proxy
+            except Exception as exc:
+                last_error = exc
+    except Exception as exc:
+        last_error = exc
+
+    if last_error:
+        debug_log(f"代理池分享链接转换失败({scheme or 'unknown'}): {last_error}")
+    return None
+
+def _unique_proxies(items):
+    seen = set()
+    out = []
+    for item in items:
+        proxy = (item or "").strip()
+        if not proxy or proxy in seen:
+            continue
+        seen.add(proxy)
+        out.append(proxy)
+    return out
+
+def _auto_bootstrap_proxies():
+    cached = []
+    with _proxy_pool_lock:
+        cached.extend(_proxy_pool_cache.get("items", ()) or ())
+    manual = []
+    for candidate in _proxy_pool_paths():
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            proxy = _normalize_proxy_line(raw)
+            if proxy:
+                manual.append(proxy)
+        break
+    return _unique_proxies(cached + manual + load_active_proxies(PROXY_AUTO_CONFIG))
+
+def _ensure_proxy_auto_manager_started():
+    global _proxy_auto_manager
+    if not PROXY_AUTO_CONFIG.enabled:
+        return None
+    with _proxy_auto_manager_lock:
+        if _proxy_auto_manager is None:
+            _proxy_auto_manager = ProxyAutoManager(
+                PROXY_AUTO_CONFIG,
+                _normalize_proxy_line,
+                bootstrap_proxies=_auto_bootstrap_proxies,
+                logger=debug_log,
+            )
+        _proxy_auto_manager.start()
+        return _proxy_auto_manager
+
+def _auto_proxy_mtime_ns():
+    if not PROXY_AUTO_CONFIG.enabled:
+        return None
+    try:
+        return PROXY_AUTO_CONFIG.active_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+def _load_auto_proxy_items():
+    if not PROXY_AUTO_CONFIG.enabled:
+        return []
+    items = []
+    for raw in load_active_proxies(PROXY_AUTO_CONFIG):
+        proxy = _normalize_proxy_line(raw)
+        if proxy:
+            items.append(proxy)
+    return items
+
+def _proxy_pool_paths():
+    if not PROXY_POOL_FILE:
+        return []
+    configured = Path(PROXY_POOL_FILE).expanduser()
+    paths = [configured]
+    if _PROXY_POOL_FILE_ENV is None and configured.name == "代理.txt":
+        paths.append(Path("proxy.txt"))
+    return paths
+
+def _load_proxy_pool_locked():
+    auto_mtime_ns = _auto_proxy_mtime_ns()
+    if not PROXY_POOL_FILE:
+        items = tuple(_unique_proxies(_load_auto_proxy_items()))
+        _proxy_pool_cache.update(
+            {
+                "path": None,
+                "mtime_ns": None,
+                "auto_mtime_ns": auto_mtime_ns,
+                "items": items,
+                "index": 0,
+                "relay_pending": False,
+                "retry_at": None,
+            }
+        )
+        return items
+    path = None
+    stat = None
+    for candidate in _proxy_pool_paths():
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        path = candidate
+        break
+    if path is None or stat is None:
+        first = _proxy_pool_paths()[0] if _proxy_pool_paths() else None
+        items = tuple(_unique_proxies(_load_auto_proxy_items()))
+        _proxy_pool_cache.update(
+            {
+                "path": str(first) if first else None,
+                "mtime_ns": None,
+                "auto_mtime_ns": auto_mtime_ns,
+                "items": items,
+                "index": 0,
+                "relay_pending": False,
+                "retry_at": None,
+            }
+        )
+        return items
+    now = time.time()
+    if (
+        _proxy_pool_cache.get("path") == str(path)
+        and _proxy_pool_cache.get("mtime_ns") == stat.st_mtime_ns
+        and _proxy_pool_cache.get("auto_mtime_ns") == auto_mtime_ns
+    ):
+        retry_at = _proxy_pool_cache.get("retry_at")
+        if not _proxy_pool_cache.get("relay_pending") or (retry_at and retry_at > now):
+            return _proxy_pool_cache.get("items", ())
+    items = []
+    relay_pending = False
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            is_share_link = bool(_share_link_scheme(raw))
+            proxy = _normalize_proxy_line(raw)
+            if proxy:
+                items.append(proxy)
+            elif is_share_link and PROXY_RELAY_ENABLED:
+                relay_pending = True
+    except OSError:
+        items = []
+        relay_pending = False
+    items = _unique_proxies(items + _load_auto_proxy_items())
+    _proxy_pool_cache.update(
+        {
+            "path": str(path),
+            "mtime_ns": stat.st_mtime_ns,
+            "auto_mtime_ns": auto_mtime_ns,
+            "items": tuple(items),
+            "index": 0,
+            "relay_pending": relay_pending,
+            "retry_at": (now + max(1, PROXY_RELAY_RETRY_SEC)) if relay_pending else None,
+        }
+    )
+    return _proxy_pool_cache["items"]
+
+def _pick_grok_proxy():
+    """Pick one proxy from the Grok/XAI proxy pool; missing file means direct."""
+    _ensure_proxy_auto_manager_started()
+    with _proxy_pool_lock:
+        items = _load_proxy_pool_locked()
+        if not items:
+            return None
+        if PROXY_POOL_STRATEGY == "random":
+            return random.choice(items)
+        idx = int(_proxy_pool_cache.get("index", 0)) % len(items)
+        _proxy_pool_cache["index"] = (idx + 1) % len(items)
+        return items[idx]
+
+def _pick_email_proxy():
+    """Backward-compatible alias; proxy pool is used for Grok/XAI, not email providers."""
+    return _pick_grok_proxy()
+
+def _requests_proxy_kwargs(proxy):
+    if not proxy:
+        return {}
+    return {"proxies": {"http": proxy, "https": proxy}}
+
+def _playwright_proxy(proxy):
+    if not proxy:
+        return None
+    parsed = urlparse(proxy)
+    scheme = parsed.scheme.lower()
+    if scheme == "socks5h":
+        scheme = "socks5"
+    if scheme not in {"http", "https", "socks4", "socks5"}:
+        return None
+    if not parsed.hostname or not parsed.port:
+        return None
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    item = {"server": f"{scheme}://{host}:{parsed.port}"}
+    if parsed.username:
+        item["username"] = parsed.username
+    if parsed.password:
+        item["password"] = parsed.password
+    return item
+
+async def _new_grok_page(browser, proxy=None, *, always_context=False):
+    proxy = _pick_grok_proxy() if proxy is None else proxy
+    playwright_proxy = _playwright_proxy(proxy)
+    if playwright_proxy or always_context:
+        kwargs = {"proxy": playwright_proxy} if playwright_proxy else {}
+        context = await browser.new_context(**kwargs)
+        page = await context.new_page()
+        return context, page
+    page = await browser.new_page()
+    return None, page
+
+async def _close_grok_page(context, page):
+    if context is not None:
+        try:
+            await context.close()
+            return
+        except Exception:
+            pass
+    if page is not None:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+def _cf_ares_mode_enabled():
+    return CF_ARES_EMAIL_MODE in ("1", "true", "yes", "on", "fallback", "always")
+
+def _cf_ares_mode_always():
+    return CF_ARES_EMAIL_MODE == "always"
+
+def _cf_ares_add_import_path():
+    if not CF_ARES_PATH:
+        return
+    path = Path(CF_ARES_PATH).expanduser()
+    if path.is_file():
+        path = path.parent
+    if path.name == "cf_ares":
+        path = path.parent
+    candidate = path if (path / "cf_ares").is_dir() else path
+    text = str(candidate)
+    if candidate.exists() and text not in sys.path:
+        sys.path.insert(0, text)
+
+def _cf_ares_client_class():
+    try:
+        from cf_ares import AresClient
+        return AresClient
+    except Exception:
+        if not CF_ARES_PATH:
+            raise
+    _cf_ares_add_import_path()
+    for name in list(sys.modules):
+        if name == "cf_ares" or name.startswith("cf_ares."):
+            sys.modules.pop(name, None)
+    from cf_ares import AresClient
+    return AresClient
+
+def _cf_ares_get_client(proxy=None):
+    """Lazy-load CF-Ares only when the optional email transport needs it."""
+    global _cf_ares_import_error
+    key = proxy or CF_ARES_PROXY or "__direct__"
+    if key in _cf_ares_clients:
+        return _cf_ares_clients[key]
+    if _cf_ares_import_error is not None:
+        raise RuntimeError("cf-ares unavailable") from _cf_ares_import_error
+    try:
+        AresClient = _cf_ares_client_class()
+    except Exception as exc:
+        _cf_ares_import_error = exc
+        raise RuntimeError("cf-ares unavailable") from exc
+
+    kwargs = {
+        "browser_engine": CF_ARES_BROWSER_ENGINE or "auto",
+        "headless": CF_ARES_HEADLESS,
+        "timeout": CF_ARES_TIMEOUT,
+        "debug": REGISTER_LOG_MODE == "debug",
+    }
+    effective_proxy = proxy or CF_ARES_PROXY
+    if effective_proxy:
+        kwargs["proxy"] = effective_proxy
+    if CF_ARES_CHROME_PATH:
+        kwargs["chrome_path"] = CF_ARES_CHROME_PATH
+    _cf_ares_clients[key] = AresClient(**kwargs)
+    return _cf_ares_clients[key]
+
+def _close_cf_ares_client():
+    clients = list(_cf_ares_clients.values())
+    _cf_ares_clients.clear()
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+atexit.register(_close_cf_ares_client)
+
+def _looks_like_cloudflare_block(response):
+    status = getattr(response, "status_code", 200)
+    if status not in (403, 503):
+        return False
+    text = getattr(response, "text", "") or ""
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "cloudflare",
+            "cf-browser-verification",
+            "cf-im-under-attack",
+            "challenge platform",
+            "just a moment",
+            "turnstile",
+            "captcha",
+            "error code: 1010",
+        )
+    )
+
+def _cf_ares_request(method, url, **kwargs):
+    with _cf_ares_lock:
+        proxy = kwargs.pop("proxy", None)
+        client = _cf_ares_get_client(proxy=proxy)
+        timeout = kwargs.pop("timeout", None)
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return getattr(client, method.lower())(url, **kwargs)
+
+def _email_http_request(method, url, **kwargs):
+    """External email-provider HTTP with optional CF-Ares fallback."""
+    proxy = kwargs.pop("proxy", None)
+    request_kwargs = dict(kwargs)
+    if proxy and "proxies" not in request_kwargs:
+        request_kwargs.update(_requests_proxy_kwargs(proxy))
+    cf_kwargs = dict(kwargs)
+    if proxy:
+        cf_kwargs["proxy"] = proxy
+
+    if not _cf_ares_mode_enabled():
+        return getattr(req, method.lower())(url, **request_kwargs)
+
+    if _cf_ares_mode_always():
+        return _cf_ares_request(method, url, **cf_kwargs)
+
+    try:
+        response = getattr(req, method.lower())(url, **request_kwargs)
+    except Exception as exc:
+        try:
+            debug_log("[P] email HTTP retry via CF-Ares after request error")
+            return _cf_ares_request(method, url, **cf_kwargs)
+        except Exception:
+            raise exc
+    if _looks_like_cloudflare_block(response):
+        try:
+            debug_log("[P] email HTTP retry via CF-Ares after Cloudflare block")
+            return _cf_ares_request(method, url, **cf_kwargs)
+        except Exception:
+            return response
+    return response
+
+def _email_get(url, **kwargs):
+    return _email_http_request("GET", url, **kwargs)
+
+def _email_post(url, **kwargs):
+    return _email_http_request("POST", url, **kwargs)
 
 def _extract_code(text):
     """多层兜底提取验证码,抗邮件模板变化。"""
@@ -1185,25 +1801,99 @@ def _extract_code(text):
 
 def _mailtm_create(base, password):
     """mail.tm 同协议建箱;返回 (handle, email)。"""
-    d = req.get(f'{base}/domains', timeout=12).json()
+    d = _email_get(f'{base}/domains', timeout=12).json()
     d = d.get('hydra:member', d) if isinstance(d, dict) else d
     doms = [x['domain'] for x in d if x.get('isActive', True) and not x.get('isPrivate', False)]
     if not doms:
         raise RuntimeError('no domain')
     email = f'oc{secrets.token_hex(5)}@{doms[0]}'
-    req.post(f'{base}/accounts', json={'address': email, 'password': password}, timeout=12)
-    tok = req.post(f'{base}/token', json={'address': email, 'password': password}, timeout=12).json().get('token', '')
+    _email_post(f'{base}/accounts', json={'address': email, 'password': password}, timeout=12)
+    tok = _email_post(f'{base}/token', json={'address': email, 'password': password}, timeout=12).json().get('token', '')
     if not tok:
         raise RuntimeError('no token')
     return f'mt|{base}|{tok}', email
 
 def _lol_create():
     """tempmail.lol 建箱;返回 (handle, email)。"""
-    r = req.post('https://api.tempmail.lol/v2/inbox/create', timeout=12).json()
+    r = _email_post('https://api.tempmail.lol/v2/inbox/create', timeout=12).json()
     addr, tok = r.get('address', ''), r.get('token', '')
     if not addr or not tok:
         raise RuntimeError('lol create failed')
     return f'lol|{tok}', addr
+
+def _moemail_api_root(api=None):
+    """规范化 MoeMail API 根地址;用户粘贴 /moe 等页面路径时回退到站点根。"""
+    raw = (api or MOEMAIL_API or "https://moemail.app").strip().rstrip("/")
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError("invalid moemail api")
+    path = parsed.path.rstrip("/")
+    if path and path != "/api" and not path.endswith("/api"):
+        path = ""
+    parsed = parsed._replace(path=path, params="", query="", fragment="")
+    return urlunparse(parsed).rstrip("/")
+
+def _moemail_url(path, api=None):
+    root = _moemail_api_root(api)
+    if root.endswith("/api") and path.startswith("/api/"):
+        return root + path[len("/api"):]
+    return root + path
+
+def _moemail_headers(json_body=False):
+    if not MOEMAIL_API_KEY:
+        raise RuntimeError("moemail api key missing")
+    headers = {"Accept": "application/json", "X-API-Key": MOEMAIL_API_KEY}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+def _json_or_error(response, context):
+    status = getattr(response, "status_code", 200)
+    if status >= 400:
+        raise RuntimeError(f"{context} http {status}")
+    try:
+        return response.json()
+    except Exception as exc:
+        raise RuntimeError(f"{context} invalid json") from exc
+
+def _moemail_domains():
+    if MOEMAIL_DOMAIN:
+        return [MOEMAIL_DOMAIN]
+    data = _json_or_error(
+        _email_get(_moemail_url("/api/config"), headers=_moemail_headers(), timeout=12),
+        "moemail config",
+    )
+    domains = [
+        item.strip()
+        for item in str(data.get("emailDomains") or "").split(",")
+        if item.strip()
+    ]
+    if not domains:
+        raise RuntimeError("moemail no domain")
+    return domains
+
+def _moemail_create(password=None):
+    """MoeMail OpenAPI 建箱;返回 (handle, email)。"""
+    domain = _moemail_domains()[0]
+    payload = {
+        "name": f"oc{secrets.token_hex(5)}",
+        "expiryTime": MOEMAIL_EXPIRY_MS,
+        "domain": domain,
+    }
+    data = _json_or_error(
+        _email_post(
+            _moemail_url("/api/emails/generate"),
+            headers=_moemail_headers(json_body=True),
+            json=payload,
+            timeout=12,
+        ),
+        "moemail create",
+    )
+    email_id = data.get("id")
+    address = data.get("email") or data.get("address")
+    if not email_id or not address:
+        raise RuntimeError("moemail create failed")
+    return f"moe|{email_id}", address
 
 def create_email():
     """custom 用自建域名(本地 webhook);tempmail 随机打散多个 provider,逐个 fallback。"""
@@ -1213,8 +1903,16 @@ def create_email():
         return email, email, password  # 地址即用,验证码经 CF Worker POST 到本地 webhook
 
     password = rand_str()
+    if EMAIL_MODE == 'moemail':
+        handle, email = _moemail_create(password)
+        return handle, email, password
+
     # 优先用已跑通的 mail.tm,其余按序仅作 fallback
-    makers = [(lambda b=b: _mailtm_create(b, password)) for b in TEMPMAIL_BASES] + [_lol_create]
+    makers = []
+    if MOEMAIL_API_KEY:
+        makers.append(lambda: _moemail_create(password))
+    makers.extend((lambda b=b: _mailtm_create(b, password)) for b in TEMPMAIL_BASES)
+    makers.append(_lol_create)
     for make in makers:
         try:
             handle, email = make()
@@ -1223,54 +1921,102 @@ def create_email():
             continue
     raise RuntimeError('所有临时邮箱 provider 均不可用')
 
+def _moemail_fetch(handle):
+    """读取 MoeMail 邮箱当前邮件全文(subject+content+html);无则 None。"""
+    _, email_id = handle.split("|", 1)
+    data = _json_or_error(
+        _email_get(
+            _moemail_url(f"/api/emails/{email_id}"),
+            headers=_moemail_headers(),
+            timeout=10,
+        ),
+        "moemail messages",
+    )
+    items = data.get("messages") or []
+    if not items:
+        return None
+
+    parts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        message = item
+        if not any(message.get(k) for k in ("content", "html")) and item.get("id"):
+            try:
+                detail = _json_or_error(
+                    _email_get(
+                        _moemail_url(f"/api/emails/{email_id}/{item['id']}"),
+                        headers=_moemail_headers(),
+                        timeout=10,
+                    ),
+                    "moemail message",
+                )
+                message = detail.get("message") or detail
+            except Exception:
+                message = item
+        parts.append(
+            "\n".join(
+                str(message.get(k, ""))
+                for k in ("subject", "content", "html")
+            )
+        )
+    return "\n".join(parts) if parts else None
+
 def _tempmail_fetch(handle):
     """按 handle 前缀分派,取该邮箱当前邮件全文(subject+text+html);无则 None。"""
     kind = handle.split('|', 1)[0]
     if kind == 'lol':
         tok = handle.split('|', 1)[1]
-        data = req.get(f'https://api.tempmail.lol/v2/inbox?token={tok}', timeout=10).json()
+        data = _email_get(f'https://api.tempmail.lol/v2/inbox?token={tok}', timeout=10).json()
         items = data.get('emails') or data.get('messages') or []
         if not items:
             return None
         return '\n'.join(f"{i.get('subject','')}\n{i.get('body','')}\n{i.get('html','')}"
                          for i in items if isinstance(i, dict))
+    if kind == 'moe':
+        return _moemail_fetch(handle)
     # mail.tm 同协议:handle = "mt|base|token"
+    if kind != 'mt':
+        raise RuntimeError('unknown tempmail provider')
     _, base, tok = handle.split('|', 2)
     hdr = {'Accept': 'application/json', 'Authorization': f'Bearer {tok}'}
-    data = req.get(f'{base}/messages', headers=hdr, timeout=10).json()
+    data = _email_get(f'{base}/messages', headers=hdr, timeout=10).json()
     msgs = data if isinstance(data, list) else data.get('hydra:member', [])
     if not msgs:
         return None
     mid = str(msgs[0].get('id') or '')
-    detail = req.get(f'{base}/messages/{mid}', headers=hdr, timeout=10).json()
+    detail = _email_get(f'{base}/messages/{mid}', headers=hdr, timeout=10).json()
     parts = [str(detail.get(k, '')) for k in ['subject', 'intro', 'text', 'html']]
     if isinstance(detail.get('html'), list):
         parts.append('\n'.join(str(x) for x in detail['html']))
     return '\n'.join(parts)
 
-def poll_code(handle, max_wait=90):
-    """轮询验证码:custom 查本地 webhook /check;tempmail 按 provider 取信。"""
+def poll_code_once(handle):
+    """检查一次验证码:custom 查本地 webhook /check;tempmail 按 provider 取信。"""
     if EMAIL_MODE == 'custom':
-        for _ in range(max_wait):
-            time.sleep(1)
-            try:
-                resp = req.get(f'{LOCAL_EMAIL_API}/check/{handle}', timeout=5)
-                if resp.status_code == 200 and resp.json().get('code'):
-                    return resp.json()['code']
-            except Exception:
-                pass
-        return None
-
-    for _ in range(max_wait):
-        time.sleep(1)
         try:
-            text = _tempmail_fetch(handle)
-            if text:
-                code = _extract_code(text)
-                if code:
-                    return code
+            resp = req.get(f'{LOCAL_EMAIL_API}/check/{handle}', timeout=5)
+            if resp.status_code == 200 and resp.json().get('code'):
+                return resp.json()['code']
         except Exception:
             pass
+        return None
+
+    try:
+        text = _tempmail_fetch(handle)
+        if text:
+            return _extract_code(text)
+    except Exception:
+        pass
+    return None
+
+def poll_code(handle, max_wait=90):
+    """轮询验证码:custom 查本地 webhook /check;tempmail 按 provider 取信。"""
+    for _ in range(max_wait):
+        time.sleep(1)
+        code = poll_code_once(handle)
+        if code:
+            return code
     return None
 
 
@@ -1282,6 +2028,11 @@ async def _create_email_async(loop):
 async def _poll_code_async(loop, handle):
     """在线程池中轮询验证码。"""
     return await loop.run_in_executor(POLL_EXECUTOR, poll_code, handle)
+
+
+async def _poll_code_once_async(loop, handle):
+    """在线程池中执行一次轻量验证码检查。"""
+    return await loop.run_in_executor(POLL_EXECUTOR, poll_code_once, handle)
 
 
 async def _acquire_many(sem, count):
@@ -1316,6 +2067,7 @@ async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, met
     physical_acquired = False
     physical_wait_started = None
     physical_hold_started = None
+    context = None
     page = None
     await p_send_sem.acquire()
     p_send_acquired = True
@@ -1327,7 +2079,7 @@ async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, met
         if metrics is not None:
             metrics.p_physical_count += 1
             metrics.p_physical_wait_seconds += physical_hold_started - physical_wait_started
-        page = await browser.new_page()
+        context, page = await _new_grok_page(browser)
         await page.set_viewport_size({"width": 800, "height": 600})
         try:
             stage_started = time.time()
@@ -1356,17 +2108,94 @@ async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, met
             metrics.p_send_seconds += time.time() - send_started
         return results
     finally:
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
+        await _close_grok_page(context, page)
         if physical_acquired:
             if metrics is not None and physical_hold_started is not None:
                 metrics.p_physical_hold_seconds += time.time() - physical_hold_started
             physical_sem.release()
         if p_send_acquired:
             p_send_sem.release()
+
+
+async def _resend_q_request(browser, physical_sem, p_send_sem, request, metrics=None):
+    """重新发送单个邮箱验证码请求；只走 Grok/xAI 页面代理链路。"""
+    if browser is None or physical_sem is None:
+        return False
+    p_send_sem = p_send_sem or _NoopAsyncSemaphore()
+    results = await _send_q_request_batch(
+        browser,
+        physical_sem,
+        p_send_sem,
+        [request],
+        metrics,
+    )
+    if metrics is not None:
+        metrics.q_send_batches += 1
+        metrics.q_send_batch_items += len(results)
+    return bool(results and results[0].get("sent"))
+
+
+async def _poll_code_with_resends(
+    loop,
+    request,
+    *,
+    browser,
+    physical_sem,
+    p_send_sem,
+    metrics,
+):
+    """等待验证码；超时窗口内未收到时按配置重新触发 xAI 发码。"""
+    deadline = time.monotonic() + P_REQUEST_TIMEOUT
+    resend_attempts = 0
+    next_resend_at = time.monotonic() + EMAIL_CODE_RESEND_AFTER_SEC
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+
+        try:
+            code = await asyncio.wait_for(
+                _poll_code_once_async(loop, request["handle"]),
+                timeout=max(1.0, min(5.0, remaining)),
+            )
+        except asyncio.TimeoutError:
+            code = None
+        if code:
+            return code
+
+        now = time.monotonic()
+        if (
+            resend_attempts < EMAIL_CODE_RESEND_ATTEMPTS
+            and now >= next_resend_at
+        ):
+            resend_attempts += 1
+            sent = False
+            try:
+                sent = await _resend_q_request(
+                    browser,
+                    physical_sem,
+                    p_send_sem,
+                    request,
+                    metrics,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                debug_log(f"[P] resend email code err: {sanitize_terminal_error(exc)}")
+            if sent:
+                if metrics is not None:
+                    metrics.q_sent += 1
+                debug_log(f"[P] resent verification code attempt={resend_attempts}")
+            next_resend_at = time.monotonic() + EMAIL_CODE_RESEND_AFTER_SEC
+            continue
+
+        if resend_attempts < EMAIL_CODE_RESEND_ATTEMPTS:
+            sleep_for = min(1.0, max(0.0, next_resend_at - now), max(0.0, remaining))
+        else:
+            sleep_for = min(1.0, max(0.0, remaining))
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
 
 
 async def _poll_and_admit_q(
@@ -1378,16 +2207,29 @@ async def _poll_and_admit_q(
     *,
     q_batch_lease=None,
     admission_gate=None,
+    browser=None,
+    physical_sem=None,
+    p_send_sem=None,
 ):
     """等待单个 Q 返回并入库；每个请求独立释放 pending/inflight。"""
     loop = asyncio.get_event_loop()
     release_reservation = True
     try:
         try:
-            code = await asyncio.wait_for(
-                _poll_code_async(loop, request["handle"]),
-                timeout=P_REQUEST_TIMEOUT,
-            )
+            if browser is not None and EMAIL_CODE_RESEND_ATTEMPTS > 0:
+                code = await _poll_code_with_resends(
+                    loop,
+                    request,
+                    browser=browser,
+                    physical_sem=physical_sem,
+                    p_send_sem=p_send_sem,
+                    metrics=metrics,
+                )
+            else:
+                code = await asyncio.wait_for(
+                    _poll_code_async(loop, request["handle"]),
+                    timeout=P_REQUEST_TIMEOUT,
+                )
         except asyncio.CancelledError:
             # poll_code 仍在运行时取消，底层轮询可能继续持有该请求；此处
             # 不能提前归还 pending/inflight，否则新请求会超量进入。
@@ -1481,8 +2323,7 @@ _c_hot_page_pool_size = derive_c_hot_page_pool_size(PHYSICAL_CAP or 1, C_WORKERS
 
 
 async def _new_c_hot_page(browser):
-    context = await browser.new_context()
-    page = await context.new_page()
+    context, page = await _new_grok_page(browser, always_context=True)
     await page.set_viewport_size({"width": 800, "height": 600})
     await _prepare_signup_page(page, redirect=True, timeout=30000)
     return context, page
@@ -1499,18 +2340,19 @@ async def _acquire_c_page(browser, metrics=None):
             metrics.c_hot_page_misses += 1
         return await _new_c_hot_page(browser)
 
-    page = await browser.new_page()
+    context, page = await _new_grok_page(browser)
     await page.set_viewport_size({"width": 800, "height": 600})
     await _prepare_signup_page(page, redirect=True, timeout=30000)
-    return None, page
+    return context, page
 
 
 async def _release_c_page(context, page, *, healthy):
-    if not C_HOT_PAGE_POOL or context is None:
-        try:
-            await page.close()
-        except Exception:
-            pass
+    if not C_HOT_PAGE_POOL:
+        await _close_grok_page(context, page)
+        return
+
+    if context is None:
+        await _close_grok_page(context, page)
         return
 
     if healthy:
@@ -1713,6 +2555,9 @@ async def p_worker(
                         metrics,
                         q_batch_lease=q_lease,
                         admission_gate=admission_gate,
+                        browser=browser,
+                        physical_sem=physical_sem,
+                        p_send_sem=p_send_sem,
                     )
                 )
                 task.add_done_callback(_observe_background_task)
@@ -1748,6 +2593,7 @@ def _pair_is_expired(pair, now=None):
 
 
 def _append_registration_line(path, line, mode=None, *, durable=False):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as stream:
         stream.write(line)
         if durable:
@@ -1757,6 +2603,288 @@ def _append_registration_line(path, line, mode=None, *, durable=False):
         os.chmod(path, mode)
 
 
+_key_export_file_lock = threading.Lock()
+_key_export_tasks = set()
+
+
+def _key_export_path(*parts):
+    return Path(KEY_EXPORT_DIR).joinpath(*parts)
+
+
+def _key_export_oauth_formats():
+    if not KEY_EXPORT_ENROLLER:
+        return ()
+    return tuple(fmt for fmt in KEY_EXPORT_FORMATS if fmt in {"cpa", "sub2api"})
+
+
+def _atomic_write_private_json(path, document):
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    payload = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def _load_or_create_key_export_salt():
+    configured = os.environ.get("XAI_ENROLLER_SOURCE_SALT")
+    if configured:
+        return configured.encode()
+    path = _key_export_path(".xai-enroller-salt")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value.encode()
+    except OSError:
+        pass
+    value = secrets.token_urlsafe(32)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".xai-enroller-salt.", suffix=".tmp", dir=path.parent, text=True
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+    return value.encode()
+
+
+def _sub2api_account_from_credential(email, credential):
+    from xai_enroller.protocol import XAIProfile
+
+    profile = XAIProfile.default()
+    credentials = {
+        "access_token": credential.access_token,
+        "refresh_token": credential.refresh_token,
+        "expires_at": credential.expires_at,
+        "client_id": profile.client_id,
+        "scope": profile.scope,
+        "email": email,
+        "base_url": "https://api.x.ai/v1",
+    }
+    if credential.id_token:
+        credentials["id_token"] = credential.id_token
+    if credential.token_type:
+        credentials["token_type"] = credential.token_type
+    return {
+        "name": email or credential.subject or "grok-account",
+        "platform": "grok",
+        "type": "oauth",
+        "concurrency": 10,
+        "priority": 1,
+        "credentials": credentials,
+        "extra": {
+            "email": email,
+            "subject": credential.subject,
+            "last_refresh": credential.last_refresh,
+        },
+    }
+
+
+def _sub2api_document(accounts):
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "proxies": [],
+        "accounts": list(accounts),
+    }
+
+
+def _store_sub2api_credential_sync(email, credential, name_secret):
+    from xai_enroller.sinks import credential_filename
+
+    directory = _key_export_path("sub2api")
+    filename = credential_filename(credential, name_secret).removesuffix(".json")
+    account = _sub2api_account_from_credential(email, credential)
+    with _key_export_file_lock:
+        account_path = directory / f"{filename}.sub2api.json"
+        _atomic_write_private_json(account_path, _sub2api_document([account]))
+
+        accounts = []
+        seen = set()
+        for path in sorted(directory.glob("*.sub2api.json")):
+            if path.name == "accounts.sub2api.json":
+                continue
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for item in document.get("accounts", []):
+                if not isinstance(item, dict):
+                    continue
+                credentials = item.get("credentials") or {}
+                key = (
+                    item.get("platform"),
+                    credentials.get("refresh_token"),
+                    credentials.get("access_token"),
+                    item.get("name"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                accounts.append(item)
+        _atomic_write_private_json(
+            directory / "accounts.sub2api.json",
+            _sub2api_document(accounts),
+        )
+    return filename
+
+
+class _LocalKeyExportSink:
+    def __init__(self, email, formats, name_secret):
+        self.email = email
+        self.formats = set(formats)
+        self.name_secret = name_secret
+
+    async def store(self, credential):
+        from xai_enroller.models import SinkReceipt
+        from xai_enroller.sinks import LocalAuthFileSink
+
+        fingerprints = []
+        if "cpa" in self.formats:
+            receipt = await LocalAuthFileSink(
+                _key_export_path("cpa"),
+                name_secret=self.name_secret,
+            ).store(credential)
+            fingerprints.append(receipt.fingerprint)
+        if "sub2api" in self.formats:
+            fingerprint = await asyncio.to_thread(
+                _store_sub2api_credential_sync,
+                self.email,
+                credential,
+                self.name_secret,
+            )
+            fingerprints.append(fingerprint)
+        return SinkReceipt(",".join(fingerprints) or "no-output")
+
+
+class _SingleRegistrationSource:
+    def __init__(self, record):
+        self.record = record
+
+    def records(self):
+        yield self.record
+
+
+async def _run_key_export_enrollment(email, sso, session_cookies):
+    formats = _key_export_oauth_formats()
+    if not formats:
+        return None
+
+    import httpx
+    from xai_enroller.coordinator import EnrollmentCoordinator
+    from xai_enroller.executors import PlaywrightExecutor
+    from xai_enroller.models import SourceRecord
+    from xai_enroller.protocol import XAIProfile, XAIProtocol
+
+    name_secret = _load_or_create_key_export_salt()
+    record = SourceRecord(
+        email,
+        sso,
+        tuple(session_cookies or ()),
+    )
+    proxy = _pick_grok_proxy()
+    client_kwargs = {}
+    if proxy and urlparse(proxy).scheme.lower() in {"http", "https"}:
+        client_kwargs["proxy"] = proxy
+    client = httpx.AsyncClient(**client_kwargs)
+    try:
+        coordinator = EnrollmentCoordinator(
+            source=_SingleRegistrationSource(record),
+            protocol=XAIProtocol(
+                client,
+                XAIProfile.default(),
+                default_poll_interval=KEY_EXPORT_ENROLLER_POLL_SEC,
+            ),
+            executor=PlaywrightExecutor(
+                concurrency=1,
+                executable_path=find_chrome(),
+                proxy=_playwright_proxy(proxy),
+            ),
+            sink=_LocalKeyExportSink(email, formats, name_secret),
+            ledger_path=_key_export_path("xai-enroller-ledger.db"),
+            ledger_salt=name_secret,
+            concurrency=1,
+            timeout=KEY_EXPORT_ENROLLER_TIMEOUT,
+            retry_attempts=KEY_EXPORT_ENROLLER_RETRY_ATTEMPTS,
+        )
+        results = await coordinator.run(target=1)
+        result = results[0] if results else None
+        if result is not None and result.status.value == "imported":
+            debug_log(f"[keys] exported OAuth credential formats={','.join(formats)}")
+        elif result is not None:
+            debug_log(f"[keys] OAuth export skipped status={result.status.value} reason={result.reason_code}")
+        return result
+    finally:
+        await client.aclose()
+
+
+def _schedule_key_export_enrollment(email, sso, session_cookies):
+    if not _key_export_oauth_formats():
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    task = loop.create_task(_run_key_export_enrollment(email, sso, session_cookies))
+    _key_export_tasks.add(task)
+
+    def done(completed):
+        _key_export_tasks.discard(completed)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            debug_log(f"[keys] OAuth export failed: {sanitize_terminal_error(exc)}")
+
+    task.add_done_callback(done)
+    return task
+
+
+async def _drain_key_export_tasks(timeout=None):
+    tasks = [task for task in list(_key_export_tasks) if not task.done()]
+    if not tasks:
+        return
+    timeout = KEY_EXPORT_ENROLLER_DRAIN_TIMEOUT if timeout is None else timeout
+    if timeout <= 0:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+    except asyncio.TimeoutError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def _persist_registration(email, password, sso, session_cookies):
     if session_cookies:
         document = json.dumps(
@@ -1764,13 +2892,17 @@ def _persist_registration(email, password, sso, session_cookies):
             separators=(",", ":"),
         )
         _append_registration_line(
-            "keys/auth-sessions.jsonl",
+            str(_key_export_path("auth-sessions.jsonl")),
             document + "\n",
             mode=0o600,
             durable=True,
         )
-    _append_registration_line("keys/accounts.txt", f"{email}:{password}:{sso}\n")
-    _append_registration_line("keys/grok.txt", sso + "\n")
+    if "legacy" in KEY_EXPORT_FORMATS:
+        _append_registration_line(
+            str(_key_export_path("accounts.txt")),
+            f"{email}:{password}:{sso}\n",
+        )
+        _append_registration_line(str(_key_export_path("grok.txt")), sso + "\n")
 
 
 async def _consume_pair(
@@ -1858,6 +2990,7 @@ async def _consume_pair(
             elapsed = time.time() - t0
             async with file_lock:
                 _persist_registration(email, password, sso, session_cookies)
+                _schedule_key_export_enrollment(email, sso, session_cookies)
                 metrics.record_success()
                 success_count = metrics.success_count
                 count = metrics.success_count
@@ -1995,10 +3128,12 @@ async def main():
     _c_hot_page_pool_size = derive_c_hot_page_pool_size(physical_cap, c_workers)
 
     # 校验邮箱模式配置
-    if EMAIL_MODE not in ('tempmail', 'custom'):
-        log("[!] 配置错误：EMAIL_MODE 应为 tempmail 或 custom"); return 2
+    if EMAIL_MODE not in ('tempmail', 'moemail', 'custom'):
+        log("[!] 配置错误：EMAIL_MODE 应为 tempmail、moemail 或 custom"); return 2
     if EMAIL_MODE == 'custom' and not EMAIL_DOMAIN:
         log("[!] 配置错误：custom 模式需在 .env 设置 EMAIL_DOMAIN"); return 2
+    if EMAIL_MODE == 'moemail' and not MOEMAIL_API_KEY:
+        log("[!] 配置错误：moemail 模式需在 .env 设置 MOEMAIL_API_KEY"); return 2
 
     debug_log("=" * 50)
     debug_log(f"  Grok Free Register (CSP Architecture)")
@@ -2112,6 +3247,7 @@ async def main():
         finally:
             for t in tasks:
                 t.cancel()
+            await _drain_key_export_tasks()
             await _close_c_hot_page_pool()
             await browser.close()
             log(format_user_registration_event("stopped", count=metrics.success_count))

@@ -32,7 +32,7 @@ bash start.sh --reconfig    # 重新选择邮箱模式
 
 `start.sh` 直接在当前终端显示状态。按 `Ctrl-C` 停止，再次执行同一命令即可重启；不需要额外的会话管理或守护进程依赖。
 
-需要代理时，在 `.env` 中加入：
+需要全局代理时，在 `.env` 中加入：
 
 ```env
 HTTP_PROXY=http://127.0.0.1:7890
@@ -45,6 +45,50 @@ HTTPS_PROXY=http://127.0.0.1:7890
 
 ```env
 EMAIL_MODE=tempmail
+```
+
+`moemail` 使用 MoeMail OpenAPI，适合已有 MoeMail 实例和 API Key 的场景：
+
+```env
+EMAIL_MODE=moemail
+MOEMAIL_API=https://moemail.app
+MOEMAIL_API_KEY=mk_xxx
+# MOEMAIL_DOMAIN=moemail.app
+```
+
+`moemail` 模式只使用 MoeMail，不会 fallback 到其它临时邮箱 provider。
+
+需要 Grok/xAI 代理池时，在项目目录创建 `代理.txt`，一行一个代理即可。未显式设置 `PROXY_POOL_FILE` 时，也兼容读取 `proxy.txt`。这个代理池只用于 xAI 注册页、发码、提交和自动 OAuth 转换，MoeMail 等邮箱 HTTP 默认直连：
+
+```text
+http://user:pass@host:port
+socks5://user:pass@host:port
+vless://...
+trojan://...
+```
+
+`代理.txt` 也支持 `vmess`、`vless`、`trojan`、`ss`、`hy2`、`hysteria2`、`tuic`、`anytls` 分享链接。使用分享链接时需先启动本机 proxy-relay 服务，默认调用 `http://127.0.0.1:18080` 的 `/api/state` 和 `/api/nodes/import`，导入后会自动使用对应本地端口。
+
+需要自动节点池时开启本地开关：
+
+```env
+PROXY_AUTO_FETCH_ENABLED=1
+```
+
+开启后程序会多线程拉取订阅、多线程测试节点，每 20 分钟刷新一次，只保留能访问 `PROXY_AUTO_TEST_URLS` 的代理；上一轮可用的自动代理会在下一轮继续复测，避免源站临时失败时直接清空。自动代理会和 `代理.txt` 里的手动代理混合轮换使用。拉取订阅时会用当前已有代理做轮换请求，避免所有源站请求都走同一个出口。可在 `proxy-sources.txt` 里追加订阅源，一行一个 URL；带 `*` 前缀表示这个 URL 返回的是“订阅源列表”。自动导出文件在 `logs/` 下，支持 raw、base64、sub2api/cpa 导入 JSON。
+
+注册成功后默认会把 SSO 会话交给本项目内置的 `xai_enroller` 自动换成 Grok OAuth 凭据，并写入 `keys/sub2api/`。需要 CPA 文件时设置：
+
+```env
+KEY_EXPORT_FORMATS=legacy,sub2api,cpa
+```
+
+只想保留某一种最终格式也可以设置为 `sub2api`、`cpa` 或 `legacy`。`sub` 会作为 `sub2api` 的别名处理。
+
+外部邮箱接口如果偶发 Cloudflare 拦截，可开启 CF-Ares 兜底。`cf-ares` 已随默认依赖安装：
+
+```env
+CF_ARES_EMAIL=fallback
 ```
 
 `custom` 是自建域名邮箱模式，适合长时间运行。需要一个已接入 Cloudflare Email Routing 的域名，并在运行机器上启动本项目的收信服务。
@@ -76,7 +120,44 @@ EMAIL_API=http://127.0.0.1:8080
 
 | 配置 | 默认值 | 说明 |
 |---|---:|---|
-| `EMAIL_MODE` | `tempmail` | 邮箱模式，支持 `tempmail` 和 `custom` |
+| `EMAIL_MODE` | `tempmail` | 邮箱模式，支持 `tempmail`、`moemail` 和 `custom` |
+| `MOEMAIL_API` | `https://moemail.app` | `moemail` 模式使用的 MoeMail 地址 |
+| `MOEMAIL_API_KEY` | 空 | `moemail` 模式使用的 API Key |
+| `MOEMAIL_DOMAIN` | 空 | `moemail` 模式指定邮箱域名，留空自动读取 |
+| `MOEMAIL_EXPIRY_MS` | `3600000` | `moemail` 邮箱有效期，单位毫秒 |
+| `KEY_EXPORT_DIR` | `keys` | 注册结果输出目录 |
+| `KEY_EXPORT_FORMATS` | `legacy,sub2api` | 输出格式，支持 `legacy`、`sub2api`/`sub`、`cpa` |
+| `KEY_EXPORT_ENROLLER` | `1` | 是否自动调用 `xai_enroller` 把 SSO 转 OAuth 后导出 |
+| `PROXY_POOL_FILE` | `代理.txt` | 可选 Grok/xAI 代理池文件，一行一个 `http`/`socks5` 代理或节点分享链接 |
+| `PROXY_POOL_STRATEGY` | `round_robin` | 代理选择方式，支持 `round_robin` 和 `random` |
+| `PROXY_RELAY_ENABLED` | `1` | 是否把节点分享链接交给本机 proxy-relay 转成本地代理 |
+| `PROXY_RELAY_URL` | `http://127.0.0.1:18080` | proxy-relay 管理 API 地址 |
+| `PROXY_RELAY_KERNEL` | `auto` | 分享链接导入内核，支持 `auto`、`sing-box`、`xray` |
+| `PROXY_RELAY_PROXY_SCHEME` | `auto` | 导入后给 Grok/xAI 链路使用的代理协议，`auto` 下 sing-box 为 `http`、xray 为 `socks5` |
+| `PROXY_RELAY_TIMEOUT` | `8` | 调用 proxy-relay 管理 API 的超时秒数 |
+| `PROXY_RELAY_RETRY_SEC` | `30` | 分享链接导入失败后的重试间隔 |
+| `PROXY_AUTO_FETCH_ENABLED` | `0` | 是否启用自动节点拉取和测试 |
+| `PROXY_AUTO_FETCH_URLS` | 内置 NoMoreWalls 订阅 | 逗号或换行分隔的订阅源 URL |
+| `PROXY_AUTO_FETCH_SOURCES_FILE` | `proxy-sources.txt` | 本地订阅源文件，一行一个 URL |
+| `PROXY_AUTO_FETCH_INTERVAL_SEC` | `1200` | 自动刷新间隔，默认 20 分钟 |
+| `PROXY_AUTO_FETCH_WORKERS` | `8` | 拉取订阅的线程数 |
+| `PROXY_AUTO_TEST_WORKERS` | `16` | 测试节点的线程数 |
+| `PROXY_AUTO_FETCH_TIMEOUT` | `12` | 拉取订阅的 HTTP 超时秒数 |
+| `PROXY_AUTO_TEST_TIMEOUT` | `10` | 测试节点的 HTTP 超时秒数 |
+| `PROXY_AUTO_TEST_URLS` | `https://accounts.x.ai/sign-up?redirect=grok-com` | 节点可用性测试 URL |
+| `PROXY_AUTO_TEST_ACCEPT_STATUS` | `200-399` | 可接受 HTTP 状态码范围 |
+| `PROXY_AUTO_EXPORT_FORMATS` | `raw,sub2api` | 自动导出格式，支持 `raw`、`base64`、`sub2api`、`cpa` |
+| `PROXY_AUTO_OUTPUT_DIR` | `logs` | 自动节点池输出目录 |
+| `PROXY_AUTO_ACTIVE_FILE` | `proxy-auto-active.txt` | 当前可用自动代理列表文件名 |
+| `PROXY_AUTO_STATE_FILE` | `proxy-auto-state.json` | 自动节点池状态文件名 |
+| `PROXY_AUTO_SOURCE_LIST_DEPTH` | `1` | `*URL` 订阅源列表最多展开层数 |
+| `PROXY_AUTO_MAX_CANDIDATES` | `0` | 单轮最多测试候选数，`0` 表示不限 |
+| `PROXY_AUTO_MAX_ACTIVE` | `0` | 自动池最多保留可用代理数，`0` 表示不限 |
+| `CF_ARES_EMAIL` | `0` | 可选邮箱 HTTP 兜底，`fallback` 遇到 Cloudflare 拦截时重试，`always` 始终使用 |
+| `CF_ARES_BROWSER_ENGINE` | `auto` | CF-Ares 浏览器引擎，支持 `auto`、`undetected`、`seleniumbase` |
+| `CF_ARES_HEADLESS` | `1` | CF-Ares 浏览器是否无头运行 |
+| `CF_ARES_PROXY` | 空 | CF-Ares 代理，留空沿用 `HTTPS_PROXY`/`HTTP_PROXY` |
+| `CF_ARES_PATH` | 空 | 可选本地 CF-Ares 源码目录，不设置则只使用 pip 包 |
 | `EMAIL_DOMAIN` | 空 | `custom` 模式使用的域名 |
 | `EMAIL_API` | `http://127.0.0.1:8080` | 本地收信服务地址 |
 | `TARGET` | `0` | 成功数量目标，`0` 表示不限 |
@@ -87,6 +168,8 @@ EMAIL_API=http://127.0.0.1:8080
 | `T_SLOT_CAP` | `8` | token 缓冲容量 |
 | `Q_SLOT_CAP` | `8` | 验证码缓冲容量 |
 | `Q_PENDING_CAP` | `12` | 等待验证码返回的请求上限 |
+| `EMAIL_CODE_RESEND_ATTEMPTS` | `2` | 邮箱验证码未收到时重新发送的最大次数 |
+| `EMAIL_CODE_RESEND_AFTER_SEC` | `35` | 等待多久仍未收到验证码后重发 |
 | `SOLVER_MOUSE_CLICK_RETRIES` | `3` | token 验证框中心点击次数，`0` 表示关闭 |
 | `PAGE_BLOCK_STATIC_ASSETS` | `0` | 可选：阻断部分静态资源，降低页面准备成本 |
 | `C_HOT_PAGE_POOL` | `0` | 可选：复用消费阶段页面，减少页面重建开销 |
@@ -148,11 +231,14 @@ PY
 
 ## 输出文件
 
-成功结果写入：
+成功结果写入 `keys/`。默认包括：
 
 ```text
 keys/accounts.txt
 keys/grok.txt
+keys/auth-sessions.jsonl
+keys/sub2api/accounts.sub2api.json
+keys/sub2api/xai-*.sub2api.json
 ```
 
 `accounts.txt` 每行格式：
@@ -162,6 +248,12 @@ email:password:sso_token
 ```
 
 `keys/` 目录包含运行结果，默认不会提交到 Git。
+
+当 `KEY_EXPORT_FORMATS` 包含 `cpa` 时，还会写入：
+
+```text
+keys/cpa/xai-*.json
+```
 
 ## 项目结构
 

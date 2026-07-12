@@ -35,6 +35,11 @@ echo "[2/4] 创建 Python 环境..."
 python3 -m venv .venv
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum requirements.txt | awk '{print $1}' > .venv/.requirements.sha256
+elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 requirements.txt | awk '{print $1}' > .venv/.requirements.sha256
+fi
 
 # 本项目直接由 Playwright 启动二进制，因此显式准备 CloakBrowser Chromium。
 echo "[3/4] 下载 CloakBrowser Chromium..."
