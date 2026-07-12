@@ -1,7 +1,7 @@
 import asyncio
 import threading
 
-from xai_enroller.auth_pipeline import AuthPipeline
+from xai_enroller.auth_pipeline import AuthPipeline, MinimumStartInterval
 from xai_enroller.ledger import Ledger
 from xai_enroller.models import (
     AuthorizationResult,
@@ -54,6 +54,26 @@ def test_cancel_active_is_idempotent_while_cleanup_is_in_progress(tmp_path):
         await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_start_interval_recovers_cautiously_and_explores_slowly():
+    interval = MinimumStartInterval(10)
+
+    interval.mark_rate_limited()
+    assert interval.seconds == 17
+
+    interval.mark_authorized(recovered=True)
+    for _ in range(19):
+        interval.mark_authorized()
+    assert interval.seconds == 17
+
+    interval.mark_authorized()
+    assert interval.seconds == 16.5
+
+    interval.mark_rate_limited()
+    assert interval.seconds == 17
+    interval.mark_rate_limited()
+    assert interval.seconds == 18
 
 
 class SingleSource:

@@ -115,8 +115,15 @@ class GlobalRateLimitGate:
 class MinimumStartInterval:
     """Enforce a minimum interval between actual authorization starts."""
 
+    RECOVERY_FLOOR_SECONDS = 17.0
+    MAX_RECOVERY_SECONDS = 60.0
+    SUCCESS_WINDOW = 20
+    RECOVERY_DECREASE_SECONDS = 0.5
+
     def __init__(self, seconds=0.0, *, clock=time.monotonic, sleep=asyncio.sleep):
-        self.seconds = max(0.0, float(seconds))
+        self.base_seconds = max(0.0, float(seconds))
+        self.seconds = self.base_seconds
+        self._stable_successes = 0
         self._clock = clock
         self._sleep = sleep
         self._last_started_at = self._clock() if self.seconds > 0 else None
@@ -131,6 +138,27 @@ class MinimumStartInterval:
     def mark_started(self):
         self._last_started_at = self._clock()
 
+    def mark_rate_limited(self):
+        floor = max(self.base_seconds, self.RECOVERY_FLOOR_SECONDS)
+        if self.seconds < floor:
+            self.seconds = floor
+        else:
+            self.seconds = min(self.MAX_RECOVERY_SECONDS, self.seconds + 1.0)
+        self._stable_successes = 0
+
+    def mark_authorized(self, *, recovered=False):
+        if recovered or self.seconds <= self.base_seconds:
+            self._stable_successes = 0
+            return
+        self._stable_successes += 1
+        if self._stable_successes < self.SUCCESS_WINDOW:
+            return
+        self.seconds = max(
+            self.base_seconds,
+            self.seconds - self.RECOVERY_DECREASE_SECONDS,
+        )
+        self._stable_successes = 0
+
     def snapshot(self):
         if self._last_started_at is None:
             remaining = 0.0
@@ -141,6 +169,7 @@ class MinimumStartInterval:
             )
         return {
             "min_authorization_interval_seconds": self.seconds,
+            "configured_min_authorization_interval_seconds": self.base_seconds,
             "pacing_remaining_seconds": round(remaining, 1),
         }
 
@@ -548,6 +577,9 @@ class AuthPipeline:
             self._authorization_cancellable = False
             if authorization.status is AuthorizationStatus.AUTHORIZED:
                 recovery_elapsed = await self.rate_gate.authorized(probe_token)
+                self.start_interval.mark_authorized(
+                    recovered=recovery_elapsed is not None
+                )
                 if recovery_elapsed is not None:
                     self._emit(
                         "rate_limit_cleared",
@@ -559,6 +591,7 @@ class AuthPipeline:
             if authorization.reason_code == "rate_limited":
                 applied = await self.rate_gate.rate_limited(probe_token)
                 if applied:
+                    self.start_interval.mark_rate_limited()
                     self._emit(
                         "rate_limited",
                         {"wait_seconds": int(self.rate_gate.COOLDOWN_SECONDS)},
