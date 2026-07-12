@@ -173,12 +173,18 @@ start.sh                    首次配置和运行
 auth-service.sh             认证服务入口
 setup.sh                    安装依赖
 .env.example                配置模板
-tools/                      日志分析与场景压测工具
+tools/                      运行日志分析工具
 tests/                      自动化测试
 docs/architecture.md        并发架构说明
 ```
 
 ## 测试
+
+测试依赖与运行依赖分开安装：
+
+```bash
+.venv/bin/pip install -r tests/requirements.txt
+```
 
 快速检查：
 
@@ -191,15 +197,6 @@ python3 -m unittest tests.test_admission_gate tests.test_register_runtime_unitte
 ```bash
 python3 -m pytest tests -q
 ```
-
-场景压测：
-
-```bash
-python3 tools/run_tests.py
-python3 tools/run_tests.py --list
-```
-
-`tools/run_tests.py` 默认输出到 `test_results/`，该目录是生成物。
 
 ## xAI OAuth Enroller
 

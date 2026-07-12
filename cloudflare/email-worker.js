@@ -52,10 +52,10 @@ export default {
       headers,
       body: JSON.stringify(payload),
     });
-    // 不要静默吞错:把结果打到 Worker 日志,便于排查(尤其上面的 1003)
-    console.log(`webhook ${env.WEBHOOK_URL} -> ${res.status}`);
+    // 日志只保留状态码，避免把 webhook 地址或上游响应写入 Worker 日志。
+    console.log(`webhook delivery -> ${res.status}`);
     if (!res.ok) {
-      console.error(`webhook failed: ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
+      console.error(`webhook delivery failed: ${res.status}`);
     }
   },
 };

@@ -9,7 +9,5 @@ logs/
 .setup.lock/
 .DS_Store
 .pytest_cache/
-test_results/
-test_results_real/
 xai-enroller-ledger.db*
 tmp_*.py

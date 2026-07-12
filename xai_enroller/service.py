@@ -3,7 +3,6 @@
 import asyncio
 import os
 import secrets
-import shlex
 import sys
 import tempfile
 from contextlib import suppress
@@ -12,9 +11,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .models import SourceRecord
 from .inventory import InventoryError
-from .remote_stream import parse_session_document
 
 
 DEFAULT_LOCAL_AUTH_DIR = Path.home() / "Downloads" / "grok-free-register-auth"
@@ -266,126 +263,6 @@ class AuthServiceSettings:
             retry_seconds=retry_seconds,
             min_authorization_interval_seconds=min_authorization_interval_seconds,
         )
-
-
-def parse_registered_accounts(lines):
-    """Parse legacy ``source:discarded-password:sso`` records."""
-    seen = set()
-    for line_number, line in enumerate(lines, 1):
-        raw = line.rstrip("\r\n")
-        if not raw:
-            continue
-        try:
-            source_id, _discarded_password, sso_token = raw.rsplit(":", 2)
-        except ValueError as exc:
-            raise ValueError(f"invalid registered account line {line_number}") from exc
-        if not source_id or not sso_token or source_id in seen:
-            continue
-        seen.add(source_id)
-        yield SourceRecord(source_id, sso_token)
-
-
-def parse_exported_records(lines):
-    """Parse the historical tab-delimited redacted exporter format."""
-    seen = set()
-    for line_number, line in enumerate(lines, 1):
-        raw = line.rstrip("\r\n")
-        if not raw:
-            continue
-        try:
-            source_id, sso_token = raw.split("\t", 1)
-        except ValueError as exc:
-            raise ValueError(f"invalid remote export line {line_number}") from exc
-        if not source_id or not sso_token or source_id in seen:
-            continue
-        seen.add(source_id)
-        yield SourceRecord(source_id, sso_token)
-
-
-def parse_exported_sessions(lines):
-    """Parse exact redacted session documents while preserving Cookie scope."""
-    seen = set()
-    for line_number, line in enumerate(lines, 1):
-        raw = line.rstrip("\r\n")
-        if not raw:
-            continue
-        try:
-            record = parse_session_document(raw)
-        except ValueError as exc:
-            raise ValueError(f"invalid registered session line {line_number}") from exc
-        if record.source_id in seen:
-            continue
-        seen.add(record.source_id)
-        yield record
-
-
-class SSHRegisteredSource:
-    """Compatibility facade for the former one-shot account exporter."""
-
-    def __init__(
-        self,
-        host,
-        *,
-        remote_root="/opt/grok-free-register",
-        identity_file=None,
-        process_factory=asyncio.create_subprocess_exec,
-    ):
-        self.host = host
-        self.remote_root = remote_root
-        self.identity_file = identity_file
-        self.process_factory = process_factory
-
-    async def fetch(self):
-        command = (
-            f"cd {shlex.quote(self.remote_root)} && "
-            "python3 scripts/export_registered_sso.py keys/accounts.txt"
-        )
-        args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
-        if self.identity_file:
-            args.extend(["-i", self.identity_file])
-        args.extend([self.host, command])
-        process = await self.process_factory(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _stderr = await process.communicate()
-        if process.returncode != 0:
-            raise RuntimeError("registered account sync failed")
-        return list(parse_exported_records(stdout.decode("utf-8").splitlines()))
-
-
-class AuthService:
-    """Compatibility facade for the former polling enrollment service."""
-
-    def __init__(self, source, enroller, emit):
-        self.source = source
-        self.enroller = enroller
-        self.emit = emit
-
-    async def run_cycle(self):
-        records = await self.source.fetch()
-        fresh = [
-            record
-            for record in records
-            if not self.enroller.ledger.has_imported(record.source_id)
-        ]
-        if not fresh:
-            return []
-        self.emit(("sync", {"new": len(fresh)}))
-        results = await self.enroller.run_records(fresh)
-        for result in results:
-            self.emit(
-                (
-                    "result",
-                    {
-                        "source_id": result.source_id,
-                        "status": result.status.value,
-                        "reason": result.reason_code,
-                    },
-                )
-            )
-        return results
 
 
 class EventTerminal:
@@ -737,82 +614,6 @@ class AuthPipelineRunner:
             await self.current_cycle
         finally:
             self.current_cycle = None
-
-
-class AuthServiceRunner:
-    """Compatibility runner for the former polling service API."""
-
-    def __init__(self, service, emit, *, interval_seconds):
-        self.service = service
-        self.emit = emit
-        self.interval_seconds = interval_seconds
-        self.paused = False
-        self.current_cycle = None
-        self._resume = asyncio.Event()
-        self._resume.set()
-        self._wake = asyncio.Event()
-        self._stopping = False
-
-    async def handle_command(self, command):
-        command = command.strip().lower()
-        if command == "p":
-            self.paused = True
-            self._resume.clear()
-            self.emit(("control", {"state": "paused"}))
-        elif command == "r":
-            self.paused = False
-            self._resume.set()
-            self._wake.set()
-            self.emit(("control", {"state": "running"}))
-        elif command == "s":
-            active = self.current_cycle is not None and not self.current_cycle.done()
-            self.emit(
-                (
-                    "status",
-                    {
-                        "state": "paused" if self.paused else "running",
-                        "active": active,
-                    },
-                )
-            )
-        elif command == "c":
-            if self.current_cycle is not None and not self.current_cycle.done():
-                self.current_cycle.cancel()
-                self.emit(("control", {"state": "cancelling"}))
-        elif command in {"q", "quit", "exit"}:
-            self._stopping = True
-            self._resume.set()
-            self._wake.set()
-            if self.current_cycle is not None and not self.current_cycle.done():
-                self.current_cycle.cancel()
-            self.emit(("control", {"state": "stopping"}))
-            return False
-        return True
-
-    async def run(self):
-        while not self._stopping:
-            await self._resume.wait()
-            if self._stopping:
-                break
-            self.current_cycle = asyncio.create_task(self.service.run_cycle())
-            try:
-                await self.current_cycle
-            except asyncio.CancelledError:
-                if self._stopping:
-                    break
-            except Exception:
-                self.emit(("error", {"reason": "sync_failed"}))
-            finally:
-                self.current_cycle = None
-            if self._stopping:
-                break
-            self._wake.clear()
-            try:
-                await asyncio.wait_for(
-                    self._wake.wait(), timeout=self.interval_seconds
-                )
-            except TimeoutError:
-                pass
 
 
 async def _run_interactive(runner, terminal):
