@@ -14,6 +14,13 @@ bash start.sh
 
 首次运行会自动创建 `.venv`、安装依赖，并引导生成 `.env`。
 
+需要完整说明时，按用途查看：
+
+- [注册教程](docs/guides/registration.md)
+- [本地认证服务](docs/guides/auth-service.md)
+- [凭据库存与取用](docs/guides/credential-inventory.md)
+- [运行状态与排障](docs/guides/runtime-troubleshooting.md)
+
 常用命令：
 
 ```bash
