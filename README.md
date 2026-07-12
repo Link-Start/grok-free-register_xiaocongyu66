@@ -274,11 +274,24 @@ export XAI_AUTH_SERVICE_RETRY_SEC=60
 ```
 
 终端只在账号开始、认证结果、限流状态或控制状态变化时输出。`s` 查看状态，`p` 暂停，
-`r` 恢复，`c` 取消当前账号，`q` 退出；`Ctrl-C` 同样会退出。累计结果保存在：
+`r` 恢复，`c` 取消当前账号，`q` 退出；`Ctrl-C` 同样会退出。输入 `take 100`
+会把最新的 100 个可用凭证登记为已取用，并移动到独立批次目录。认证记录仍保留为
+`imported`，不会因为凭证被取出而重新认证。
+
+可用凭证保存在：
 
 ```text
 ~/Downloads/grok-free-register-auth/authenticated/
 ```
+
+已取用批次保存在：
+
+```text
+~/Downloads/grok-free-register-auth/claimed/<batch-id>/
+```
+
+库存状态保存在 `enrollment-ledger.db` 的 `credential_inventory` 表中，状态为
+`available`、`claiming` 或 `claimed`。每条记录预留 `note` 字段，默认留空。
 
 ### 配置 CPA 导入
 

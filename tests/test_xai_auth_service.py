@@ -1,16 +1,20 @@
 import asyncio
 import subprocess
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 from xai_enroller.models import JobResult, JobStatus, SourceRecord
 from xai_enroller.service import (
     AuthService,
     AuthServiceRunner,
     AuthServiceSettings,
+    AuthPipelineRunner,
     SSHRegisteredSource,
     parse_registered_accounts,
 )
 from xai_enroller.ledger import Ledger
+from xai_enroller.inventory import InventoryError
 
 
 def test_registered_account_parser_keeps_only_email_and_sso():
@@ -155,3 +159,86 @@ def test_auth_service_settings_requires_an_ssh_host_and_bounds_polling():
     assert settings.ssh_host == "ubuntu@example.test"
     assert settings.sync_seconds == 45
     assert settings.remote_root == "/opt/grok-free-register"
+
+
+def test_pipeline_runner_takes_a_credential_batch_and_reports_inventory():
+    class InventoryLedger:
+        def inventory_counts(self):
+            return {"available": 7, "claiming": 0, "claimed": 3}
+
+    class Pipeline:
+        ledger = InventoryLedger()
+
+        def status(self):
+            return {"state": "running"}
+
+    class Inventory:
+        def take(self, count):
+            assert count == 3
+            return SimpleNamespace(
+                batch_id="batch-1",
+                directory=Path("/tmp/claimed/batch-1"),
+                moved=3,
+                note="",
+            )
+
+    async def scenario():
+        events = []
+        runner = AuthPipelineRunner(Pipeline(), events.append, inventory=Inventory())
+        assert await runner.handle_command("take 3") is True
+        assert await runner.handle_command("s") is True
+        return events
+
+    assert asyncio.run(scenario()) == [
+        (
+            "inventory_taken",
+            {
+                "batch_id": "batch-1",
+                "directory": "/tmp/claimed/batch-1",
+                "moved": 3,
+                "available": 7,
+                "claiming": 0,
+                "claimed": 3,
+            },
+        ),
+        (
+            "status",
+            {
+                "state": "running",
+                "available": 7,
+                "claiming": 0,
+                "claimed": 3,
+            },
+        ),
+    ]
+
+
+def test_pipeline_runner_reports_inventory_failure_without_stopping():
+    class Ledger:
+        def inventory_counts(self):
+            return {"available": 1, "claiming": 1, "claimed": 0}
+
+    class Pipeline:
+        ledger = Ledger()
+
+    class Inventory:
+        def take(self, _count):
+            raise InventoryError("credential file is missing")
+
+    async def scenario():
+        events = []
+        runner = AuthPipelineRunner(Pipeline(), events.append, inventory=Inventory())
+        assert await runner.handle_command("take 1") is True
+        return events
+
+    assert asyncio.run(scenario()) == [
+        (
+            "inventory_error",
+            {
+                "reason": "credential file is missing",
+                "available": 1,
+                "claiming": 1,
+                "claimed": 0,
+            },
+        )
+    ]

@@ -11,11 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import SourceRecord
+from .inventory import InventoryError
 from .remote_stream import parse_session_document
 
 
 DEFAULT_LOCAL_AUTH_DIR = Path.home() / "Downloads" / "grok-free-register-auth"
 AUTHENTICATED_DIRNAME = "authenticated"
+CLAIMED_DIRNAME = "claimed"
 
 
 def prepare_local_service_environment(env=None):
@@ -295,7 +297,21 @@ class EventTerminal:
                 f"attempted={data['attempted_unique']}; "
                 f"rate_limited={data['rate_limited']}; "
                 f"5m_rate={data['five_minute_imports_per_minute']:.2f}/min; "
-                f"lifetime_rate={data['lifetime_imports_per_minute']:.2f}/min"
+                f"lifetime_rate={data['lifetime_imports_per_minute']:.2f}/min; "
+                f"available={data['available']}; "
+                f"claiming={data['claiming']}; claimed={data['claimed']}"
+            )
+        elif kind == "inventory_taken":
+            message = (
+                f"✓ inventory: claimed={data['moved']}; "
+                f"available={data['available']}; batch={data['batch_id']}; "
+                f"directory={data['directory']}"
+            )
+        elif kind == "inventory_error":
+            message = (
+                f"⚠ inventory: {data['reason']}; "
+                f"available={data['available']}; "
+                f"claiming={data['claiming']}; claimed={data['claimed']}"
             )
         elif kind == "pipeline_error":
             message = (
@@ -308,9 +324,10 @@ class EventTerminal:
 class AuthPipelineRunner:
     """Map interactive controls onto the persistent pipeline lifecycle."""
 
-    def __init__(self, pipeline, emit, *, interval_seconds=None):
+    def __init__(self, pipeline, emit, *, interval_seconds=None, inventory=None):
         self.pipeline = pipeline
         self.emit = emit
+        self.inventory = inventory
         self.paused = False
         self.current_cycle = None
 
@@ -325,7 +342,42 @@ class AuthPipelineRunner:
             self.pipeline.resume()
             self.emit(("control", {"state": "running"}))
         elif command == "s":
-            self.emit(("status", self.pipeline.status()))
+            status = self.pipeline.status()
+            status.update(self.pipeline.ledger.inventory_counts())
+            self.emit(("status", status))
+        elif command.startswith("take "):
+            parts = command.split()
+            if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
+                self.emit(("control", {"state": "usage: take <positive-count>"}))
+                return True
+            if self.inventory is None:
+                self.emit(("control", {"state": "inventory unavailable"}))
+                return True
+            try:
+                batch = await asyncio.to_thread(self.inventory.take, int(parts[1]))
+            except InventoryError as exc:
+                self.emit(
+                    (
+                        "inventory_error",
+                        {
+                            "reason": str(exc),
+                            **self.pipeline.ledger.inventory_counts(),
+                        },
+                    )
+                )
+                return True
+            counts = self.pipeline.ledger.inventory_counts()
+            self.emit(
+                (
+                    "inventory_taken",
+                    {
+                        "batch_id": batch.batch_id,
+                        "directory": str(batch.directory),
+                        "moved": batch.moved,
+                        **counts,
+                    },
+                )
+            )
         elif command == "c":
             cancelled = await self.pipeline.cancel_active()
             self.emit(
@@ -423,7 +475,8 @@ class AuthServiceRunner:
 
 async def _run_interactive(runner):
     print(
-        "commands: s=status, p=pause, r=resume, c=cancel active, q=quit",
+        "commands: s=status, take N=claim credentials, p=pause, "
+        "r=resume, c=cancel active, q=quit",
         flush=True,
     )
     loop = asyncio.get_running_loop()
@@ -472,6 +525,7 @@ async def main_async():
     from .auth_pipeline import AuthPipeline
     from .config import Settings
     from .executors import PlaywrightExecutor
+    from .inventory import CredentialInventory
     from .ledger import Ledger
     from .protocol import XAIProfile, XAIProtocol
     from .remote_stream import DiskSnapshotSource, SSHSnapshotSynchronizer
@@ -511,6 +565,14 @@ async def main_async():
             name_secret=settings.source_salt,
         )
         ledger = Ledger(settings.ledger_path, settings.source_salt)
+        inventory = CredentialInventory(
+            ledger,
+            Path(settings.local_auth_dir) / AUTHENTICATED_DIRNAME,
+            Path(settings.local_auth_dir) / CLAIMED_DIRNAME,
+        )
+        recovered = await asyncio.to_thread(inventory.recover)
+        if recovered:
+            terminal.emit(("control", {"state": f"recovered {recovered} claims"}))
         pipeline = AuthPipeline(
             source=source,
             protocol=protocol,
@@ -524,7 +586,7 @@ async def main_async():
             event_callback=lambda kind, data: terminal.emit((kind, data)),
         )
         pipeline.rate_gate.COOLDOWN_SECONDS = float(service_settings.retry_seconds)
-        runner = AuthPipelineRunner(pipeline, terminal.emit)
+        runner = AuthPipelineRunner(pipeline, terminal.emit, inventory=inventory)
         await _run_interactive(runner)
     finally:
         if pipeline is not None:

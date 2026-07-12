@@ -46,6 +46,33 @@ class Ledger:
                 "CREATE INDEX IF NOT EXISTS jobs_source_status_idx "
                 "ON jobs(source_fingerprint, status)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS credential_inventory (
+                    sink_receipt_fingerprint TEXT PRIMARY KEY,
+                    state TEXT NOT NULL CHECK(state IN ('available', 'claiming', 'claimed')),
+                    claimed_at TEXT NOT NULL DEFAULT '',
+                    batch_id TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS credential_inventory_state_idx "
+                "ON credential_inventory(state)"
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO credential_inventory(
+                    sink_receipt_fingerprint, state
+                )
+                SELECT sink_receipt_fingerprint, 'available'
+                FROM jobs
+                WHERE status=?
+                  AND COALESCE(TRIM(sink_receipt_fingerprint), '') <> ''
+                """,
+                (JobStatus.IMPORTED.value,),
+            )
         os.chmod(self.path, 0o600)
 
     def fingerprint(self, source_id):
@@ -90,12 +117,108 @@ class Ledger:
         status_value = status.value if isinstance(status, JobStatus) else str(status)
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE jobs SET status=?, finished_at=?, reason_code=?, "
                 "sink_receipt_fingerprint=? "
                 "WHERE job_id=? AND status='pending'",
                 (status_value, now, reason_code, sink_receipt_fingerprint, job_id),
             )
+            if (
+                cursor.rowcount == 1
+                and status_value == JobStatus.IMPORTED.value
+                and sink_receipt_fingerprint
+            ):
+                connection.execute(
+                    "INSERT OR IGNORE INTO credential_inventory("
+                    "sink_receipt_fingerprint, state) VALUES (?, 'available')",
+                    (sink_receipt_fingerprint,),
+                )
+
+    def claim_available(self, limit, batch_id):
+        limit = int(limit)
+        if limit <= 0:
+            return []
+        batch_id = str(batch_id).strip()
+        if not batch_id:
+            raise ValueError("batch_id must not be empty")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                WITH latest_import AS (
+                    SELECT sink_receipt_fingerprint, MAX(finished_at) AS finished_at
+                    FROM jobs
+                    WHERE status=?
+                      AND COALESCE(TRIM(sink_receipt_fingerprint), '') <> ''
+                    GROUP BY sink_receipt_fingerprint
+                )
+                SELECT inventory.sink_receipt_fingerprint
+                FROM credential_inventory AS inventory
+                JOIN latest_import USING (sink_receipt_fingerprint)
+                WHERE inventory.state='available'
+                ORDER BY latest_import.finished_at DESC,
+                         inventory.sink_receipt_fingerprint ASC
+                LIMIT ?
+                """,
+                (JobStatus.IMPORTED.value, limit),
+            ).fetchall()
+            fingerprints = [row["sink_receipt_fingerprint"] for row in rows]
+            connection.executemany(
+                "UPDATE credential_inventory SET state='claiming', batch_id=?, "
+                "claimed_at='', note='' "
+                "WHERE sink_receipt_fingerprint=? AND state='available'",
+                ((batch_id, fingerprint) for fingerprint in fingerprints),
+            )
+        return fingerprints
+
+    def mark_claimed(self, batch_id, note=""):
+        batch_id = str(batch_id).strip()
+        if not batch_id:
+            raise ValueError("batch_id must not be empty")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE credential_inventory SET state='claimed', claimed_at=?, note=? "
+                "WHERE state='claiming' AND batch_id=?",
+                (datetime.now(timezone.utc).isoformat(), str(note), batch_id),
+            )
+            return cursor.rowcount
+
+    def inventory_counts(self):
+        counts = {"available": 0, "claiming": 0, "claimed": 0}
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM credential_inventory GROUP BY state"
+            )
+            for row in rows:
+                counts[row["state"]] = int(row["count"])
+        return counts
+
+    def pending_claims(self, batch_id=None):
+        query = (
+            "SELECT sink_receipt_fingerprint, batch_id, note "
+            "FROM credential_inventory WHERE state='claiming'"
+        )
+        params = ()
+        if batch_id is not None:
+            query += " AND batch_id=?"
+            params = (str(batch_id),)
+        query += " ORDER BY batch_id, sink_receipt_fingerprint"
+        with self._connect() as connection:
+            rows = connection.execute(query, params)
+            return [dict(row) for row in rows]
+
+    def recover_claiming(self, batch_id=None, *, note=""):
+        query = (
+            "UPDATE credential_inventory SET state='available', claimed_at='', "
+            "batch_id='', note=? WHERE state='claiming'"
+        )
+        params = [str(note)]
+        if batch_id is not None:
+            query += " AND batch_id=?"
+            params.append(str(batch_id))
+        with self._connect() as connection:
+            cursor = connection.execute(query, params)
+            return cursor.rowcount
 
     def recover_pending(self, *, reason="recovered_pending"):
         with self._connect() as connection:
