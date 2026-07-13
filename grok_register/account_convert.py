@@ -230,24 +230,30 @@ def _load_legacy_accounts(root: Path) -> dict[str, dict]:
     return out
 
 
-def _load_cpa_doc(root: Path, email: str) -> dict | None:
+def _index_cpa_by_email(root: Path) -> dict[str, dict]:
+    """email(lower) -> cpa document. Single pass over keys/cpa."""
+    out: dict[str, dict] = {}
     cpa_dir = root / "cpa"
     if not cpa_dir.is_dir():
-        return None
+        return out
     for path in cpa_dir.glob("xai-*.json"):
         doc = _read_json(path)
         if not isinstance(doc, dict):
             continue
-        if str(doc.get("email") or "").strip().lower() == email.lower():
-            return doc
-    return None
+        email = str(doc.get("email") or doc.get("name") or "").strip()
+        if not email:
+            continue
+        out[email.lower()] = doc
+    return out
 
 
-def _load_sub2api_item(root: Path, email: str) -> dict | None:
+def _index_sub2api_by_email(root: Path) -> dict[str, dict]:
+    """email(lower) -> sub2api account item. Single pass over keys/sub2api."""
+    out: dict[str, dict] = {}
     sub_dir = root / "sub2api"
     if not sub_dir.is_dir():
-        return None
-    for path in sorted(sub_dir.glob("*.sub2api.json")):
+        return out
+    for path in sub_dir.glob("*.sub2api.json"):
         if path.name == "accounts.sub2api.json":
             continue
         doc = _read_json(path)
@@ -261,9 +267,17 @@ def _load_sub2api_item(root: Path, email: str) -> dict | None:
             e = str(
                 creds.get("email") or extra.get("email") or item.get("name") or ""
             ).strip()
-            if e.lower() == email.lower():
-                return item
-    return None
+            if e:
+                out[e.lower()] = item
+    return out
+
+
+def _load_cpa_doc(root: Path, email: str) -> dict | None:
+    return _index_cpa_by_email(root).get(email.strip().lower())
+
+
+def _load_sub2api_item(root: Path, email: str) -> dict | None:
+    return _index_sub2api_by_email(root).get(email.strip().lower())
 
 
 def _cpa_from_sub2api_item(item: dict) -> dict:
@@ -287,17 +301,19 @@ def _cpa_from_sub2api_item(item: dict) -> dict:
     }
 
 
+# Keep in sync with xai_enroller.protocol.XAIProfile.default() — no import (avoids httpx).
+_XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+_XAI_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+
+
 def _sub2api_from_cpa_doc(doc: dict) -> dict:
     email = str(doc.get("email") or doc.get("name") or "")
-    from xai_enroller.protocol import XAIProfile
-
-    profile = XAIProfile.default()
     credentials = {
         "access_token": doc.get("access_token"),
         "refresh_token": doc.get("refresh_token"),
         "expires_at": doc.get("expired") or doc.get("expires_at"),
-        "client_id": profile.client_id,
-        "scope": profile.scope,
+        "client_id": _XAI_CLIENT_ID,
+        "scope": _XAI_SCOPE,
         "email": email,
         "base_url": doc.get("base_url") or "https://api.x.ai/v1",
     }
@@ -328,10 +344,7 @@ def _filename_for_email(email: str, name_secret: bytes) -> str:
     return f"xai-{digest}"
 
 
-def _write_cpa(root: Path, email: str, doc: dict, name_secret: bytes) -> Path:
-    """Write single-account xai-*.json only (never accounts.cpa.json)."""
-    directory = root / "cpa"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+def _purge_cpa_once(directory: Path) -> None:
     try:
         from xai_enroller.sinks import purge_cpa_bundles
 
@@ -344,6 +357,21 @@ def _write_cpa(root: Path, email: str, doc: dict, name_secret: bytes) -> Path:
                     p.unlink()
             except OSError:
                 pass
+
+
+def _write_cpa(
+    root: Path,
+    email: str,
+    doc: dict,
+    name_secret: bytes,
+    *,
+    purge: bool = True,
+) -> Path:
+    """Write single-account xai-*.json only (never accounts.cpa.json)."""
+    directory = root / "cpa"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if purge:
+        _purge_cpa_once(directory)
     sub = str(doc.get("sub") or email)
     import hashlib
     import hmac
@@ -356,26 +384,11 @@ def _write_cpa(root: Path, email: str, doc: dict, name_secret: bytes) -> Path:
     return path
 
 
-def _write_sub2api(root: Path, email: str, account: dict, name_secret: bytes) -> Path:
-    directory = root / "sub2api"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    creds = account.get("credentials") or {}
-    subject = str((account.get("extra") or {}).get("subject") or email)
-    import hashlib
-    import hmac
-
-    digest = hmac.new(name_secret, subject.encode(), hashlib.sha256).hexdigest()[:16]
-    path = directory / f"xai-{digest}.sub2api.json"
-    doc = {
-        "exported_at": datetime.now(timezone.utc).isoformat(),
-        "proxies": [],
-        "accounts": [account],
-    }
-    _atomic_write_private_json(path, doc)
-    # refresh bundle
-    accounts = []
-    seen = set()
-    for p in sorted(directory.glob("*.sub2api.json")):
+def _rebuild_sub2api_bundle(directory: Path) -> int:
+    """Rebuild accounts.sub2api.json once after a batch of single-file writes."""
+    accounts: list = []
+    seen: set = set()
+    for p in directory.glob("*.sub2api.json"):
         if p.name == "accounts.sub2api.json":
             continue
         d = _read_json(p)
@@ -398,21 +411,65 @@ def _write_sub2api(root: Path, email: str, account: dict, name_secret: bytes) ->
             "accounts": accounts,
         },
     )
+    return len(accounts)
+
+
+def _write_sub2api(
+    root: Path,
+    email: str,
+    account: dict,
+    name_secret: bytes,
+    *,
+    rebuild_bundle: bool = True,
+) -> Path:
+    directory = root / "sub2api"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    subject = str((account.get("extra") or {}).get("subject") or email)
+    import hashlib
+    import hmac
+
+    digest = hmac.new(name_secret, subject.encode(), hashlib.sha256).hexdigest()[:16]
+    path = directory / f"xai-{digest}.sub2api.json"
+    doc = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "proxies": [],
+        "accounts": [account],
+    }
+    _atomic_write_private_json(path, doc)
+    if rebuild_bundle:
+        _rebuild_sub2api_bundle(directory)
     return path
 
 
-def convert_oauth_copy(email: str, formats: Iterable[str], root: Path | None = None) -> dict:
-    """Convert using existing OAuth files only (no browser)."""
+def convert_oauth_copy(
+    email: str,
+    formats: Iterable[str],
+    root: Path | None = None,
+    *,
+    cpa_index: dict[str, dict] | None = None,
+    sub_index: dict[str, dict] | None = None,
+    name_secret: bytes | None = None,
+    purge_cpa: bool = True,
+    rebuild_sub2api_bundle: bool = True,
+) -> dict:
+    """Convert using existing OAuth files only (no browser).
+
+    Pass prebuilt indexes for batch conversion (avoids O(n²) directory scans).
+    """
     root = root or key_export_dir()
     formats = {f.strip().lower() for f in formats if f}
     formats &= {"cpa", "sub2api"}
     if not formats:
         return {"ok": False, "email": email, "error": "no formats"}
 
-    name_secret = _load_or_create_salt(root)
+    if name_secret is None:
+        name_secret = _load_or_create_salt(root)
+    email_l = email.strip().lower()
+    cpa_map = cpa_index if cpa_index is not None else _index_cpa_by_email(root)
+    sub_map = sub_index if sub_index is not None else _index_sub2api_by_email(root)
     written = []
-    cpa_doc = _load_cpa_doc(root, email)
-    sub_item = _load_sub2api_item(root, email)
+    cpa_doc = cpa_map.get(email_l)
+    sub_item = sub_map.get(email_l)
 
     if "cpa" in formats:
         if cpa_doc:
@@ -421,27 +478,32 @@ def convert_oauth_copy(email: str, formats: Iterable[str], root: Path | None = N
             doc = _cpa_from_sub2api_item(sub_item)
             if not doc.get("access_token") and not doc.get("refresh_token"):
                 return {"ok": False, "email": email, "error": "sub2api missing tokens"}
-            path = _write_cpa(root, email, doc, name_secret)
+            path = _write_cpa(root, email, doc, name_secret, purge=purge_cpa)
             written.append(f"cpa:{path.name}")
+            cpa_map[email_l] = dict(doc)
+            cpa_map[email_l]["email"] = email
         else:
             return {"ok": False, "email": email, "error": "no oauth source for cpa", "need_sso": True}
 
     if "sub2api" in formats:
         if sub_item:
             written.append("sub2api:already")
-        elif cpa_doc:
-            item = _sub2api_from_cpa_doc(cpa_doc)
-            path = _write_sub2api(root, email, item, name_secret)
-            written.append(f"sub2api:{path.name}")
         else:
-            # maybe we just wrote cpa above
-            cpa_doc2 = _load_cpa_doc(root, email)
-            if cpa_doc2:
-                item = _sub2api_from_cpa_doc(cpa_doc2)
-                path = _write_sub2api(root, email, item, name_secret)
+            src = cpa_map.get(email_l) or cpa_doc
+            if src:
+                item = _sub2api_from_cpa_doc(src)
+                path = _write_sub2api(
+                    root, email, item, name_secret, rebuild_bundle=rebuild_sub2api_bundle
+                )
                 written.append(f"sub2api:{path.name}")
+                sub_map[email_l] = item
             else:
-                return {"ok": False, "email": email, "error": "no oauth source for sub2api", "need_sso": True}
+                return {
+                    "ok": False,
+                    "email": email,
+                    "error": "no oauth source for sub2api",
+                    "need_sso": True,
+                }
 
     return {"ok": True, "email": email, "method": "oauth_copy", "written": written}
 
@@ -576,6 +638,13 @@ def convert_account(
     *,
     root: Path | None = None,
     allow_enroll: bool = True,
+    cpa_index: dict[str, dict] | None = None,
+    sub_index: dict[str, dict] | None = None,
+    name_secret: bytes | None = None,
+    sessions: dict[str, dict] | None = None,
+    legacy: dict[str, dict] | None = None,
+    purge_cpa: bool = True,
+    rebuild_sub2api_bundle: bool = True,
 ) -> dict:
     """Convert one account to requested formats."""
     root = root or key_export_dir()
@@ -586,7 +655,16 @@ def convert_account(
 
     email = email.strip()
     # 1) try pure OAuth copy/transform first
-    copy_result = convert_oauth_copy(email, formats, root)
+    copy_result = convert_oauth_copy(
+        email,
+        formats,
+        root,
+        cpa_index=cpa_index,
+        sub_index=sub_index,
+        name_secret=name_secret,
+        purge_cpa=purge_cpa,
+        rebuild_sub2api_bundle=rebuild_sub2api_bundle,
+    )
     if copy_result.get("ok"):
         return copy_result
     if not copy_result.get("need_sso") and not allow_enroll:
@@ -597,25 +675,27 @@ def convert_account(
             "ok": False,
             "email": email,
             "error": copy_result.get("error") or "need sso enrollment",
+            "need_sso": bool(copy_result.get("need_sso")),
         }
 
-    # 2) SSO enrollment
-    sessions = _load_auth_sessions(root)
-    legacy = _load_legacy_accounts(root)
+    # 2) SSO enrollment (slow browser path — only when explicitly allowed)
+    sess_map = sessions if sessions is not None else _load_auth_sessions(root)
+    leg_map = legacy if legacy is not None else _load_legacy_accounts(root)
     sso = ""
     cookies: list = []
     fp = None
-    if email in sessions:
-        sso = sessions[email].get("sso") or ""
-        cookies = sessions[email].get("cookies") or []
-        fp = sessions[email].get("browser_fingerprint_id")
-    if not sso and email in legacy:
-        sso = legacy[email].get("sso") or ""
+    if email in sess_map:
+        sso = sess_map[email].get("sso") or ""
+        cookies = sess_map[email].get("cookies") or []
+        fp = sess_map[email].get("browser_fingerprint_id")
+    if not sso and email in leg_map:
+        sso = leg_map[email].get("sso") or ""
     if not sso:
         return {
             "ok": False,
             "email": email,
             "error": "no SSO session for enrollment (accounts.txt / auth-sessions.jsonl)",
+            "need_sso": True,
         }
     if not cookies and sso:
         cookies = [
@@ -630,17 +710,17 @@ def convert_account(
             }
         ]
 
-    name_secret = _load_or_create_salt(root)
+    secret = name_secret if name_secret is not None else _load_or_create_salt(root)
     try:
         return asyncio.run(
-            _enroll_one(email, sso, cookies, fp, formats, root, name_secret)
+            _enroll_one(email, sso, cookies, fp, formats, root, secret)
         )
     except RuntimeError:
         # nested event loop
         loop = asyncio.new_event_loop()
         try:
             return loop.run_until_complete(
-                _enroll_one(email, sso, cookies, fp, formats, root, name_secret)
+                _enroll_one(email, sso, cookies, fp, formats, root, secret)
             )
         finally:
             loop.close()
@@ -653,19 +733,24 @@ def convert_accounts(
     formats: Iterable[str],
     *,
     only_pending: bool = False,
-    allow_enroll: bool = True,
+    allow_enroll: bool = False,
     rebuild: bool = True,
-    limit: int = 50,
+    limit: int = 500,
+    progress_cb=None,
 ) -> dict:
     """
     Convert many accounts.
     emails=None → all accounts (optionally only oauth_pending).
+
+    Fast path: one-shot OAuth indexes + deferred bundle rebuild.
+    Enroll (browser) is opt-in via allow_enroll=True — used by「仅转换待 OAuth」.
     """
     root = key_export_dir()
     formats = [f.strip().lower() for f in formats if f and f.strip().lower() in {"cpa", "sub2api"}]
     if not formats:
         return {"ok": False, "message": "formats must include cpa and/or sub2api", "results": []}
 
+    t0 = time.time()
     records = scan_accounts(root)
     if emails:
         want = {e.strip().lower() for e in emails if e and e.strip()}
@@ -681,25 +766,90 @@ def convert_accounts(
                 filtered.append(r)
         records = filtered
 
-    records = records[: max(1, min(int(limit or 50), 200))]
+    # When not enrolling, only process rows that already have some OAuth file
+    # (pure legacy SSO cannot become CPA without browser enroller).
+    if not allow_enroll and not emails and not only_pending:
+        records = [
+            r for r in records if any(src in r.formats for src in ("cpa", "sub2api"))
+        ]
+
+    max_limit = 5000
+    try:
+        lim = int(limit or 500)
+    except (TypeError, ValueError):
+        lim = 500
+    records = records[: max(1, min(lim, max_limit))]
+
+    # Build indexes once — O(files) not O(accounts × files)
+    name_secret = _load_or_create_salt(root)
+    cpa_index = _index_cpa_by_email(root)
+    sub_index = _index_sub2api_by_email(root)
+    sessions = _load_auth_sessions(root) if allow_enroll else {}
+    legacy = _load_legacy_accounts(root) if allow_enroll else {}
+    # purge cpa merge leftovers once per batch
+    _purge_cpa_once(root / "cpa")
+
     results = []
     ok = fail = skipped = 0
-    for rec in records:
+    wrote_sub2api = False
+    total = len(records)
+    if progress_cb:
+        try:
+            progress_cb(done=0, total=total, ok=0, fail=0, skipped=0, message="indexing done")
+        except Exception:
+            pass
+
+    for i, rec in enumerate(records):
         missing = [f for f in formats if f not in rec.formats]
         if not missing and emails is None:
             skipped += 1
-            results.append({"ok": True, "email": rec.email, "skipped": True, "reason": "already has formats"})
-            continue
-        target_formats = missing if (emails is None and missing) else formats
-        # if user selected specific emails, convert all requested formats
-        if emails:
-            target_formats = formats
-        r = convert_account(rec.email, target_formats, root=root, allow_enroll=allow_enroll)
-        results.append(r)
-        if r.get("ok"):
-            ok += 1
+            results.append(
+                {"ok": True, "email": rec.email, "skipped": True, "reason": "already has formats"}
+            )
         else:
-            fail += 1
+            target_formats = missing if (emails is None and missing) else formats
+            if emails:
+                target_formats = formats
+            r = convert_account(
+                rec.email,
+                target_formats,
+                root=root,
+                allow_enroll=allow_enroll,
+                cpa_index=cpa_index,
+                sub_index=sub_index,
+                name_secret=name_secret,
+                sessions=sessions,
+                legacy=legacy,
+                purge_cpa=False,
+                rebuild_sub2api_bundle=False,
+            )
+            results.append(r)
+            if r.get("ok"):
+                ok += 1
+                written = r.get("written") or []
+                if any(str(w).startswith("sub2api:") and "already" not in str(w) for w in written):
+                    wrote_sub2api = True
+            else:
+                fail += 1
+
+        if progress_cb and (i % 10 == 0 or i + 1 == total):
+            try:
+                progress_cb(
+                    done=i + 1,
+                    total=total,
+                    ok=ok,
+                    fail=fail,
+                    skipped=skipped,
+                    message=f"converting {i + 1}/{total}",
+                )
+            except Exception:
+                pass
+
+    if wrote_sub2api or ("sub2api" in formats and ok):
+        try:
+            _rebuild_sub2api_bundle(root / "sub2api")
+        except Exception:
+            pass
 
     bundles = {}
     if rebuild:
@@ -708,10 +858,15 @@ def convert_accounts(
         except Exception as exc:
             bundles = {"error": str(exc)}
 
-    need_sso = sum(1 for r in results if r.get("need_sso") or "SSO" in str(r.get("error") or ""))
-    msg = f"转换完成：成功 {ok} · 失败 {fail} · 跳过 {skipped}"
-    if need_sso and fail:
-        msg += f"（其中 {need_sso} 个需 SSO→OAuth，请保持 allow_enroll 或点「仅转换待 OAuth」）"
+    elapsed = round(time.time() - t0, 2)
+    need_sso = sum(
+        1 for r in results if r.get("need_sso") or "SSO" in str(r.get("error") or "")
+    )
+    msg = f"转换完成：成功 {ok} · 失败 {fail} · 跳过 {skipped} · {elapsed}s"
+    if need_sso and fail and not allow_enroll:
+        msg += f"（{need_sso} 个仅有 SSO、无 OAuth，请点「仅转换待 OAuth」走浏览器）"
+    elif need_sso and fail:
+        msg += f"（其中 {need_sso} 个需 SSO→OAuth）"
     return {
         "ok": fail == 0 and (ok + skipped) > 0,
         "message": msg,
@@ -722,6 +877,8 @@ def convert_accounts(
         "formats": formats,
         "results": results,
         "bundles": bundles,
+        "elapsed_sec": elapsed,
+        "allow_enroll": allow_enroll,
     }
 
 
@@ -730,8 +887,8 @@ def start_convert_job(
     formats: Iterable[str],
     *,
     only_pending: bool = False,
-    allow_enroll: bool = True,
-    limit: int = 50,
+    allow_enroll: bool = False,
+    limit: int = 500,
 ) -> dict:
     """Background convert for dashboard (non-blocking)."""
     with _job_lock:
@@ -749,10 +906,21 @@ def start_convert_job(
             ok=0,
             fail=0,
             skipped=0,
-            message="running",
+            message="indexing…",
             results=[],
             error="",
         )
+
+        def on_progress(**kwargs):
+            _set_job(
+                total=kwargs.get("total") or 0,
+                done=kwargs.get("done") or 0,
+                ok=kwargs.get("ok") or 0,
+                fail=kwargs.get("fail") or 0,
+                skipped=kwargs.get("skipped") or 0,
+                message=kwargs.get("message") or "running",
+            )
+
         try:
             out = convert_accounts(
                 emails,
@@ -761,6 +929,7 @@ def start_convert_job(
                 allow_enroll=allow_enroll,
                 rebuild=True,
                 limit=limit,
+                progress_cb=on_progress,
             )
             _set_job(
                 running=False,
@@ -774,6 +943,7 @@ def start_convert_job(
                 results=out.get("results") or [],
                 error="",
                 bundles=out.get("bundles") or {},
+                elapsed_sec=out.get("elapsed_sec"),
             )
         except Exception as exc:
             _set_job(
@@ -785,4 +955,4 @@ def start_convert_job(
 
     t = threading.Thread(target=worker, name="account-convert", daemon=True)
     t.start()
-    return {"ok": True, "message": "转换任务已启动", "job": job_status()}
+    return {"ok": True, "message": "转换任务已启动（OAuth 文件互转，秒级）", "job": job_status()}

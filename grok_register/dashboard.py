@@ -992,7 +992,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <button class="act" id="btn-convert-both" data-i18n="btn_convert_both">转 sub2api + CPA</button>
         <button class="act" id="btn-convert-pending" data-i18n="btn_convert_pending">仅转换待 OAuth</button>
       </div>
-      <div class="note" id="convert-note" data-i18n="convert_hint">优先用已有 OAuth 互转；没有 OAuth 时用 SSO 走 enroller（可能较慢）</div>
+      <div class="note" id="convert-note" data-i18n="convert_hint">一键转 CPA/sub2api = 已有 OAuth 文件互转（秒级，默认不走浏览器）。「仅转换待 OAuth」才用 SSO 浏览器（慢，建议少量）。</div>
       <div class="actions" style="margin-top:12px">
         <button class="act primary" id="btn-cpa-sync" data-i18n="btn_cpa_sync">同步 CLIProxyAPI</button>
         <button class="act" id="btn-cpa-refresh" data-i18n="btn_cpa_refresh">刷新过期 Token</button>
@@ -1121,7 +1121,7 @@ const I18N = {
     btn_convert_cpa: "一键转 CPA",
     btn_convert_both: "转 sub2api + CPA",
     btn_convert_pending: "仅转换待 OAuth",
-    convert_hint: "优先用已有 OAuth 互转；没有 OAuth 时用 SSO 走 enroller（可能较慢）",
+    convert_hint: "一键转 CPA/sub2api = 已有 OAuth 文件互转（秒级，默认不走浏览器）。「仅转换待 OAuth」才用 SSO 浏览器（慢，建议少量）。",
     convert_starting: "正在启动转换…",
     convert_running: "转换进行中…",
     convert_done: "转换完成",
@@ -1282,7 +1282,7 @@ const I18N = {
     btn_convert_cpa: "Convert → CPA",
     btn_convert_both: "Convert → sub2api + CPA",
     btn_convert_pending: "Convert pending OAuth only",
-    convert_hint: "Prefers OAuth copy; falls back to SSO enroller (slower)",
+    convert_hint: "One-click CPA/sub2api = OAuth file transform (seconds, no browser). “Pending OAuth only” uses SSO browser (slow).",
     convert_starting: "Starting convert…",
     convert_running: "Convert running…",
     convert_done: "Convert finished",
@@ -2195,18 +2195,21 @@ $("btn-scrape-public")?.addEventListener("click",async()=>{
   }catch(e){ if(note) note.textContent=String(e); }
 });
 
-async function startConvert(formats, onlyPending){
+async function startConvert(formats, onlyPending, opts){
   const note=$("convert-note");
   if(!note) return;
   note.textContent=t("convert_starting");
+  opts = opts || {};
+  // one-click CPA/sub2api: pure OAuth file transform (fast). Browser enroll only for「待 OAuth」.
+  const allowEnroll = opts.allow_enroll != null ? !!opts.allow_enroll : !!onlyPending;
   try{
     const body={
       action:"convert",
       formats: formats,
       only_pending: !!onlyPending,
-      allow_enroll: true,
+      allow_enroll: allowEnroll,
       background: true,
-      limit: 50,
+      limit: opts.limit != null ? opts.limit : 2000,
     };
     const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     note.textContent=r.message||JSON.stringify(r);
@@ -2216,10 +2219,10 @@ async function startConvert(formats, onlyPending){
     note.textContent=String(e);
   }
 }
-$("btn-convert-sub2api")?.addEventListener("click",()=>startConvert(["sub2api"], false));
-$("btn-convert-cpa")?.addEventListener("click",()=>startConvert(["cpa"], false));
-$("btn-convert-both")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], false));
-$("btn-convert-pending")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], true));
+$("btn-convert-sub2api")?.addEventListener("click",()=>startConvert(["sub2api"], false, {allow_enroll:false, limit:2000}));
+$("btn-convert-cpa")?.addEventListener("click",()=>startConvert(["cpa"], false, {allow_enroll:false, limit:2000}));
+$("btn-convert-both")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], false, {allow_enroll:false, limit:2000}));
+$("btn-convert-pending")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], true, {allow_enroll:true, limit:20}));
 
 async function runCpaAction(action){
   const note=$("cpa-sync-note");
@@ -2486,13 +2489,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if isinstance(emails, str):
                 emails = [e.strip() for e in emails.split(",") if e.strip()]
             only_pending = bool((data or {}).get("only_pending"))
-            allow_enroll = (data or {}).get("allow_enroll", True)
+            # Default: OAuth file transform only (fast). Enroll is opt-in.
+            if "allow_enroll" in (data or {}):
+                allow_enroll = (data or {}).get("allow_enroll")
+            else:
+                allow_enroll = bool(only_pending)
             if isinstance(allow_enroll, str):
                 allow_enroll = allow_enroll.strip().lower() not in {"0", "false", "no", "off"}
             try:
-                limit = int((data or {}).get("limit") or 50)
+                default_limit = 20 if allow_enroll else 2000
+                limit = int((data or {}).get("limit") or default_limit)
             except (TypeError, ValueError):
-                limit = 50
+                limit = 20 if allow_enroll else 2000
             background = (data or {}).get("background", True)
             if isinstance(background, str):
                 background = background.strip().lower() not in {"0", "false", "no", "off"}
