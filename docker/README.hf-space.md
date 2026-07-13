@@ -39,8 +39,13 @@ EMAIL_MODE=moemail
 CAPSOLVER_API_KEY=...          # 强烈推荐：减轻本机浏览器压力
 REGISTER_ENGINE=protocol
 TURNSTILE_SOLVER=hybrid
-TURNSTILE_SOLVER_THREADS=2
-GO_REGISTER_WORKERS=4
+# 新版 hybrid 多语言 Turnstile：8 浏览器并发
+TURNSTILE_SOLVER=hybrid
+SOLVER_GATEWAY_WORKERS=8
+SOLVER_GATEWAY_WORKERS_MAX=8
+SOLVER_WORKER_CONCURRENCY=1
+TURNSTILE_SOLVER_THREADS=8
+GO_REGISTER_WORKERS=8
 CONTROL_PLANE_ALLOW_ACTIONS=1
 ```
 
@@ -82,8 +87,8 @@ docker run --rm -p 7860:7860 \
 
 ## 性能建议（16G）
 
-- `TURNSTILE_SOLVER_THREADS=2`～`4`（再高容易把内存打满）
-- `GO_REGISTER_WORKERS` 不要远大于 Turnstile 槽位（例如 4～8）
+- 新版 hybrid：`SOLVER_GATEWAY_WORKERS=8`（浏览器数）；内存紧可改 2～4
+- `GO_REGISTER_WORKERS` 建议与 Turnstile 槽位同量级（例如都 8）
 - 有 **CapSolver** 时协议路径可优先打码 API，吞吐更稳
 - 主进程退出会清理 hybrid 进程组（本仓库已加 orphan 清理）
 

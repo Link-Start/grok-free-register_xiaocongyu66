@@ -860,9 +860,9 @@ func autoWorkers(softMB int) int {
 		byCPU = 1
 	}
 	// hard cap to avoid OOM storms
-	capN := envInt("SOLVER_GATEWAY_WORKERS_MAX", 6)
+	capN := envInt("SOLVER_GATEWAY_WORKERS_MAX", 8)
 	if capN < 1 {
-		capN = 6
+		capN = 8
 	}
 	n := byMem
 	if byCPU < n {
@@ -1043,7 +1043,7 @@ func main() {
 	host := flag.String("host", env("SOLVER_GATEWAY_HOST", "127.0.0.1"), "bind host")
 	port := flag.Int("port", envInt("SOLVER_GATEWAY_PORT", 5080), "bind port")
 	// workers: "auto" or integer; default auto uses multi-core + free RAM
-	workersRaw := flag.String("workers", env("SOLVER_GATEWAY_WORKERS", "auto"), "browser workers (auto|N)")
+	workersRaw := flag.String("workers", env("SOLVER_GATEWAY_WORKERS", "8"), "browser workers (N|auto, default 8)")
 	concurrency := flag.Int("concurrency", envInt("SOLVER_WORKER_CONCURRENCY", 0), "async pages per worker (0=auto)")
 	timeout := flag.Int("timeout", envInt("SOLVER_GATEWAY_TIMEOUT", 90), "solve timeout sec")
 	queueSize := flag.Int("queue", envInt("SOLVER_GATEWAY_QUEUE", 0), "job queue size (0=auto)")
