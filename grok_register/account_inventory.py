@@ -377,9 +377,158 @@ def ensure_bundles(*, rebuild: bool = False) -> dict[str, str]:
     return out
 
 
+# Runtime account files needed to resume registration / re-export OAuth later.
+# These live under KEY_EXPORT_DIR (keys/ or /data/keys on HF).
+RECOVERY_FILE_SPECS: list[dict[str, str]] = [
+    {
+        "id": "accounts_txt",
+        "name": "accounts.txt",
+        "media": "text/plain; charset=utf-8",
+        "aliases": "legacy,accounts,txt,accounts_txt,accounts.txt",
+        "desc": "email:password:sso 主台账",
+    },
+    {
+        "id": "auth_sessions",
+        "name": "auth-sessions.jsonl",
+        "media": "application/x-ndjson; charset=utf-8",
+        "aliases": "auth_sessions,sessions,auth-sessions,auth-sessions.jsonl,jsonl",
+        "desc": "SSO cookie / 会话（enroller 用）",
+    },
+    {
+        "id": "browser_fingerprints",
+        "name": "browser-fingerprints.json",
+        "media": "application/json",
+        "aliases": "browser_fingerprints,fingerprints,browser-fingerprints,browser-fingerprints.json,fp",
+        "desc": "浏览器指纹绑定",
+    },
+    {
+        "id": "grok_txt",
+        "name": "grok.txt",
+        "media": "text/plain; charset=utf-8",
+        "aliases": "grok,grok_txt,grok.txt,sso",
+        "desc": "纯 SSO 行（一行一个）",
+    },
+    {
+        "id": "protocol_log",
+        "name": "accounts.protocol.log",
+        "media": "text/plain; charset=utf-8",
+        "aliases": "protocol_log,protocol,accounts.protocol.log,protocol.log",
+        "desc": "协议注册成功日志",
+    },
+]
+
+
+def _recovery_alias_map() -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for spec in RECOVERY_FILE_SPECS:
+        for raw in (spec.get("aliases") or "").split(","):
+            key = raw.strip().lower()
+            if key:
+                out[key] = spec
+        out[spec["id"].lower()] = spec
+        out[spec["name"].lower()] = spec
+    return out
+
+
+def list_recovery_files(root: Path | None = None) -> list[dict[str, Any]]:
+    """Presence / size of recovery sources for dashboard + API."""
+    root = root or key_export_dir()
+    items: list[dict[str, Any]] = []
+    for spec in RECOVERY_FILE_SPECS:
+        path = root / spec["name"]
+        size = 0
+        mtime = ""
+        exists = path.is_file()
+        if exists:
+            try:
+                st = path.stat()
+                size = int(st.st_size)
+                mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
+            except OSError:
+                exists = False
+        items.append(
+            {
+                "id": spec["id"],
+                "name": spec["name"],
+                "desc": spec.get("desc") or "",
+                "exists": exists,
+                "size": size,
+                "updated_at": mtime,
+                "download": f"/api/download?format={spec['id']}",
+            }
+        )
+    return items
+
+
+def pack_recovery_zip(root: Path | None = None) -> Path:
+    """Zip accounts.txt + sessions + fingerprints + grok + protocol log for backup."""
+    root = root or key_export_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    zip_path = root / f"account-recovery-{stamp}.zip"
+    # stable name for latest download link + keep stamped copy when possible
+    latest = root / "account-recovery.zip"
+    written = 0
+    tmp = latest.with_suffix(".zip.tmp")
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for spec in RECOVERY_FILE_SPECS:
+            path = root / spec["name"]
+            if not path.is_file():
+                continue
+            try:
+                zf.write(path, arcname=spec["name"])
+                written += 1
+            except OSError:
+                continue
+        # tiny manifest for restore tooling
+        manifest = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "files": [s["name"] for s in RECOVERY_FILE_SPECS if (root / s["name"]).is_file()],
+            "note": "Unpack into KEY_EXPORT_DIR (keys/ or /data/keys) to resume",
+        }
+        zf.writestr(
+            "recovery-manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+    if written == 0:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ValueError("no recovery files found under keys/ (accounts.txt / sessions / …)")
+    tmp.replace(latest)
+    # best-effort stamped archive
+    try:
+        import shutil
+
+        shutil.copy2(latest, zip_path)
+    except OSError:
+        zip_path = latest
+    return latest
+
+
 def download_spec(fmt: str) -> tuple[Path, str, str]:
     """Return (path, media_type, download_filename) for a finished product format."""
     fmt = (fmt or "").strip().lower()
+    # recovery / runtime sources (no bundle rebuild)
+    if fmt in {
+        "recovery",
+        "recovery_zip",
+        "backup",
+        "backup_zip",
+        "account_recovery",
+        "resume",
+        "resume_zip",
+    }:
+        p = pack_recovery_zip()
+        return p, "application/zip", "account-recovery.zip"
+    rec = _recovery_alias_map().get(fmt)
+    if rec is not None:
+        p = key_export_dir() / rec["name"]
+        if not p.is_file():
+            raise ValueError(f"missing {rec['name']} under {key_export_dir()}")
+        return p, rec["media"], rec["name"]
+
     paths = ensure_bundles(rebuild=False)
     if fmt in {"sub2api", "sub2api_json", "sub"}:
         p = Path(paths["sub2api_json"])
@@ -405,6 +554,7 @@ def download_spec(fmt: str) -> tuple[Path, str, str]:
         tmp.replace(zip_path)
         return zip_path, "application/zip", "xai-singles.zip"
     if fmt in {"legacy", "accounts", "txt"}:
+        # kept for back-compat; same as accounts_txt recovery file
         p = key_export_dir() / "accounts.txt"
         return p, "text/plain; charset=utf-8", "accounts.txt"
     raise ValueError(f"unknown format: {fmt}")

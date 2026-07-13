@@ -323,7 +323,14 @@ def build_accounts_payload(*, limit: int = 500, status: str = "", fmt: str = "")
             "legacy": "/api/download?format=legacy",
             "sub2api": "/api/download?format=sub2api",
             "cpa_zip": "/api/download?format=cpa_zip",
+            "recovery_zip": "/api/download?format=recovery",
+            "accounts_txt": "/api/download?format=accounts_txt",
+            "auth_sessions": "/api/download?format=auth_sessions",
+            "browser_fingerprints": "/api/download?format=browser_fingerprints",
+            "grok_txt": "/api/download?format=grok_txt",
+            "protocol_log": "/api/download?format=protocol_log",
         },
+        "recovery_files": inv.list_recovery_files(),
     }
 
 
@@ -435,7 +442,14 @@ def build_overview() -> dict:
             "sub2api": "/api/download?format=sub2api",
             "cpa_zip": "/api/download?format=cpa_zip",
             "legacy": "/api/download?format=legacy",
+            "recovery_zip": "/api/download?format=recovery",
+            "accounts_txt": "/api/download?format=accounts_txt",
+            "auth_sessions": "/api/download?format=auth_sessions",
+            "browser_fingerprints": "/api/download?format=browser_fingerprints",
+            "grok_txt": "/api/download?format=grok_txt",
+            "protocol_log": "/api/download?format=protocol_log",
         },
+        "recovery_files": inv.list_recovery_files(),
         "xai_probe": {
             "last": _last_probe if _last_probe.get("at") else None,
         },
@@ -998,6 +1012,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <h3 data-i18n="card_products">成品下载</h3>
         <div id="products-body" class="note" data-i18n="products_hint">扫描 keys/ 中的 legacy / sub2api / cpa 成品</div>
         <div class="dl-row" id="product-downloads"></div>
+        <div style="margin-top:14px">
+          <div class="group-title" data-i18n="card_recovery">账号恢复包</div>
+          <div class="note" data-i18n="recovery_hint">导出 accounts.txt / auth-sessions / 指纹 / grok.txt / protocol.log，换机或重建 Space 后解压到 keys/ 即可续跑。</div>
+          <div class="dl-row" id="recovery-downloads" style="margin-top:8px"></div>
+          <div class="note" id="recovery-meta" style="margin-top:6px"></div>
+        </div>
         <div class="actions" style="margin-top:12px">
           <button class="act primary" id="btn-rebuild-bundles" data-i18n="btn_rebuild">重建合并包</button>
         </div>
@@ -1022,6 +1042,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <a class="dl" href="/api/download?format=sub2api">↓ sub2api</a>
           <a class="dl" href="/api/download?format=cpa_zip">↓ xai-singles.zip</a>
           <a class="dl" href="/api/download?format=legacy">↓ legacy</a>
+          <a class="dl" href="/api/download?format=recovery" data-i18n="dl_recovery_zip">↓ 恢复包.zip</a>
         </div>
       </div>
       <div class="actions" style="margin-top:10px">
@@ -1151,6 +1172,10 @@ const I18N = {
     card_raw: "原始状态",
     products_hint: "扫描 keys/ 中的 legacy / sub2api / cpa 成品",
     products_dir: "导出目录：{dir} · 可直接导入 sub2api / CPA 面板",
+    card_recovery: "账号恢复包",
+    recovery_hint: "导出 accounts.txt / auth-sessions / 指纹 / grok.txt / protocol.log，换机或重建 Space 后解压到 keys/ 即可续跑。",
+    recovery_meta: "恢复源文件：存在 {ok}/{n} · 合计 {size}",
+    dl_recovery_zip: "↓ 恢复包.zip",
     btn_rebuild: "重建合并包",
     btn_refresh: "刷新",
     btn_save: "保存修改",
@@ -1312,6 +1337,10 @@ const I18N = {
     card_raw: "Raw status",
     products_hint: "Scan finished products in keys/ (legacy / sub2api / cpa)",
     products_dir: "Export dir: {dir} · import into sub2api / CPA panels",
+    card_recovery: "Account recovery pack",
+    recovery_hint: "Export accounts.txt / auth-sessions / fingerprints / grok.txt / protocol.log. Unpack into keys/ to resume after rebuild.",
+    recovery_meta: "Recovery sources: {ok}/{n} present · {size} total",
+    dl_recovery_zip: "↓ recovery.zip",
     btn_rebuild: "Rebuild bundles",
     btn_refresh: "Refresh",
     btn_save: "Save changes",
@@ -1642,6 +1671,27 @@ async function refreshStatus(fromCache){
     <a class="dl" href="${prods.cpa_zip||"/api/download?format=cpa_zip"}">↓ xai-singles.zip</a>
     <a class="dl" href="${prods.legacy||"/api/download?format=legacy"}">↓ accounts.txt</a>
     <span class="note" style="margin-left:8px">CPA 仅 keys/cpa/xai-*.json 单文件</span>`;
+  const recFiles = data.recovery_files || [];
+  const recRoot = $("recovery-downloads");
+  if(recRoot){
+    const zipHref = prods.recovery_zip || "/api/download?format=recovery";
+    let html = `<a class="dl" href="${zipHref}" style="border-color:rgba(61,220,151,.45)">${t("dl_recovery_zip")}</a>`;
+    recFiles.forEach(f=>{
+      if(!f || !f.name) return;
+      const href = f.download || (`/api/download?format=${f.id||f.name}`);
+      const mark = f.exists ? "" : " (missing)";
+      const dim = f.exists ? "" : "opacity:.45;pointer-events:none";
+      html += `<a class="dl" href="${href}" style="${dim}" title="${f.desc||""}">↓ ${f.name}${mark}</a>`;
+    });
+    recRoot.innerHTML = html;
+  }
+  const recMeta = $("recovery-meta");
+  if(recMeta){
+    const ok = recFiles.filter(f=>f && f.exists).length;
+    const bytes = recFiles.reduce((s,f)=>s+((f&&f.exists)?(f.size||0):0),0);
+    const size = bytes>=1048576 ? (bytes/1048576).toFixed(1)+" MB" : (bytes>=1024 ? (bytes/1024).toFixed(1)+" KB" : bytes+" B");
+    recMeta.textContent = t("recovery_meta",{ok, n: recFiles.length||5, size});
+  }
   $("products-body").textContent = t("products_dir",{dir: acc.export_dir||"keys"});
   // engine select default from server
   const engSel=$("reg-engine");
