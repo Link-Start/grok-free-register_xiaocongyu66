@@ -205,5 +205,124 @@ def _escape_env(value: str) -> str:
     return value
 
 
-# re-export pattern for line matching
-_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+def read_env_raw() -> dict[str, Any]:
+    """Full .env text for web export (no secret masking)."""
+    path = env_path()
+    text = ""
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return {"ok": False, "error": str(exc), "path": str(path)}
+    return {
+        "ok": True,
+        "path": str(path),
+        "text": text,
+        "keys": parse_env_file(path),
+        "size": len(text.encode("utf-8")),
+    }
+
+
+def write_env_raw(text: str, *, merge: bool = False) -> dict[str, Any]:
+    """Replace or merge .env from raw KEY=VALUE text (web import)."""
+    path = env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    incoming: dict[str, str] = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _LINE_RE.match(line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2)
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in {"'", '"'}:
+            val = val[1:-1]
+        incoming[key] = val
+    if merge:
+        return update_env_values(incoming, allow_unknown=True)
+    previous = parse_env_file(path) if path.is_file() else {}
+    # full replace while preserving a header comment
+    lines = [
+        "# managed by grok-free-register control plane",
+        "# updated via web panel",
+    ]
+    for key in sorted(incoming.keys()):
+        lines.append(f"{key}={_escape_env(incoming[key])}")
+    body = "\n".join(lines) + "\n"
+    fd, tmp = tempfile.mkstemp(prefix=".env.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+        Path(tmp).replace(path)
+    finally:
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except Exception:
+            pass
+    # drop keys that disappeared so process env matches file
+    for key in previous:
+        if key not in incoming:
+            os.environ.pop(key, None)
+    for key, value in incoming.items():
+        os.environ[key] = value
+    return {
+        "ok": True,
+        "path": str(path),
+        "changed": sorted(incoming.keys()),
+        "removed": sorted(k for k in previous if k not in incoming),
+        "mode": "replace",
+        "needs_restart": True,
+    }
+
+
+def delete_env_keys(keys: list[str]) -> dict[str, Any]:
+    """Remove keys from .env file and process env."""
+    path = env_path()
+    if not path.is_file():
+        return {"ok": True, "removed": [], "path": str(path)}
+    want = {str(k).strip() for k in keys if str(k).strip()}
+    if not want:
+        return {"ok": False, "error": "no keys", "removed": []}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    out: list[str] = []
+    removed: list[str] = []
+    for line in lines:
+        m = _LINE_RE.match(line.strip()) if line.strip() and not line.strip().startswith("#") else None
+        if m and m.group(1) in want:
+            removed.append(m.group(1))
+            continue
+        out.append(line)
+    text = "\n".join(out) + ("\n" if out else "")
+    fd, tmp = tempfile.mkstemp(prefix=".env.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        Path(tmp).replace(path)
+    finally:
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except Exception:
+            pass
+    for k in removed:
+        os.environ.pop(k, None)
+    return {"ok": True, "removed": removed, "path": str(path), "needs_restart": True}
+
+
+def apply_preset(preset_id: str) -> dict[str, Any]:
+    """Apply a named preset of env updates (does not wipe unrelated keys)."""
+    from grok_register.config_catalog import CONFIG_PRESETS
+
+    preset = CONFIG_PRESETS.get(preset_id)
+    if not preset:
+        return {"ok": False, "error": f"unknown preset: {preset_id}", "presets": list(CONFIG_PRESETS)}
+    updates = dict(preset.get("env") or {})
+    result = update_env_values(updates, allow_unknown=True)
+    result["preset"] = preset_id
+    result["label"] = preset.get("label") or preset_id
+    result["message"] = (
+        f"preset {preset.get('label') or preset_id}: "
+        f"updated {len(result.get('changed') or [])} keys"
+        + ("; restart register to apply" if result.get("needs_restart") else "")
+    )
+    return result

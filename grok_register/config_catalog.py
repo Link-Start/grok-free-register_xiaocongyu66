@@ -515,6 +515,27 @@ CATALOG: list[dict[str, Any]] = [
         "simple": False,
     },
     {
+        "key": "CAPSOLVER_API_KEY",
+        "group": "turnstile",
+        "type": "secret",
+        "default": "",
+        "label": "CapSolver API Key",
+        "desc": "第三方打码；有 key 时协议注册可优先走 CapSolver，减轻本机浏览器压力",
+        "restart": True,
+        "simple": True,
+        "placeholder": "CAP-…",
+    },
+    {
+        "key": "TWOCAPTCHA_API_KEY",
+        "group": "turnstile",
+        "type": "secret",
+        "default": "",
+        "label": "2Captcha API Key",
+        "desc": "备选打码平台；与 CapSolver 二选一或作回退",
+        "restart": True,
+        "simple": True,
+    },
+    {
         "key": "TURNSTILE_SOLVER_DEBUG",
         "group": "turnstile",
         "type": "bool",
@@ -1201,15 +1222,118 @@ SIMPLE_KEYS = [
     "REGISTER_LOG_MODE",
     "REGISTRATION_RATE_LIMIT_COOLDOWN",
     "CONTROL_PLANE_ALLOW_ACTIONS",
+    "DASHBOARD_USER",
+    "DASHBOARD_PASSWORD",
+    "CONTROL_PLANE_TOKEN",
     "DASHBOARD_LANG",
+    "CAPSOLVER_API_KEY",
+    "TWOCAPTCHA_API_KEY",
 ]
 
 SECRET_KEYS = {e["key"] for e in CATALOG if e.get("type") == "secret"}
 CATALOG_BY_KEY = {e["key"]: e for e in CATALOG}
 
+# One-click env presets for environments without shell access (HF Space / Docker)
+CONFIG_PRESETS: dict[str, dict[str, Any]] = {
+    "hf_protocol": {
+        "label": "HF / Docker · 协议注册",
+        "desc": "协议引擎 + hybrid Turnstile 按需 + 4 并发（适合 2c/16G）",
+        "env": {
+            "REGISTER_ENGINE": "protocol",
+            "TURNSTILE_SOLVER": "hybrid",
+            "TURNSTILE_SOLVER_ON_DEMAND": "1",
+            "TURNSTILE_SOLVER_HEADLESS": "1",
+            "TURNSTILE_SOLVER_THREADS": "2",
+            "TURNSTILE_API_URL": "http://127.0.0.1:5080",
+            "GO_REGISTER_WORKERS": "4",
+            "CONTROL_PLANE_ALLOW_ACTIONS": "1",
+            "KEY_EXPORT_DIR": "/data/keys",
+        },
+    },
+    "hf_capsolver": {
+        "label": "HF · 协议 + CapSolver",
+        "desc": "有 CAPSOLVER_API_KEY 时优先打码 API，减轻浏览器压力",
+        "env": {
+            "REGISTER_ENGINE": "protocol",
+            "TURNSTILE_SOLVER": "hybrid",
+            "TURNSTILE_SOLVER_ON_DEMAND": "1",
+            "GO_REGISTER_WORKERS": "6",
+            "TURNSTILE_SOLVER_THREADS": "2",
+            "CONTROL_PLANE_ALLOW_ACTIONS": "1",
+        },
+    },
+    "local_fast": {
+        "label": "本机高速协议",
+        "desc": "8 协议 worker + 4 Turnstile 浏览器线程",
+        "env": {
+            "REGISTER_ENGINE": "protocol",
+            "TURNSTILE_SOLVER": "hybrid",
+            "TURNSTILE_SOLVER_ON_DEMAND": "1",
+            "GO_REGISTER_WORKERS": "8",
+            "TURNSTILE_SOLVER_THREADS": "4",
+            "CONTROL_PLANE_ALLOW_ACTIONS": "1",
+        },
+    },
+    "browser_python": {
+        "label": "浏览器注册路径",
+        "desc": "REGISTER_ENGINE=python（Playwright 全流程）",
+        "env": {
+            "REGISTER_ENGINE": "python",
+            "TURNSTILE_SOLVER": "local",
+            "CONTROL_PLANE_ALLOW_ACTIONS": "1",
+        },
+    },
+    "safe_readonly": {
+        "label": "只读面板",
+        "desc": "禁止面板启停操作（仅查看）",
+        "env": {
+            "CONTROL_PLANE_ALLOW_ACTIONS": "0",
+        },
+    },
+    "moemail_setup": {
+        "label": "MoeMail 邮箱",
+        "desc": "切到 MoeMail OpenAPI（仍需自行填 MOEMAIL_API_KEY）",
+        "env": {
+            "EMAIL_MODE": "moemail",
+            "MOEMAIL_API": "https://moemail.app",
+            "CONTROL_PLANE_ALLOW_ACTIONS": "1",
+        },
+    },
+    "tempmail_free": {
+        "label": "免费临时邮箱",
+        "desc": "EMAIL_MODE=tempmail，零配置收码",
+        "env": {
+            "EMAIL_MODE": "tempmail",
+            "CONTROL_PLANE_ALLOW_ACTIONS": "1",
+        },
+    },
+    "export_all_formats": {
+        "label": "全格式导出",
+        "desc": "legacy + sub2api + cpa 同时写出",
+        "env": {
+            "KEY_EXPORT_FORMATS": "legacy,sub2api,cpa",
+            "KEY_EXPORT_ENROLLER": "1",
+        },
+    },
+}
+
 
 def catalog_public() -> list[dict[str, Any]]:
     return list(CATALOG)
+
+
+def presets_public() -> list[dict[str, Any]]:
+    out = []
+    for pid, meta in CONFIG_PRESETS.items():
+        out.append(
+            {
+                "id": pid,
+                "label": meta.get("label") or pid,
+                "desc": meta.get("desc") or "",
+                "keys": list((meta.get("env") or {}).keys()),
+            }
+        )
+    return out
 
 
 def mask_secret(value: str) -> str:

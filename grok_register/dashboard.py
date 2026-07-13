@@ -42,8 +42,15 @@ from grok_register.runtime_status import (
     read_status,
     status_path,
 )
-from grok_register.config_catalog import GROUPS, catalog_public
-from grok_register.env_store import load_config_view, update_env_values
+from grok_register.config_catalog import GROUPS, catalog_public, presets_public
+from grok_register.env_store import (
+    apply_preset,
+    delete_env_keys,
+    load_config_view,
+    read_env_raw,
+    update_env_values,
+    write_env_raw,
+)
 from grok_register import account_inventory as inv
 from grok_register import account_convert as acct_convert
 from grok_register import proxy_batch_test as proxy_batch
@@ -95,6 +102,51 @@ _LAST_PROBE_PATH = PROJECT_ROOT / "logs" / "dashboard-last-probe.json"
 def auth_required() -> bool:
     """True when password or token is configured."""
     return bool(DASHBOARD_PASSWORD or CONTROL_PLANE_TOKEN)
+
+
+def _test_moemail() -> dict:
+    """Probe MoeMail config endpoint with current env (no file access needed)."""
+    import urllib.error
+    import urllib.request
+
+    api = (os.environ.get("MOEMAIL_API") or "https://moemail.app").strip().rstrip("/")
+    key = (os.environ.get("MOEMAIL_API_KEY") or "").strip()
+    if not key:
+        return {"ok": False, "message": "MOEMAIL_API_KEY empty", "api": api}
+    req = urllib.request.Request(
+        api + "/api/config",
+        headers={"X-API-Key": key, "Accept": "application/json", "User-Agent": "grok-register-panel"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()[:800]
+            return {
+                "ok": resp.status < 400,
+                "status": resp.status,
+                "api": api,
+                "body": body.decode("utf-8", errors="replace"),
+            }
+    except urllib.error.HTTPError as exc:
+        try:
+            b = exc.read()[:400].decode("utf-8", errors="replace")
+        except Exception:
+            b = ""
+        return {"ok": False, "status": exc.code, "api": api, "body": b, "message": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "api": api, "message": str(exc)}
+
+
+def _test_turnstile_api() -> dict:
+    """Health-check configured Turnstile solver URL."""
+    url = (os.environ.get("TURNSTILE_API_URL") or "http://127.0.0.1:5080").rstrip("/")
+    try:
+        from grok_register.turnstile_solver import health_check
+
+        ok = health_check(url, timeout=2.5)
+        return {"ok": ok, "url": url, "message": "healthy" if ok else "unreachable"}
+    except Exception as exc:
+        return {"ok": False, "url": url, "message": str(exc)}
 
 
 def _const_eq(a: str, b: str) -> bool:
@@ -321,6 +373,8 @@ def build_overview() -> dict:
         "config": _env_public(),
         "config_full": load_config_view(reveal_secrets=False),
         "config_groups": [{"id": g, "label": lab} for g, lab in GROUPS],
+        "config_presets": presets_public(),
+        "auth_required": auth_required(),
         "actions_enabled": ALLOW_ACTIONS,
         "last_action": _last_action,
         "engines": {
@@ -796,6 +850,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .cfg-mode{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden}
   .cfg-mode button{border:0;background:#152038;color:var(--muted);padding:7px 14px;cursor:pointer;font-weight:600}
   .cfg-mode button.active{background:#27407a;color:var(--text)}
+  .cfg-presets{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin:8px 0 14px}
+  .cfg-preset{border:1px solid var(--border);border-radius:12px;padding:12px;background:rgba(10,16,28,.45)}
   .cfg-label{font-weight:600;font-size:13px}
   .cfg-key{font-size:11px;color:var(--muted);margin-top:2px}
   .cfg-card{border:1px solid rgba(36,51,82,.55);border-radius:12px;padding:12px;margin:8px 0;background:rgba(10,16,28,.35)}
@@ -984,12 +1040,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
         <h3 style="margin:0" data-i18n="card_config">配置</h3>
-        <div class="actions" style="margin:0">
+        <div class="actions" style="margin:0;flex-wrap:wrap">
           <button class="act primary" id="btn-save-config" data-i18n="btn_save">保存修改</button>
+          <button class="act primary" id="btn-save-restart" data-i18n="btn_save_restart">保存并重启注册</button>
           <button class="act" id="btn-reload-config" data-i18n="btn_reload">重新加载</button>
+          <button class="act" id="btn-export-env" data-i18n="btn_export_env">导出 .env</button>
+          <button class="act" id="btn-import-env" data-i18n="btn_import_env">导入 .env</button>
         </div>
       </div>
-      <div class="note" id="config-note" data-i18n="config_hint">默认显示常用项。改完点保存；多数项需重启注册进程才生效。密钥显示为掩码，留空表示不改。</div>
+      <div class="note" id="config-note" data-i18n="config_hint">无法 SSH 时在此改全部后台项。保存写 .env；「保存并重启」会停旧进程再拉起。密钥掩码，留空不改。</div>
       <div class="cfg-toolbar">
         <div class="cfg-mode">
           <button type="button" id="cfg-mode-simple" class="active" data-mode="simple" data-i18n="cfg_mode_simple">常用配置</button>
@@ -997,7 +1056,37 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <input type="search" id="cfg-search" data-i18n-placeholder="cfg_search_ph" placeholder="搜索：邮箱、代理、导出…" />
       </div>
+      <div class="cfg-presets-wrap">
+        <div class="group-title" data-i18n="cfg_presets">一键预设</div>
+        <div class="note" data-i18n="cfg_presets_hint">按场景批量写入常用键，不会清空其它配置。可「应用」或「应用并重启注册」。</div>
+        <div id="cfg-presets" class="cfg-presets"></div>
+      </div>
+      <div class="cfg-custom card" style="margin:12px 0;padding:12px">
+        <div class="group-title" data-i18n="cfg_custom">自定义环境变量</div>
+        <div class="row-fields" style="grid-template-columns:1fr 1.4fr auto auto;gap:8px">
+          <input type="text" id="cfg-custom-key" placeholder="KEY_NAME" spellcheck="false" />
+          <input type="text" id="cfg-custom-val" placeholder="value" spellcheck="false" />
+          <button class="act primary" id="btn-cfg-custom-add" data-i18n="btn_cfg_add">添加/更新</button>
+          <button class="act danger" id="btn-cfg-custom-del" data-i18n="btn_cfg_del">删除键</button>
+        </div>
+        <div class="note" data-i18n="cfg_custom_hint">目录外的键也可写。删除会从 .env 移除该键（进程环境同步 pop）。</div>
+      </div>
+      <div class="cfg-test card" style="margin:12px 0;padding:12px">
+        <div class="group-title" data-i18n="cfg_test">连通性快速测试</div>
+        <div class="actions" style="margin:0">
+          <button class="act" id="btn-test-moemail" data-i18n="btn_test_moemail">测 MoeMail</button>
+          <button class="act" id="btn-test-xai" data-i18n="btn_test_xai_cfg">测 x.ai</button>
+          <button class="act" id="btn-test-turnstile" data-i18n="btn_test_turnstile">测 Turnstile API</button>
+        </div>
+        <pre id="cfg-test-out" class="note" style="margin-top:8px;white-space:pre-wrap;max-height:160px;overflow:auto"></pre>
+      </div>
       <div id="config-editor"></div>
+      <textarea id="cfg-import-box" class="hidden" rows="12" style="width:100%;margin-top:10px;background:#0d1524;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:ui-monospace,monospace" placeholder="# paste .env here"></textarea>
+      <div class="actions hidden" id="cfg-import-actions" style="margin-top:8px">
+        <button class="act primary" id="btn-import-merge" data-i18n="btn_import_merge">合并导入</button>
+        <button class="act danger" id="btn-import-replace" data-i18n="btn_import_replace">整文件替换</button>
+        <button class="act" id="btn-import-cancel" data-i18n="btn_import_cancel">取消</button>
+      </div>
     </div>
   </section>
   <section id="tab-raw" class="hidden">
@@ -1084,7 +1173,29 @@ const I18N = {
     th_updated: "更新时间",
     loading: "加载中…",
     no_accounts: "暂无账号",
-    config_hint: "默认显示常用项。改完点保存；多数项需重启注册进程才生效。密钥显示为掩码，留空表示不改。",
+    config_hint: "无法 SSH 时在此改全部后台项。保存写 .env；「保存并重启」无改动也会重启注册。密钥掩码，留空不改。",
+    btn_save_restart: "保存并重启注册",
+    btn_export_env: "导出 .env",
+    btn_import_env: "导入 .env",
+    btn_import_merge: "合并导入",
+    btn_import_replace: "整文件替换",
+    btn_import_cancel: "取消",
+    btn_cfg_add: "添加/更新",
+    btn_cfg_del: "删除键",
+    cfg_presets: "一键预设",
+    cfg_presets_hint: "按场景批量写入常用键，不会清空其它配置。可「应用」或「应用并重启注册」。",
+    cfg_custom: "自定义环境变量",
+    cfg_custom_hint: "目录外的键也可写。删除会从 .env 移除该键。",
+    cfg_test: "连通性快速测试",
+    btn_test_moemail: "测 MoeMail",
+    btn_test_xai_cfg: "测 x.ai",
+    btn_test_turnstile: "测 Turnstile API",
+    cfg_apply_preset: "应用",
+    cfg_apply_preset_restart: "应用并重启",
+    cfg_export_ok: "已下载 .env 备份",
+    cfg_import_need: "请先粘贴 .env 内容",
+    cfg_custom_need: "请填写合法 KEY（字母/数字/下划线）",
+    cfg_delete_confirm: "确定从 .env 删除键 {key}？",
     actions_disabled: "操作已禁用。请在配置里打开「允许面板操作」，或设置 CONTROL_PLANE_ALLOW_ACTIONS=1",
     last_action: "上次：{action} → {message}",
     kpi_success: "成功数",
@@ -1223,7 +1334,29 @@ const I18N = {
     th_updated: "Updated",
     loading: "loading…",
     no_accounts: "No accounts",
-    config_hint: "Simple mode by default. Save to write .env; most keys need register restart. Secrets masked; leave blank to keep.",
+    config_hint: "Edit all backend settings without SSH. Save writes .env; Save+Restart relaunches even with no dirty fields. Secrets masked; leave blank to keep.",
+    btn_save_restart: "Save + restart register",
+    btn_export_env: "Export .env",
+    btn_import_env: "Import .env",
+    btn_import_merge: "Merge import",
+    btn_import_replace: "Replace file",
+    btn_import_cancel: "Cancel",
+    btn_cfg_add: "Add / update",
+    btn_cfg_del: "Delete key",
+    cfg_presets: "Presets",
+    cfg_presets_hint: "Apply common key sets without wiping other keys. Use Apply or Apply+Restart.",
+    cfg_custom: "Custom env var",
+    cfg_custom_hint: "Keys outside the catalog. Delete removes from .env.",
+    cfg_test: "Connectivity tests",
+    btn_test_moemail: "Test MoeMail",
+    btn_test_xai_cfg: "Test x.ai",
+    btn_test_turnstile: "Test Turnstile API",
+    cfg_apply_preset: "Apply",
+    cfg_apply_preset_restart: "Apply + restart",
+    cfg_export_ok: "Downloaded .env backup",
+    cfg_import_need: "Paste .env content first",
+    cfg_custom_need: "Enter a valid KEY (letters/digits/_)",
+    cfg_delete_confirm: "Delete key {key} from .env?",
     actions_disabled: "Actions disabled. Enable “Allow panel actions” or set CONTROL_PLANE_ALLOW_ACTIONS=1",
     last_action: "last: {action} → {message}",
     kpi_success: "Success",
@@ -1826,15 +1959,144 @@ function updateConfigNote(){
 async function loadConfig(){
   const view=await api("/api/config");
   renderConfig(view);
+  renderPresets();
 }
-$("btn-reload-config").onclick=()=>{state.dirty={}; loadConfig()};
-$("btn-save-config").onclick=async()=>{
-  if(!Object.keys(state.dirty).length){ $("config-note").textContent=t("cfg_no_changes"); return; }
-  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_config",updates:state.dirty})});
+function renderPresets(){
+  const root=$("cfg-presets"); if(!root) return;
+  const list = state.status?.config_presets || state.config?.presets || [];
+  root.innerHTML="";
+  if(!list.length){ root.innerHTML=`<span class="note">—</span>`; return; }
+  list.forEach(p=>{
+    const card=document.createElement("div");
+    card.className="cfg-preset";
+    card.innerHTML=`<div style="font-weight:700">${p.label||p.id}</div>
+      <div class="note" style="margin:4px 0 8px">${p.desc||""}</div>
+      <div class="note" style="font-size:11px">${(p.keys||[]).slice(0,8).join(", ")}${(p.keys||[]).length>8?"…":""}</div>`;
+    const row=document.createElement("div");
+    row.className="actions"; row.style.marginTop="8px";
+    const b=document.createElement("button");
+    b.className="act"; b.textContent=t("cfg_apply_preset");
+    const br=document.createElement("button");
+    br.className="act primary"; br.textContent=t("cfg_apply_preset_restart");
+    const apply=async(restart)=>{
+      b.disabled=true; br.disabled=true;
+      try{
+        const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action: restart?"apply_preset_restart":"apply_preset",preset:p.id})});
+        $("config-note").textContent=r.message||JSON.stringify(r);
+        state.dirty={};
+        await loadConfig();
+        await refreshStatus();
+      }finally{ b.disabled=false; br.disabled=false; }
+    };
+    b.onclick=()=>apply(false);
+    br.onclick=()=>apply(true);
+    row.append(b, br);
+    card.appendChild(row);
+    root.appendChild(card);
+  });
+}
+async function saveConfigUpdates(updates, {restart=false}={}){
+  updates = updates || {};
+  if(!restart && !Object.keys(updates).length){
+    $("config-note").textContent=t("cfg_no_changes");
+    return null;
+  }
+  // restart with empty updates still relaunches register (after preset / import)
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action: restart?"save_config_restart":"save_config", updates})});
   $("config-note").textContent=r.message||JSON.stringify(r);
   state.dirty={};
   await loadConfig();
   await refreshStatus();
+  return r;
+}
+$("btn-reload-config").onclick=()=>{state.dirty={}; loadConfig()};
+$("btn-save-config").onclick=()=>saveConfigUpdates(state.dirty, {restart:false});
+$("btn-save-restart").onclick=()=>saveConfigUpdates(state.dirty, {restart:true});
+$("btn-export-env").onclick=async()=>{
+  const r=await api("/api/config/export");
+  if(!r.ok){ $("config-note").textContent=r.error||JSON.stringify(r); return; }
+  const blob=new Blob([r.text||""],{type:"text/plain;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="grok-register.env";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  $("config-note").textContent=t("cfg_export_ok")+" · "+(r.path||"");
+};
+$("btn-import-env").onclick=()=>{
+  $("cfg-import-box").classList.remove("hidden");
+  $("cfg-import-actions").classList.remove("hidden");
+  $("cfg-import-box").focus();
+};
+$("btn-import-cancel").onclick=()=>{
+  $("cfg-import-box").classList.add("hidden");
+  $("cfg-import-actions").classList.add("hidden");
+};
+async function doImport(replace){
+  const text=$("cfg-import-box").value||"";
+  if(!text.trim()){ $("config-note").textContent=t("cfg_import_need"); return; }
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"import_env", text, replace:!!replace})});
+  $("config-note").textContent=r.message||JSON.stringify(r);
+  $("cfg-import-box").classList.add("hidden");
+  $("cfg-import-actions").classList.add("hidden");
+  await loadConfig();
+  await refreshStatus();
+}
+$("btn-import-merge").onclick=()=>doImport(false);
+$("btn-import-replace").onclick=()=>{
+  if(!confirm(state.lang==="zh"?"将用粘贴内容整文件替换 .env，确定？":"Replace entire .env with paste?")) return;
+  doImport(true);
+};
+$("btn-cfg-custom-add").onclick=async()=>{
+  const key=($("cfg-custom-key").value||"").trim();
+  const val=$("cfg-custom-val").value??"";
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)){
+    $("config-note").textContent=t("cfg_custom_need");
+    return;
+  }
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"save_config",updates:{[key]:val}})});
+  $("config-note").textContent=r.message||JSON.stringify(r);
+  $("cfg-custom-key").value="";
+  $("cfg-custom-val").value="";
+  await loadConfig();
+  await refreshStatus();
+};
+$("btn-cfg-custom-del").onclick=async()=>{
+  const key=($("cfg-custom-key").value||"").trim();
+  if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)){
+    $("config-note").textContent=t("cfg_custom_need");
+    return;
+  }
+  if(!confirm(t("cfg_delete_confirm",{key}))) return;
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"delete_env_keys",keys:[key]})});
+  $("config-note").textContent=r.message||JSON.stringify(r);
+  $("cfg-custom-key").value="";
+  $("cfg-custom-val").value="";
+  await loadConfig();
+  await refreshStatus();
+};
+function setTestOut(msg){ const el=$("cfg-test-out"); if(el) el.textContent=msg; }
+$("btn-test-moemail").onclick=async()=>{
+  setTestOut("…");
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"test_moemail"})});
+  setTestOut(JSON.stringify(r,null,2));
+};
+$("btn-test-xai").onclick=async()=>{
+  setTestOut("…");
+  const r=await runXaiProbe(false);
+  setTestOut(typeof r==="string"?r:JSON.stringify(r,null,2));
+};
+$("btn-test-turnstile").onclick=async()=>{
+  setTestOut("…");
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"test_turnstile"})});
+  setTestOut(JSON.stringify(r,null,2));
 };
 $("cfg-mode-simple").onclick=()=>setCfgMode("simple");
 $("cfg-mode-all").onclick=()=>setCfgMode("all");
@@ -2138,7 +2400,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # secrets reveal only when actions enabled
             if reveal and not ALLOW_ACTIONS:
                 reveal = False
-            self._json(200, {"ok": True, **load_config_view(reveal_secrets=reveal), "catalog": catalog_public()})
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    **load_config_view(reveal_secrets=reveal),
+                    "catalog": catalog_public(),
+                    "presets": presets_public(),
+                },
+            )
+            return
+        if path == "/api/config/export":
+            # full .env text for backup (auth already required)
+            self._json(200, read_env_raw())
+            return
+        if path == "/api/config/presets":
+            self._json(200, {"ok": True, "presets": presets_public()})
             return
         self._json(404, {"ok": False, "error": "not found"})
 
@@ -2414,6 +2691,91 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     f"updated {len(result.get('changed') or [])} keys"
                     + ("; restart register to apply" if result.get("needs_restart") else "")
                 )
+            elif action in {"save_config_restart", "apply_and_restart"}:
+                updates = (data or {}).get("updates") or {}
+                save = update_env_values(updates, allow_unknown=True)
+                # restart register with current REGISTER_ENGINE / TARGET
+                engine = (
+                    str((data or {}).get("engine") or os.environ.get("REGISTER_ENGINE") or "protocol")
+                    .strip()
+                    .lower()
+                )
+                target = (data or {}).get("target")
+                if target in (None, ""):
+                    target = os.environ.get("TARGET") or ""
+                stop = _stop_register()
+                args: list[str] = []
+                if target not in (None, ""):
+                    args = ["--target", str(target)]
+                if engine == "go":
+                    start = _spawn_go_register({"target": target} if target not in (None, "") else {})
+                else:
+                    start = _spawn_register(args, engine=engine)
+                result = {
+                    "ok": bool(save.get("ok")) and bool(start.get("ok")),
+                    "save": save,
+                    "stop": stop,
+                    "start": start,
+                    "message": (
+                        f"config: {len(save.get('changed') or [])} keys · "
+                        f"restart: {start.get('message') or stop.get('message')}"
+                    ),
+                }
+            elif action == "apply_preset":
+                pid = str((data or {}).get("preset") or (data or {}).get("id") or "").strip()
+                result = apply_preset(pid)
+            elif action == "apply_preset_restart":
+                pid = str((data or {}).get("preset") or (data or {}).get("id") or "").strip()
+                save = apply_preset(pid)
+                engine = (
+                    str((data or {}).get("engine") or os.environ.get("REGISTER_ENGINE") or "protocol")
+                    .strip()
+                    .lower()
+                )
+                target = (data or {}).get("target")
+                if target in (None, ""):
+                    target = os.environ.get("TARGET") or ""
+                stop = _stop_register()
+                args: list[str] = []
+                if target not in (None, ""):
+                    args = ["--target", str(target)]
+                if engine == "go":
+                    start = _spawn_go_register({"target": target} if target not in (None, "") else {})
+                else:
+                    start = _spawn_register(args, engine=engine)
+                result = {
+                    "ok": bool(save.get("ok")) and bool(start.get("ok")),
+                    "save": save,
+                    "stop": stop,
+                    "start": start,
+                    "message": (
+                        f"{save.get('message') or save.get('label') or pid} · "
+                        f"restart: {start.get('message') or stop.get('message')}"
+                    ),
+                }
+            elif action == "import_env":
+                text = str((data or {}).get("text") or "")
+                replace = bool((data or {}).get("replace"))
+                result = write_env_raw(text, merge=not replace)
+                result["message"] = (
+                    f"import {'replace' if replace else 'merge'}: "
+                    f"{len(result.get('changed') or [])} keys"
+                    + (
+                        f", removed {len(result.get('removed') or [])}"
+                        if result.get("removed")
+                        else ""
+                    )
+                )
+            elif action == "delete_env_keys":
+                keys = (data or {}).get("keys") or []
+                if isinstance(keys, str):
+                    keys = [keys]
+                result = delete_env_keys(list(keys))
+                result["message"] = f"removed {len(result.get('removed') or [])} keys"
+            elif action == "test_moemail":
+                result = _test_moemail()
+            elif action == "test_turnstile":
+                result = _test_turnstile_api()
             else:
                 result = {"ok": False, "message": f"unknown action: {action}"}
             _record_last_action(action, result)
