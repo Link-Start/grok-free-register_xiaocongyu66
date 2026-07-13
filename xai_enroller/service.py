@@ -807,7 +807,7 @@ def _print_unexpected_service_failure(error, *, log_mode):
 
 
 def main(argv=None):
-    load_dotenv()
+    load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
     mode = "user"
     try:
         mode = resolve_auth_log_mode(argv)
