@@ -39,6 +39,17 @@ DEFAULT_HEADLESS_UA = (
 _managed_proc: Optional[subprocess.Popen] = None
 _managed_meta: dict = {}
 _atexit_registered = False
+_signal_handlers_registered = False
+
+
+# Hybrid stack process markers (for orphan cleanup when main exits)
+_HYBRID_ORPHAN_NEEDLES = (
+    b"solver-gateway",
+    b"solver-watchdog",
+    b"browser_worker.py",
+    b"native/solver-hybrid",
+    b"api_solver.py",  # d3vin / theyka
+)
 
 
 def _env_int(key: str, default: int) -> int:
@@ -484,49 +495,158 @@ def _register_atexit() -> None:
     _atexit_registered = True
 
 
+def _register_signal_handlers() -> None:
+    """Ensure SIGTERM/SIGINT stop the hybrid stack (not only atexit on clean exit)."""
+    global _signal_handlers_registered
+    if _signal_handlers_registered or sys.platform == "win32":
+        return
+    _signal_handlers_registered = True
+
+    def _handler(signum, frame):  # noqa: ARG001
+        try:
+            stop_managed_solver(timeout=5.0)
+        except Exception:
+            pass
+        # Re-raise default behavior
+        signal.signal(signum, signal.SIG_DFL)
+        try:
+            os.kill(os.getpid(), signum)
+        except Exception:
+            raise SystemExit(128 + int(signum))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
+
+
+def _kill_pid_tree(pid: int, *, sig: int = signal.SIGTERM) -> None:
+    if pid <= 1:
+        return
+    try:
+        if sys.platform != "win32":
+            try:
+                os.killpg(pid, sig)
+                return
+            except Exception:
+                pass
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        pass
+
+
+def _scan_orphan_solver_pids(*, exclude: set[int] | None = None) -> list[int]:
+    """Find leftover hybrid/d3vin solver processes (proot / crash orphans)."""
+    exclude = exclude or set()
+    exclude.add(os.getpid())
+    found: list[int] = []
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid in exclude:
+                continue
+            try:
+                raw = open(f"/proc/{pid}/cmdline", "rb").read()  # noqa: SIM115
+            except OSError:
+                continue
+            if not raw:
+                continue
+            if any(n in raw for n in _HYBRID_ORPHAN_NEEDLES):
+                found.append(pid)
+    except OSError:
+        pass
+    return found
+
+
+def kill_orphan_solvers(*, log=None, exclude: set[int] | None = None) -> int:
+    """Terminate orphan solver processes. Returns number of PIDs signaled."""
+    pids = _scan_orphan_solver_pids(exclude=exclude)
+    if not pids:
+        return 0
+    for pid in pids:
+        _kill_pid_tree(pid, sig=signal.SIGTERM)
+    time.sleep(0.4)
+    survivors = _scan_orphan_solver_pids(exclude=exclude)
+    for pid in survivors:
+        _kill_pid_tree(pid, sig=signal.SIGKILL)
+    if log:
+        try:
+            log(f"[*] 已清理 orphan Turnstile 进程: {pids}")
+        except Exception:
+            pass
+    return len(pids)
+
+
 def stop_managed_solver(timeout: float = 8.0) -> None:
+    """Stop the managed solver process group and any hybrid orphans.
+
+    Called on register exit / atexit / SIGTERM so browsers do not leak.
+    """
     global _managed_proc, _managed_meta
     proc = _managed_proc
     _managed_proc = None
     meta = dict(_managed_meta)
     _managed_meta = {}
-    if proc is None:
-        return
-    if proc.poll() is not None:
-        return
-    try:
-        if sys.platform != "win32":
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                proc.terminate()
-        else:
-            proc.terminate()
-    except Exception:
-        pass
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break
-        time.sleep(0.1)
-    if proc.poll() is None:
+    root_pid = int(meta.get("pid") or 0) or (proc.pid if proc is not None else 0)
+
+    if proc is not None and proc.poll() is None:
         try:
             if sys.platform != "win32":
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGTERM)
                 except Exception:
-                    proc.kill()
+                    proc.terminate()
             else:
-                proc.kill()
+                proc.terminate()
         except Exception:
             pass
-    # best-effort: remove pid file
+        deadline = time.time() + max(1.0, timeout * 0.7)
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.08)
+        if proc.poll() is None:
+            try:
+                if sys.platform != "win32":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+                else:
+                    proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+    # Close log handle if we kept one open
+    log_file = meta.get("log_file")
+    if log_file is not None:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+
+    # pid file
     pid_file = meta.get("pid_file")
     if pid_file:
         try:
             Path(pid_file).unlink(missing_ok=True)
         except Exception:
             pass
+
+    # Always sweep orphans (gateway may have reparented children under proot)
+    exclude = {os.getpid()}
+    if root_pid:
+        exclude.add(root_pid)
+    kill_orphan_solvers(exclude=exclude)
 
 
 def start_managed_solver(
@@ -670,6 +790,7 @@ def start_managed_solver(
         "log_file": log_file,
     }
     _register_atexit()
+    _register_signal_handlers()
     try:
         pid_file.write_text(str(proc.pid), encoding="utf-8")
     except Exception:

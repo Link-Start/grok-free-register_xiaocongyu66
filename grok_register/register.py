@@ -4573,8 +4573,17 @@ async def main():
         log("[*] 协议注册引擎 (HTTP 协议路径，不写 accounts.cpa.json)")
         if TURNSTILE_API_URL:
             os.environ["TURNSTILE_API_URL"] = TURNSTILE_API_URL
-        code = maybe_run_go_register_from_python(SITE_KEY, ACTION_ID, STATE_TREE)
-        return 0 if code is None else int(code)
+        # Always tear down hybrid stack when register exits (success or fail)
+        atexit.register(_stop_managed_turnstile_solver)
+        try:
+            code = maybe_run_go_register_from_python(SITE_KEY, ACTION_ID, STATE_TREE)
+            return 0 if code is None else int(code)
+        finally:
+            try:
+                _stop_managed_turnstile_solver()
+                log("[*] 协议注册结束：已停止 Turnstile solver 进程组")
+            except Exception as exc:
+                debug_log(f"stop solver after protocol: {exc}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
@@ -4699,7 +4708,21 @@ if __name__ == "__main__":
     except ValueError as exc:
         log(f"[!] 配置错误：{sanitize_terminal_error(exc)}")
         exit_code = 2
+    except KeyboardInterrupt:
+        log("[!] 用户中断")
+        exit_code = 130
     finally:
+        # Main stopped → kill hybrid Turnstile stack (gateway + browsers + watchdog)
+        try:
+            _stop_managed_turnstile_solver()
+        except Exception:
+            pass
+        try:
+            from grok_register.turnstile_solver import kill_orphan_solvers
+
+            kill_orphan_solvers()
+        except Exception:
+            pass
         try:
             from grok_register.runtime_status import clear_pid
 

@@ -38,7 +38,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 type Job struct {
 	ID        string `json:"id"`
@@ -119,15 +119,19 @@ type Gateway struct {
 }
 
 type workerProc struct {
-	id       int
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *json.Decoder
-	solves   int
-	mu       sync.Mutex
-	alive    bool
-	lastRSS  uint64
-	recycled int
+	id         int
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     *json.Decoder
+	solves     int
+	fails      int
+	mu         sync.Mutex
+	alive      bool
+	lastRSS    uint64
+	recycled   int
+	busy       atomic.Bool
+	lastUsed   atomic.Int64 // unix nano
+	startedAt  time.Time
 }
 
 func env(key, def string) string {
@@ -386,6 +390,10 @@ func (g *Gateway) startWorker(id int) (*workerProc, error) {
 		cmd.Args = append(cmd.Args, "--prefetch")
 	}
 	cmd.Dir = g.workDir
+	// Own process group so gateway stop kills chromium grandchildren
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	cmd.Env = append(os.Environ(),
 		"PYTHONUNBUFFERED=1",
 		"PYTHONDONTWRITEBYTECODE=1",
@@ -416,12 +424,14 @@ func (g *Gateway) startWorker(id int) (*workerProc, error) {
 		return nil, err
 	}
 	wp := &workerProc{
-		id:     id,
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: json.NewDecoder(stdout),
-		alive:  true,
+		id:        id,
+		cmd:       cmd,
+		stdin:     stdin,
+		stdout:    json.NewDecoder(stdout),
+		alive:     true,
+		startedAt: time.Now(),
 	}
+	wp.lastUsed.Store(time.Now().UnixNano())
 	g.aliveWorkers.Add(1)
 	fmt.Fprintf(os.Stderr, "[gateway] worker %d started pid=%d concurrency=%d\n",
 		id, cmd.Process.Pid, g.concurrency)
@@ -451,6 +461,33 @@ func (g *Gateway) startWorker(id int) (*workerProc, error) {
 	return wp, nil
 }
 
+func killProcessTree(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	// Prefer process group kill so chromium children die with the worker
+	if runtime.GOOS != "windows" {
+		_ = syscall.Kill(-pid, syscall.SIGTERM)
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(3 * time.Second):
+	}
+	if runtime.GOOS != "windows" {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
+	<-done
+}
+
 func (g *Gateway) stopWorker(wp *workerProc) {
 	if wp == nil {
 		return
@@ -460,23 +497,26 @@ func (g *Gateway) stopWorker(wp *workerProc) {
 	if !wp.alive {
 		return
 	}
-	// ask graceful recycle
-	_ = json.NewEncoder(wp.stdin).Encode(workerReq{Cmd: "shutdown"})
-	_ = wp.stdin.Close()
+	// ask graceful recycle first
+	if wp.stdin != nil {
+		_ = json.NewEncoder(wp.stdin).Encode(workerReq{Cmd: "shutdown"})
+		_ = wp.stdin.Close()
+	}
 	done := make(chan struct{})
 	go func() {
-		_ = wp.cmd.Wait()
+		if wp.cmd != nil {
+			_ = wp.cmd.Wait()
+		}
 		close(done)
 	}()
 	select {
 	case <-done:
-	case <-time.After(6 * time.Second):
-		if wp.cmd.Process != nil {
-			_ = wp.cmd.Process.Kill()
-		}
+	case <-time.After(4 * time.Second):
+		killProcessTree(wp.cmd)
 		<-done
 	}
 	wp.alive = false
+	wp.busy.Store(false)
 	g.aliveWorkers.Add(-1)
 	g.recycles.Add(1)
 }
@@ -505,27 +545,57 @@ func (g *Gateway) ensureWorker(wp **workerProc, id int) error {
 func (g *Gateway) solveOnWorker(wp *workerProc, job Job) workerResp {
 	wp.mu.Lock()
 	defer wp.mu.Unlock()
+	wp.busy.Store(true)
+	defer wp.busy.Store(false)
+	wp.lastUsed.Store(time.Now().UnixNano())
 	req := workerReq{
 		Cmd: "solve", ID: job.ID, URL: job.URL, Sitekey: job.Sitekey,
 		Action: job.Action, CData: job.CData, Proxy: job.Proxy,
 	}
 	if err := json.NewEncoder(wp.stdin).Encode(req); err != nil {
+		wp.fails++
 		return workerResp{OK: false, ID: job.ID, Error: "worker write: " + err.Error()}
 	}
 	var resp workerResp
 	// decoder blocks; rely on outer timeout via process recycle
 	if err := wp.stdout.Decode(&resp); err != nil {
 		wp.alive = false
+		wp.fails++
 		return workerResp{OK: false, ID: job.ID, Error: "worker read: " + err.Error()}
 	}
 	wp.solves++
+	if !resp.OK {
+		wp.fails++
+	}
 	return resp
+}
+
+// adaptiveTimeout shortens under high queue pressure, lengthens when idle.
+func (g *Gateway) adaptiveTimeout() time.Duration {
+	base := g.solveTimeout
+	q := len(g.queue)
+	capQ := cap(g.queue)
+	if capQ <= 0 {
+		return base
+	}
+	// High queue → slightly shorter timeout to fail fast and free workers
+	if q*100/capQ >= 70 {
+		t := time.Duration(float64(base) * 0.75)
+		if t < 25*time.Second {
+			t = 25 * time.Second
+		}
+		return t
+	}
+	return base
 }
 
 func (g *Gateway) workerLoop(id int) {
 	defer g.wg.Done()
 	var wp *workerProc
 	defer func() { g.stopWorker(wp) }()
+
+	// consecutive failures → longer backoff to avoid thrashing chromium
+	failStreak := 0
 
 	for {
 		select {
@@ -539,17 +609,24 @@ func (g *Gateway) workerLoop(id int) {
 				g.failed.Add(1)
 				g.pending.Add(-1)
 				g.putResult(&Result{ID: job.ID, Status: "error", Error: err.Error(), Worker: id})
+				failStreak++
+				if failStreak > 3 {
+					time.Sleep(time.Duration(min(failStreak, 8)) * 400 * time.Millisecond)
+				}
 				continue
 			}
 
-			// optional pre-check RSS
+			// optional pre-check RSS / solve budget
 			if wp.cmd.Process != nil {
 				rss := g.processRSS(wp.cmd.Process.Pid)
 				wp.lastRSS = rss
 				p := g.hostPressure()
-				if g.shouldRecycle(rss, p.Pressure) || (g.maxSolves > 0 && wp.solves >= g.maxSolves) {
-					fmt.Fprintf(os.Stderr, "[gateway] recycle worker %d rss_kb=%d pressure=%d solves=%d\n",
-						id, rss, p.Pressure, wp.solves)
+				// recycle earlier under high pressure even below soft limit
+				force := g.maxSolves > 0 && wp.solves >= g.maxSolves
+				force = force || (wp.fails >= 3 && wp.solves > 0)
+				if g.shouldRecycle(rss, p.Pressure) || force {
+					fmt.Fprintf(os.Stderr, "[gateway] recycle worker %d rss_kb=%d pressure=%d solves=%d fails=%d\n",
+						id, rss, p.Pressure, wp.solves, wp.fails)
 					g.stopWorker(wp)
 					wp = nil
 					if err := g.ensureWorker(&wp, id); err != nil {
@@ -568,10 +645,11 @@ func (g *Gateway) workerLoop(id int) {
 				ch <- out{r: g.solveOnWorker(wp, job)}
 			}()
 			var resp workerResp
+			timeout := g.adaptiveTimeout()
 			select {
 			case o := <-ch:
 				resp = o.r
-			case <-time.After(g.solveTimeout):
+			case <-time.After(timeout):
 				resp = workerResp{OK: false, ID: job.ID, Error: "solve timeout"}
 				g.stopWorker(wp)
 				wp = nil
@@ -582,6 +660,7 @@ func (g *Gateway) workerLoop(id int) {
 			elapsed := time.Since(start).Seconds()
 			g.pending.Add(-1)
 			if resp.OK && resp.Value != "" && g.tokenOK(resp.Value) {
+				failStreak = 0
 				g.solved.Add(1)
 				g.solveSumMs.Add(int64(elapsed * 1000))
 				g.solveCount.Add(1)
@@ -590,6 +669,7 @@ func (g *Gateway) workerLoop(id int) {
 					ElapsedSec: elapsed, Worker: id, Recycled: resp.Recycled,
 				})
 			} else {
+				failStreak++
 				g.failed.Add(1)
 				errMsg := resp.Error
 				if errMsg == "" {
@@ -603,6 +683,10 @@ func (g *Gateway) workerLoop(id int) {
 				if wp != nil {
 					g.stopWorker(wp)
 					wp = nil
+				}
+				// brief backoff under consecutive fails (scheduler anti-thrash)
+				if failStreak >= 2 {
+					time.Sleep(time.Duration(min(failStreak, 5)) * 250 * time.Millisecond)
 				}
 			}
 			if resp.Recycled && wp != nil {
@@ -659,8 +743,28 @@ func (g *Gateway) start() error {
 
 func (g *Gateway) stop() {
 	g.cancel()
-	close(g.queue)
-	g.wg.Wait()
+	// Drain is non-blocking: close queue after cancel so loops exit
+	func() {
+		defer func() { _ = recover() }()
+		close(g.queue)
+	}()
+	// Hard deadline so main register exit is not blocked by hung chromium
+	done := make(chan struct{})
+	go func() {
+		g.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(12 * time.Second):
+		fmt.Fprintln(os.Stderr, "[gateway] stop: force-killing remaining workers")
+		for _, wp := range g.workerProcs {
+			if wp != nil && wp.cmd != nil {
+				killProcessTree(wp.cmd)
+			}
+		}
+		<-done
+	}
 }
 
 func (g *Gateway) enqueue(job Job) {
@@ -1088,6 +1192,13 @@ func exePath() string {
 		return "."
 	}
 	return p
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func max(a, b int) int {
