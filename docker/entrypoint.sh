@@ -22,6 +22,10 @@ export SOLVER_GATEWAY_WORKERS_MAX="${SOLVER_GATEWAY_WORKERS_MAX:-8}"
 export SOLVER_WORKER_CONCURRENCY="${SOLVER_WORKER_CONCURRENCY:-0}"
 export REGISTER_ENGINE="${REGISTER_ENGINE:-protocol}"
 export CONTROL_PLANE_ALLOW_ACTIONS="${CONTROL_PLANE_ALLOW_ACTIONS:-1}"
+# HF: start protocol register with the panel (no UI click). Set AUTO_START_REGISTER=0 to disable.
+export AUTO_START_REGISTER="${AUTO_START_REGISTER:-1}"
+export AUTO_RESTART_REGISTER="${AUTO_RESTART_REGISTER:-1}"
+export AUTO_START_DELAY_SEC="${AUTO_START_DELAY_SEC:-3}"
 # Panel auth: set DASHBOARD_PASSWORD (and optional DASHBOARD_USER) via Space Secrets
 export DASHBOARD_USER="${DASHBOARD_USER:-${CONTROL_PLANE_USER:-admin}}"
 export DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-${CONTROL_PLANE_PASSWORD:-${PANEL_PASSWORD:-}}}"
@@ -48,6 +52,8 @@ grep -q '^SOLVER_GATEWAY_WORKERS_MAX=' /app/.env 2>/dev/null || echo "SOLVER_GAT
 grep -q '^SOLVER_WORKER_CONCURRENCY=' /app/.env 2>/dev/null || echo "SOLVER_WORKER_CONCURRENCY=${SOLVER_WORKER_CONCURRENCY}" >> /app/.env
 grep -q '^KEY_EXPORT_DIR=' /app/.env 2>/dev/null || echo "KEY_EXPORT_DIR=${KEY_EXPORT_DIR}" >> /app/.env
 grep -q '^CONTROL_PLANE_ALLOW_ACTIONS=' /app/.env 2>/dev/null || echo "CONTROL_PLANE_ALLOW_ACTIONS=${CONTROL_PLANE_ALLOW_ACTIONS}" >> /app/.env
+grep -q '^AUTO_START_REGISTER=' /app/.env 2>/dev/null || echo "AUTO_START_REGISTER=${AUTO_START_REGISTER}" >> /app/.env
+grep -q '^AUTO_RESTART_REGISTER=' /app/.env 2>/dev/null || echo "AUTO_RESTART_REGISTER=${AUTO_RESTART_REGISTER}" >> /app/.env
 
 # Public URL: SPACE_ID=owner/name → https://owner-name.hf.space
 # Prefer explicit SPACE_HOST / DASHBOARD_PUBLIC_URL when set by the platform.
@@ -96,6 +102,11 @@ else
   echo "⚠️  Panel auth OFF — set DASHBOARD_PASSWORD secret for public Spaces"
 fi
 
+if [ "${AUTO_START_REGISTER}" = "1" ] || [ "${AUTO_START_REGISTER}" = "true" ]; then
+  echo "▶ AUTO_START_REGISTER=1 — protocol register will launch ~${AUTO_START_DELAY_SEC}s after panel is up"
+  echo "  (set AUTO_START_REGISTER=0 to only use the UI Start button)"
+fi
+
 echo "🚀 Starting grok-free-register dashboard..."
-# Dashboard is the control plane; registration is started from UI / API
+# Dashboard is the control plane; register auto-starts when AUTO_START_REGISTER=1
 exec python -m grok_register.dashboard --host "${HOST}" --port "${PORT}"

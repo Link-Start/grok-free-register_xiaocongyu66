@@ -3238,6 +3238,134 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json(200, result)
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return (os.environ.get(name) or default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _auto_start_register_enabled() -> bool:
+    """HF / Docker: start protocol register with the panel (no UI click needed)."""
+    if "AUTO_START_REGISTER" in os.environ:
+        return _env_truthy("AUTO_START_REGISTER", "0")
+    # default on for Hugging Face Spaces / /data deployments
+    if (os.environ.get("SPACE_ID") or "").strip():
+        return True
+    if (os.environ.get("KEY_EXPORT_DIR") or "").startswith("/data"):
+        return True
+    return False
+
+
+def _auto_restart_register_enabled() -> bool:
+    if "AUTO_RESTART_REGISTER" in os.environ:
+        return _env_truthy("AUTO_RESTART_REGISTER", "0")
+    # follow auto-start default
+    return _auto_start_register_enabled()
+
+
+_register_supervisor_stop = threading.Event()
+_register_supervisor_thread: threading.Thread | None = None
+
+
+def _build_auto_start_args() -> list[str]:
+    args: list[str] = []
+    target = (os.environ.get("TARGET") or os.environ.get("AUTO_START_TARGET") or "").strip()
+    if target and target not in {"0", ""}:
+        args.extend(["--target", target])
+    return args
+
+
+def _maybe_auto_start_register(*, reason: str = "boot") -> dict:
+    """Spawn register once at panel boot (and for supervisor restarts)."""
+    if process_alive():
+        return {"ok": True, "message": "register already running", "skipped": True}
+    engine = (os.environ.get("REGISTER_ENGINE") or "protocol").strip().lower()
+    args = _build_auto_start_args()
+    print(
+        f"[*] AUTO_START_REGISTER ({reason}): engine={engine} args={args or '[]'}",
+        flush=True,
+    )
+    try:
+        if engine == "go":
+            payload: dict = {}
+            if args and "--target" in args:
+                try:
+                    payload["target"] = args[args.index("--target") + 1]
+                except (ValueError, IndexError):
+                    pass
+            result = _spawn_go_register(payload)
+        else:
+            result = _spawn_register(args, engine=engine)
+    except Exception as exc:
+        result = {"ok": False, "message": f"auto-start failed: {exc}"}
+    try:
+        from grok_register.run_log import append_fail
+
+        append_fail(
+            "auto_start",
+            result.get("message") or str(result),
+            level="info" if result.get("ok") else "error",
+            engine=engine,
+            extra={"reason": reason, "ok": bool(result.get("ok"))},
+        )
+    except Exception:
+        pass
+    _record_last_action("auto_start", result if isinstance(result, dict) else {"ok": False})
+    msg = (result or {}).get("message") if isinstance(result, dict) else str(result)
+    print(f"[*] AUTO_START_REGISTER result: {msg}", flush=True)
+    return result if isinstance(result, dict) else {"ok": False, "message": str(result)}
+
+
+def _register_supervisor_loop() -> None:
+    """If register exits, respawn (HF often loses child after UI start)."""
+    # initial delay so /api/health is up first
+    delay = max(1.0, float(os.environ.get("AUTO_START_DELAY_SEC") or "3"))
+    if _register_supervisor_stop.wait(delay):
+        return
+    if _auto_start_register_enabled():
+        _maybe_auto_start_register(reason="boot")
+    interval = max(5.0, float(os.environ.get("AUTO_RESTART_INTERVAL_SEC") or "15"))
+    while not _register_supervisor_stop.is_set():
+        if _register_supervisor_stop.wait(interval):
+            break
+        if not _auto_restart_register_enabled():
+            continue
+        if process_alive():
+            continue
+        # avoid thrashing if last exit was instant crash
+        try:
+            from grok_register.run_log import recent_fail_summary
+
+            recent = recent_fail_summary(limit=1)
+            if recent:
+                last = recent[0]
+                age = time.time() - float(last.get("ts") or 0)
+                if last.get("kind") in {"early_exit", "crash"} and age < 8:
+                    continue
+        except Exception:
+            pass
+        _maybe_auto_start_register(reason="supervisor")
+
+
+def start_register_supervisor() -> None:
+    global _register_supervisor_thread
+    if not _auto_start_register_enabled() and not _auto_restart_register_enabled():
+        return
+    if _register_supervisor_thread and _register_supervisor_thread.is_alive():
+        return
+    _register_supervisor_stop.clear()
+    _register_supervisor_thread = threading.Thread(
+        target=_register_supervisor_loop,
+        name="register-supervisor",
+        daemon=True,
+    )
+    _register_supervisor_thread.start()
+    print(
+        f"[*] register supervisor on "
+        f"(auto_start={_auto_start_register_enabled()} "
+        f"auto_restart={_auto_restart_register_enabled()})",
+        flush=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -3246,6 +3374,11 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Web control plane for grok-free-register")
     p.add_argument("--host", default=DEFAULT_HOST)
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument(
+        "--no-auto-register",
+        action="store_true",
+        help="Disable AUTO_START_REGISTER even if env enables it",
+    )
     args = p.parse_args(argv)
     # auto-start CLIProxyAPI import/refresh worker when enabled
     try:
@@ -3277,10 +3410,15 @@ def main(argv: list[str] | None = None) -> int:
             "[*] auth: OFF — set DASHBOARD_PASSWORD or CONTROL_PLANE_TOKEN "
             "to protect the panel (recommended on public / HF Space)"
         )
+    if not args.no_auto_register:
+        start_register_supervisor()
+    else:
+        print("[*] AUTO_START_REGISTER disabled via --no-auto-register", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[*] dashboard stopped")
+        _register_supervisor_stop.set()
     return 0
 
 
