@@ -1780,12 +1780,33 @@ def _turnstile_api_result_state(payload):
     return "error", None
 
 
+def _turnstile_api_headers() -> dict:
+    """Auth for remote standalone solver (xiaocongyu66/turnstile-solver)."""
+    token = (
+        os.environ.get("TURNSTILE_API_TOKEN")
+        or os.environ.get("SOLVER_API_TOKEN")
+        or os.environ.get("TURNSTILE_SOLVER_TOKEN")
+        or ""
+    ).strip()
+    if not token:
+        return {}
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-API-Key": token,
+    }
+
+
 def _turnstile_api_http_get(url, *, timeout):
     """同步 GET;不走代理(外部 solver 通常在本机/内网)。
 
     timeout 可为 float 秒,或 (connect, read) 元组。
     """
-    return req.get(url, timeout=timeout, proxies={"http": None, "https": None})
+    return req.get(
+        url,
+        timeout=timeout,
+        headers=_turnstile_api_headers() or None,
+        proxies={"http": None, "https": None},
+    )
 
 
 # 限制同时打到内置 solver 的任务数,避免 5 个 S_Worker 把 2 线程 solver 打满后互相拖死
