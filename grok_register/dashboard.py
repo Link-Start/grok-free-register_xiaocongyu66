@@ -458,14 +458,39 @@ def build_overview() -> dict:
             "browser_fingerprints": "/api/download?format=browser_fingerprints",
             "grok_txt": "/api/download?format=grok_txt",
             "protocol_log": "/api/download?format=protocol_log",
+            "register_log": "/api/download?format=register_log",
+            "register_fail": "/api/download?format=register_fail",
+            "register_logs_zip": "/api/download?format=register_logs_zip",
         },
         "recovery_files": inv.list_recovery_files(),
+        "run_logs": _run_logs_block(),
         "xai_probe": {
             "last": _last_probe if _last_probe.get("at") else None,
         },
         "convert_job": acct_convert.job_status(),
         "cliproxyapi": cpa_sync.job_status(),
     }
+
+
+def _run_logs_block() -> dict:
+    try:
+        from grok_register.run_log import list_run_logs, recent_fail_summary, tail_text, register_dashboard_log_path
+
+        files = list_run_logs()
+        fails = recent_fail_summary(limit=6)
+        tail = tail_text(register_dashboard_log_path(), max_bytes=3500, max_lines=25)
+        return {
+            "files": files,
+            "recent_fails": fails,
+            "log_tail": tail,
+            "downloads": {
+                "register_log": "/api/download?format=register_log",
+                "register_fail": "/api/download?format=register_fail",
+                "register_logs_zip": "/api/download?format=register_logs_zip",
+            },
+        }
+    except Exception as exc:
+        return {"files": [], "recent_fails": [], "log_tail": "", "error": str(exc)[:200]}
 
 
 def _accounts_overview_block() -> dict:
@@ -484,13 +509,18 @@ def _accounts_overview_block() -> dict:
 
 def _tail_log(path: Path, *, max_bytes: int = 2500) -> str:
     try:
+        from grok_register.run_log import tail_text
+
+        return tail_text(path, max_bytes=max_bytes, max_lines=20)
+    except Exception:
+        pass
+    try:
         data = path.read_bytes()
     except OSError:
         return ""
     if len(data) > max_bytes:
         data = data[-max_bytes:]
     text = data.decode("utf-8", errors="replace").strip()
-    # keep last ~12 non-empty lines for UI
     lines = [ln for ln in text.splitlines() if ln.strip()]
     return "\n".join(lines[-12:])
 
@@ -501,18 +531,32 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
     cmd = [sys.executable, "-m", "grok_register.register"]
     if args:
         cmd.extend(args)
-    log_path = PROJECT_ROOT / "logs" / "register-dashboard.log"
+    try:
+        from grok_register.run_log import register_dashboard_log_path, append_fail, append_dashboard_note
+
+        log_path = register_dashboard_log_path()
+    except Exception:
+        log_path = PROJECT_ROOT / "logs" / "register-dashboard.log"
+        append_fail = None  # type: ignore
+        append_dashboard_note = None  # type: ignore
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     eng = (engine or env.get("REGISTER_ENGINE") or "protocol").strip().lower()
     if eng in {"protocol", "http", "python", "go"}:
         env["REGISTER_ENGINE"] = "protocol" if eng == "http" else eng
     # detach — browser only displays progress via runtime-status + register-job.json
+    spawn_hdr = (
+        f"\n===== spawn {time.strftime('%Y-%m-%dT%H:%M:%S')} engine={env.get('REGISTER_ENGINE')} "
+        f"cmd={' '.join(cmd)} =====\n"
+    )
+    if append_dashboard_note:
+        try:
+            append_dashboard_note(spawn_hdr)
+        except Exception:
+            pass
     with open(log_path, "ab", buffering=0) as logf:
-        logf.write(
-            f"\n===== spawn {time.strftime('%Y-%m-%dT%H:%M:%S')} engine={env.get('REGISTER_ENGINE')} "
-            f"cmd={' '.join(cmd)} =====\n".encode()
-        )
+        if not append_dashboard_note:
+            logf.write(spawn_hdr.encode())
         proc = subprocess.Popen(
             cmd,
             cwd=str(PROJECT_ROOT),
@@ -522,6 +566,17 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
             start_new_session=True,
             env=env,
         )
+    if append_fail:
+        try:
+            append_fail(
+                "spawn",
+                f"dashboard spawned pid={proc.pid} engine={env.get('REGISTER_ENGINE')}",
+                level="info",
+                engine=env.get("REGISTER_ENGINE") or "",
+                extra={"cmd": cmd},
+            )
+        except Exception:
+            pass
     # proot (tmoe) may leave children in tracing-stop; poke CONT
     try:
         time.sleep(0.15)
@@ -535,8 +590,19 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
         tail = _tail_log(log_path)
         msg = (
             f"注册进程秒退 exit={early_code} engine={env.get('REGISTER_ENGINE')}。"
-            f" 见 logs/register-dashboard.log"
+            f" 下载：↓ 运行日志 / ↓ 失败事件"
         )
+        if append_fail:
+            try:
+                append_fail(
+                    "early_exit",
+                    msg,
+                    engine=env.get("REGISTER_ENGINE") or "",
+                    exit_code=early_code,
+                    extra={"log_tail": tail[-1500:]},
+                )
+            except Exception:
+                pass
         job_store.write_register_job(
             running=False,
             engine=env.get("REGISTER_ENGINE") or "protocol",
@@ -554,6 +620,9 @@ def _spawn_register(args: list[str] | None = None, *, engine: str | None = None)
             "exit_code": early_code,
             "log": str(log_path),
             "log_tail": tail,
+            "log_download": "/api/download?format=register_log",
+            "fail_download": "/api/download?format=register_fail",
+            "logs_zip": "/api/download?format=register_logs_zip",
             "engine": env.get("REGISTER_ENGINE") or "protocol",
         }
     try:
@@ -1088,6 +1157,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="row" style="margin-top:12px">
+      <div class="card" style="grid-column:1/-1">
+        <h3 data-i18n="card_run_logs">运行 / 失败日志</h3>
+        <div class="note" data-i18n="run_logs_hint">注册秒退、Turnstile 超时、worker fail 会写入这里。可下载完整日志到本地排查（HF 无 SSH 时用）。</div>
+        <div class="dl-row" id="run-log-downloads" style="margin-top:8px"></div>
+        <div class="note" id="run-log-meta" style="margin-top:6px"></div>
+        <pre id="run-log-tail" class="note" style="margin-top:8px;max-height:220px;overflow:auto;white-space:pre-wrap;background:#0d1524;border:1px solid var(--border);border-radius:8px;padding:10px;font-size:12px"></pre>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
       <div class="card">
         <h3 data-i18n="card_products">成品下载</h3>
         <div id="products-body" class="note" data-i18n="products_hint">扫描 keys/ 中的 legacy / sub2api / cpa 成品</div>
@@ -1260,6 +1338,13 @@ const I18N = {
     card_raw: "原始状态",
     products_hint: "扫描 keys/ 中的 legacy / sub2api / cpa 成品",
     products_dir: "导出目录：{dir} · 可直接导入 sub2api / CPA 面板",
+    card_run_logs: "运行 / 失败日志",
+    run_logs_hint: "注册秒退、Turnstile 超时、worker fail 会写入这里。可下载完整日志到本地排查（HF 无 SSH 时用）。",
+    run_logs_meta: "日志文件 {ok}/{n} · 最近失败 {fails} 条",
+    run_logs_empty: "暂无运行日志。启动一次注册后这里会显示尾部输出。",
+    dl_register_log: "↓ 完整运行日志",
+    dl_register_fail: "↓ 失败事件.jsonl",
+    dl_register_logs_zip: "↓ 日志包.zip",
     card_recovery: "账号恢复包",
     recovery_hint: "导出 accounts.txt / auth-sessions / 指纹 / grok.txt / protocol.log，换机或重建 Space 后解压到 keys/ 即可续跑。",
     recovery_meta: "恢复源文件：存在 {ok}/{n} · 合计 {size}",
@@ -1434,6 +1519,13 @@ const I18N = {
     card_raw: "Raw status",
     products_hint: "Scan finished products in keys/ (legacy / sub2api / cpa)",
     products_dir: "Export dir: {dir} · import into sub2api / CPA panels",
+    card_run_logs: "Run / fail logs",
+    run_logs_hint: "Instant exits, Turnstile timeouts, worker fails. Download full logs when SSH is unavailable.",
+    run_logs_meta: "log files {ok}/{n} · recent fails {fails}",
+    run_logs_empty: "No run log yet. Start register once to capture output.",
+    dl_register_log: "↓ full run log",
+    dl_register_fail: "↓ fail events.jsonl",
+    dl_register_logs_zip: "↓ logs.zip",
     card_recovery: "Account recovery pack",
     recovery_hint: "Export accounts.txt / auth-sessions / fingerprints / grok.txt / protocol.log. Unpack into keys/ to resume after rebuild.",
     recovery_meta: "Recovery sources: {ok}/{n} present · {size} total",
@@ -1875,6 +1967,42 @@ async function refreshStatus(fromCache){
     recMeta.textContent = t("recovery_meta",{ok, n: recFiles.length||5, size});
   }
   $("products-body").textContent = t("products_dir",{dir: acc.export_dir||"keys"});
+  // run / fail logs (downloadable)
+  const rl = data.run_logs || {};
+  const rlFiles = rl.files || [];
+  const rlRoot = $("run-log-downloads");
+  if(rlRoot){
+    const dls = rl.downloads || {};
+    let html = `<a class="dl" href="${dls.register_logs_zip||"/api/download?format=register_logs_zip"}" style="border-color:rgba(255,209,102,.45)">${t("dl_register_logs_zip")}</a>`;
+    html += `<a class="dl" href="${dls.register_log||"/api/download?format=register_log"}">${t("dl_register_log")}</a>`;
+    html += `<a class="dl" href="${dls.register_fail||"/api/download?format=register_fail"}">${t("dl_register_fail")}</a>`;
+    rlFiles.forEach(f=>{
+      if(!f || !f.name || f.id==="register_log" || f.id==="register_fail") return;
+      const href = f.download || (`/api/download?format=${f.id}`);
+      const dim = f.exists ? "" : "opacity:.45;pointer-events:none";
+      html += `<a class="dl" href="${href}" style="${dim}" title="${f.desc||""}">↓ ${f.name}</a>`;
+    });
+    rlRoot.innerHTML = html;
+  }
+  const rlMeta = $("run-log-meta");
+  if(rlMeta){
+    const ok = rlFiles.filter(f=>f && f.exists && (f.size||0)>0).length;
+    const fails = (rl.recent_fails||[]).length;
+    rlMeta.textContent = t("run_logs_meta",{ok, n: rlFiles.length||3, fails});
+  }
+  const rlTail = $("run-log-tail");
+  if(rlTail){
+    const fails = rl.recent_fails || [];
+    let body = rl.log_tail || "";
+    if(fails.length){
+      const failLines = fails.map(f=>{
+        const ts = f.ts_iso || "";
+        return `[${ts}] ${f.kind||"?"}: ${f.message||""}`;
+      }).join("\n");
+      body = (body ? body+"\n\n--- recent fails ---\n" : "") + failLines;
+    }
+    rlTail.textContent = body || t("run_logs_empty");
+  }
   // engine select default from server
   const engSel=$("reg-engine");
   if(engSel && !engSel.dataset.touched){

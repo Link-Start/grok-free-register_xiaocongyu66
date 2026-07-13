@@ -673,6 +673,18 @@ def run_protocol_register(
             except Exception as exc:
                 stats.bump_fail(str(exc))
                 print(f"[W{wid}] fail: {exc}", flush=True)
+                try:
+                    from grok_register.run_log import append_fail
+
+                    append_fail(
+                        "worker_fail",
+                        str(exc)[:800],
+                        worker=wid,
+                        engine="protocol",
+                        extra={"proxy": (_pick_proxy() or "")[:120]},
+                    )
+                except Exception:
+                    pass
                 if stop.wait(1.5):
                     return
 
@@ -691,4 +703,18 @@ def run_protocol_register(
         f"last_error={stats.last_error!r}",
         flush=True,
     )
-    return 0 if stats.success > 0 or target == 0 else 1
+    code = 0 if stats.success > 0 or target == 0 else 1
+    try:
+        from grok_register.run_log import append_fail
+
+        append_fail(
+            "protocol_done",
+            f"success={stats.success} failed={stats.failed} last_error={stats.last_error!r}",
+            level="info" if code == 0 else "error",
+            engine="protocol",
+            exit_code=code,
+            extra={"success": stats.success, "failed": stats.failed},
+        )
+    except Exception:
+        pass
+    return code

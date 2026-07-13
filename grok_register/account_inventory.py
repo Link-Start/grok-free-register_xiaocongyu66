@@ -522,6 +522,53 @@ def download_spec(fmt: str) -> tuple[Path, str, str]:
     }:
         p = pack_recovery_zip()
         return p, "application/zip", "account-recovery.zip"
+    # register / solver logs (panel download)
+    if fmt in {
+        "register_log",
+        "register_dashboard_log",
+        "dashboard_log",
+        "run_log",
+        "register-dashboard.log",
+    }:
+        from grok_register.run_log import register_dashboard_log_path
+
+        p = register_dashboard_log_path()
+        if not p.is_file():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("# no register log yet — start register once\n", encoding="utf-8")
+        return p, "text/plain; charset=utf-8", "register-dashboard.log"
+    if fmt in {
+        "register_fail",
+        "fail_log",
+        "register_fail_jsonl",
+        "register-fail.jsonl",
+        "fails",
+    }:
+        from grok_register.run_log import register_fail_log_path
+
+        p = register_fail_log_path()
+        if not p.is_file():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("", encoding="utf-8")
+        return p, "application/x-ndjson; charset=utf-8", "register-fail.jsonl"
+    if fmt in {"register_live", "live_log", "register-live.log"}:
+        from grok_register.run_log import register_live_log_path
+
+        p = register_live_log_path()
+        if not p.is_file():
+            raise ValueError("register-live.log not found yet")
+        return p, "text/plain; charset=utf-8", "register-live.log"
+    if fmt in {
+        "register_logs_zip",
+        "logs_zip",
+        "run_logs",
+        "run_logs_zip",
+        "debug_logs",
+    }:
+        from grok_register.run_log import pack_run_logs_zip
+
+        p = pack_run_logs_zip()
+        return p, "application/zip", "register-logs.zip"
     rec = _recovery_alias_map().get(fmt)
     if rec is not None:
         p = key_export_dir() / rec["name"]

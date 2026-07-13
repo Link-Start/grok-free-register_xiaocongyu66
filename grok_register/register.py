@@ -280,6 +280,34 @@ def log(msg):
     try:
         _terminal_output(msg)
     except Exception:
+        pass
+    # Mirror important lines to fail log for panel download (fail/exit/config)
+    try:
+        s = str(msg)
+        low = s.lower()
+        if any(
+            k in low
+            for k in (
+                "fail",
+                "error",
+                "秒退",
+                "退出",
+                "timeout",
+                "配置错误",
+                "config",
+                "traceback",
+                "exception",
+                "无法",
+                "未就绪",
+            )
+        ) or s.startswith(("[!]", "[✗]", "[W")):
+            from grok_register.run_log import append_fail
+
+            kind = "worker_fail" if s.startswith("[W") else "register"
+            if "exit" in low or "退出" in s or "秒退" in s:
+                kind = "exit"
+            append_fail(kind, s, level="error" if ("fail" in low or "error" in low or s.startswith(("[!]", "[✗]"))) else "warn")
+    except Exception:
         return
 
 
@@ -4752,9 +4780,26 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        from grok_register.run_log import append_fail
+
+        append_fail(
+            "spawn",
+            f"register main start argv={sys.argv[1:]!r}",
+            level="info",
+            engine=os.environ.get("REGISTER_ENGINE") or "",
+        )
+    except Exception:
+        pass
+    try:
         REGISTER_LOG_MODE = resolve_register_log_mode(sys.argv[1:])
     except ValueError:
         log("[!] 配置错误：REGISTER_LOG_MODE 应为 user 或 debug")
+        try:
+            from grok_register.run_log import append_fail
+
+            append_fail("config", "REGISTER_LOG_MODE invalid", exit_code=2)
+        except Exception:
+            pass
         raise SystemExit(2)
     try:
         from grok_register.runtime_status import write_pid
@@ -4762,16 +4807,53 @@ if __name__ == "__main__":
         write_pid(os.getpid())
     except Exception:
         pass
+    exit_code = 1
     try:
         exit_code = asyncio.run(main())
     except ValueError as exc:
         log(f"[!] 配置错误：{sanitize_terminal_error(exc)}")
         exit_code = 2
+        try:
+            from grok_register.run_log import append_fail
+
+            append_fail("config", str(exc)[:800], exit_code=2)
+        except Exception:
+            pass
     except KeyboardInterrupt:
         log("[!] 用户中断")
         exit_code = 130
+        try:
+            from grok_register.run_log import append_fail
+
+            append_fail("interrupt", "KeyboardInterrupt", level="warn", exit_code=130)
+        except Exception:
+            pass
+    except Exception as exc:
+        import traceback
+
+        tb = traceback.format_exc()
+        log(f"[!] 未捕获异常：{sanitize_terminal_error(exc)}")
+        print(tb, flush=True)
+        exit_code = 1
+        try:
+            from grok_register.run_log import append_fail
+
+            append_fail("crash", str(exc)[:800], exit_code=1, extra={"traceback": tb[-3000:]})
+        except Exception:
+            pass
     finally:
         # Main stopped → kill hybrid Turnstile stack (gateway + browsers + watchdog)
+        try:
+            from grok_register.run_log import append_fail
+
+            append_fail(
+                "exit",
+                f"register process exiting code={exit_code}",
+                level="info" if exit_code == 0 else "error",
+                exit_code=int(exit_code) if exit_code is not None else None,
+            )
+        except Exception:
+            pass
         try:
             _stop_managed_turnstile_solver()
         except Exception:
