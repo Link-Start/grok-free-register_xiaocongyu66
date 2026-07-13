@@ -1,5 +1,21 @@
 # 运行状态与排障
 
+## 多语言栈门禁失败
+
+启动时报 `硬性条件未满足` 或 `polyglot stack incomplete` 时：
+
+```bash
+bash scripts/polyglot_gate.sh check
+bash scripts/build-native.sh
+# 确认存在:
+#   .venv/bin/python
+#   native/proxy-worker/proxy-worker
+#   native/register-worker/register-worker
+#   native/inventory-worker/inventory-worker
+```
+
+缺少 `go` / `cargo` 时先安装工具链再 `bash setup.sh`。仅单元测试可设 `POLYGLOT_REQUIRED=0`（生产勿用）。
+
 ## 普通模式
 
 普通模式的每一行都对应一次状态变化：

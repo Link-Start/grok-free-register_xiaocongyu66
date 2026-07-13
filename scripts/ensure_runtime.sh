@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Ensure Python venv + mandatory Go/Rust native binaries before any entrypoint.
 
 ensure_runtime() {
     local lock_dir=".setup.lock"
@@ -6,6 +7,11 @@ ensure_runtime() {
     local attempt
     local current_requirements=""
     local recorded_requirements=""
+    local root
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    # shellcheck source=polyglot_gate.sh
+    source "$root/scripts/polyglot_gate.sh"
+    export POLYGLOT_ROOT="$root"
 
     for attempt in {1..300}; do
         if mkdir "$lock_dir" 2>/dev/null; then
@@ -21,9 +27,9 @@ ensure_runtime() {
     trap 'rmdir .setup.lock 2>/dev/null || true' EXIT INT TERM
 
     if [ ! -d .venv ]; then
-        echo "[*] 首次运行，安装依赖..."
+        echo "[*] 首次运行，安装依赖 (Python + Go + Rust)..."
         if ! bash setup.sh; then
-            rmdir "$lock_dir"
+            rmdir "$lock_dir" 2>/dev/null || true
             trap - EXIT INT TERM
             return 1
         fi
@@ -41,6 +47,34 @@ ensure_runtime() {
         fi
     fi
 
-    rmdir "$lock_dir"
+    # Tests / CI can set POLYGLOT_REQUIRED=0 to skip native build + hard gate
+    if [ "${POLYGLOT_REQUIRED:-1}" = "0" ]; then
+        rmdir "$lock_dir" 2>/dev/null || true
+        trap - EXIT INT TERM
+        echo "[*] POLYGLOT_REQUIRED=0 · 跳过多语言硬门禁 (仅测试用)"
+        return 0
+    fi
+
+    # Auto-build native stack if incomplete (hard requirement)
+    # polyglot_missing returns 0 when complete, 1 when components are missing
+    if polyglot_missing >/dev/null 2>&1; then
+        : # stack complete
+    else
+        echo "[*] 多语言栈不完整，正在编译 Go + Rust 原生组件..."
+        if ! bash "$root/scripts/build-native.sh"; then
+            rmdir "$lock_dir" 2>/dev/null || true
+            trap - EXIT INT TERM
+            require_polyglot_stack || true
+            return 1
+        fi
+    fi
+
+    rmdir "$lock_dir" 2>/dev/null || true
     trap - EXIT INT TERM
+
+    # Hard gate: refuse to continue without full stack
+    if ! require_polyglot_stack; then
+        return 1
+    fi
+    return 0
 }

@@ -17,3 +17,22 @@ take 100
 每条库存记录预留 `note` 字段，默认为空。取用操作不要求填写用途；以后需要备注时可直接更新该字段。
 
 若文件移动中断，服务下次启动会恢复 `claiming` 状态。库存不足或凭据文件缺失时，操作失败但认证服务继续运行。
+
+## 控制面板成品与状态
+
+Web 控制面板（`bash start.sh --dashboard`）会扫描 `KEY_EXPORT_DIR`（默认 `keys/`）并汇总：
+
+| 状态 | 含义 |
+|------|------|
+| `oauth_ready` | 已有 sub2api / CPA OAuth 凭据 |
+| `oauth_pending` | 仅有 legacy SSO，尚未转换成 OAuth |
+| `legacy_sso` | 仅 SSO 行，无 OAuth 文件 |
+
+成品下载（合并包，可直接导入对应工具）：
+
+- `GET /api/download?format=sub2api` → `accounts.sub2api.json`
+- `GET /api/download?format=cpa_zip` → `xai-singles.zip` (xai-*.json only)
+- 
+- `GET /api/download?format=legacy` → `accounts.txt`
+
+账号列表：`GET /api/accounts`。重建合并包：`POST /api/action` body `{"action":"rebuild_bundles"}`（无需开启 `CONTROL_PLANE_ALLOW_ACTIONS`）。

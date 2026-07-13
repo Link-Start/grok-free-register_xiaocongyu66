@@ -10,21 +10,21 @@ from xai_enroller.remote_stream import (
 )
 
 
-def _document(source_id):
-    return json.dumps(
-        {
-            "email": source_id,
-            "cookies": [
-                {
-                    "name": "sso",
-                    "value": "opaque",
-                    "domain": "accounts.x.ai",
-                    "path": "/",
-                }
-            ],
-        },
-        separators=(",", ":"),
-    ).encode()
+def _document(source_id, browser_fingerprint_id=None):
+    document = {
+        "email": source_id,
+        "cookies": [
+            {
+                "name": "sso",
+                "value": "opaque",
+                "domain": "accounts.x.ai",
+                "path": "/",
+            }
+        ],
+    }
+    if browser_fingerprint_id:
+        document["browser_fingerprint_id"] = browser_fingerprint_id
+    return json.dumps(document, separators=(",", ":")).encode()
 
 
 class FakeStream:
@@ -194,6 +194,22 @@ def test_snapshot_consumer_finishes_open_generation_before_replacement(tmp_path)
 
         assert (await anext(records)).source_id == "old-b"
         assert (await asyncio.wait_for(anext(records), 1)).source_id == "new-a"
+        await source.close()
+        await records.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_source_preserves_browser_fingerprint_id(tmp_path):
+    async def scenario():
+        destination = tmp_path / "source-snapshot.jsonl"
+        destination.write_bytes(_document("old-a", "bf-account-a") + b"\n")
+        source = DiskSnapshotSource(destination, poll_seconds=0.01)
+
+        records = source.records()
+        first = await anext(records)
+
+        assert first.browser_fingerprint_id == "bf-account-a"
         await source.close()
         await records.aclose()
 

@@ -4,6 +4,8 @@ import sys
 import tempfile
 import types
 import unittest
+import zipfile
+from pathlib import Path
 
 from grok_register.core.observer import Metrics
 from xai_enroller.models import OAuthCredential
@@ -24,10 +26,13 @@ from grok_register import register
 
 
 class Response:
-    def __init__(self, data, status_code=200, text=None):
+    def __init__(self, data, status_code=200, text=None, headers=None, cookies=None):
         self._data = data
         self.status_code = status_code
         self.text = json.dumps(data) if text is None else text
+        self.content = self.text.encode()
+        self.headers = headers or {}
+        self.cookies = cookies or {}
 
     def json(self):
         return self._data
@@ -37,31 +42,9 @@ def test_registration_persists_exact_session_before_legacy_outputs(monkeypatch):
     writes = []
     monkeypatch.setattr(
         register,
-        "_append_registration_line",
-        lambda path, line, mode=None, durable=False: writes.append(
-            (path, line, mode, durable)
-        ),
+        "_remember_account_browser_fingerprint",
+        lambda email, browser_fingerprint_id=None: browser_fingerprint_id or "bf-test-1",
     )
-
-    register._persist_registration(
-        "user@example.test",
-        "password",
-        "sso-token",
-        [{"name": "sso", "value": "opaque", "domain": "accounts.x.ai"}],
-    )
-
-    assert [item[0] for item in writes] == [
-        "keys/auth-sessions.jsonl",
-        "keys/accounts.txt",
-        "keys/grok.txt",
-    ]
-    assert writes[0][2] == 0o600
-    assert [item[3] for item in writes] == [True, False, False]
-
-
-def test_registration_can_disable_legacy_account_exports(monkeypatch):
-    writes = []
-    monkeypatch.setattr(register, "KEY_EXPORT_FORMATS", ("sub2api",))
     monkeypatch.setattr(
         register,
         "_append_registration_line",
@@ -75,9 +58,58 @@ def test_registration_can_disable_legacy_account_exports(monkeypatch):
         "password",
         "sso-token",
         [{"name": "sso", "value": "opaque", "domain": "accounts.x.ai"}],
+        "bf-test-1",
+    )
+
+    assert [item[0] for item in writes] == [
+        "keys/auth-sessions.jsonl",
+        "keys/accounts.txt",
+        "keys/grok.txt",
+    ]
+    assert writes[0][2] == 0o600
+    assert [item[3] for item in writes] == [True, False, False]
+    session = json.loads(writes[0][1])
+    assert session["browser_fingerprint_id"] == "bf-test-1"
+
+
+def test_registration_can_disable_legacy_account_exports(monkeypatch):
+    writes = []
+    monkeypatch.setattr(register, "KEY_EXPORT_FORMATS", ("sub2api",))
+    monkeypatch.setattr(
+        register,
+        "_remember_account_browser_fingerprint",
+        lambda email, browser_fingerprint_id=None: browser_fingerprint_id or "bf-test-1",
+    )
+    monkeypatch.setattr(
+        register,
+        "_append_registration_line",
+        lambda path, line, mode=None, durable=False: writes.append(
+            (path, line, mode, durable)
+        ),
+    )
+
+    register._persist_registration(
+        "user@example.test",
+        "password",
+        "sso-token",
+        [{"name": "sso", "value": "opaque", "domain": "accounts.x.ai"}],
+        "bf-test-1",
     )
 
     assert [item[0] for item in writes] == ["keys/auth-sessions.jsonl"]
+
+
+def test_registration_browser_fingerprint_is_stable_per_email(monkeypatch, tmp_path):
+    monkeypatch.setattr(register, "KEY_EXPORT_DIR", str(tmp_path))
+
+    first = register._remember_account_browser_fingerprint("User@Example.Test")
+    second = register._remember_account_browser_fingerprint("user@example.test")
+    other = register._remember_account_browser_fingerprint("other@example.test")
+
+    assert first == second
+    assert first != other
+    document = json.loads((tmp_path / "browser-fingerprints.json").read_text())
+    assert document["accounts"]["user@example.test"]["browser_fingerprint_id"] == first
 
 
 def test_local_key_export_sink_writes_cpa_and_sub2api_folders(monkeypatch, tmp_path):
@@ -104,7 +136,12 @@ def test_local_key_export_sink_writes_cpa_and_sub2api_folders(monkeypatch, tmp_p
 
     cpa_files = list((tmp_path / "cpa").glob("xai-*.json"))
     assert len(cpa_files) == 1
-    assert json.loads(cpa_files[0].read_text(encoding="utf-8"))["refresh_token"] == "refresh-token"
+    cpa_document = json.loads(cpa_files[0].read_text(encoding="utf-8"))
+    assert cpa_document["refresh_token"] == "refresh-token"
+    assert cpa_document["email"] == "user@example.test"
+    # merge bundles must not be created
+    assert not (tmp_path / "cpa" / "accounts.cpa.zip").exists()
+    assert not (tmp_path / "cpa" / "accounts.cpa.json").exists()
 
     sub2api_files = list((tmp_path / "sub2api").glob("xai-*.sub2api.json"))
     assert len(sub2api_files) == 1
@@ -119,10 +156,12 @@ def test_key_export_enrollment_uses_xai_enroller_and_writes_selected_format(monk
     monkeypatch.setattr(register, "KEY_EXPORT_FORMATS", ("sub2api",))
     monkeypatch.setattr(register, "KEY_EXPORT_ENROLLER", True)
     monkeypatch.setattr(register, "_pick_grok_proxy", lambda: None)
+    coordinators = []
 
     class FakeCoordinator:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            coordinators.append(self)
 
         async def run(self, target):
             credential = OAuthCredential(
@@ -153,11 +192,14 @@ def test_key_export_enrollment_uses_xai_enroller_and_writes_selected_format(monk
             "user@example.test",
             "sso-token",
             [{"name": "sso", "value": "sso-token", "domain": "accounts.x.ai"}],
+            "bf-test-1",
         )
     )
 
     merged = json.loads((tmp_path / "sub2api" / "accounts.sub2api.json").read_text(encoding="utf-8"))
     assert merged["accounts"][0]["platform"] == "grok"
+    source_record = next(coordinators[0].kwargs["source"].records())
+    assert source_record.browser_fingerprint_id == "bf-test-1"
 
 
 def test_moemail_url_normalizes_ui_path():
@@ -268,6 +310,7 @@ def test_proxy_pool_file_rotates_and_normalizes(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(register, "PROXY_POOL_FILE", str(proxy_file))
     monkeypatch.setattr(register, "PROXY_POOL_STRATEGY", "round_robin")
+    monkeypatch.setattr(register, "PROXY_AUTO_CONFIG", register.ProxyAutoConfig(enabled=False))
     register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
 
     assert register._pick_grok_proxy() == "http://one.example:8080"
@@ -281,6 +324,8 @@ def test_proxy_pool_share_link_reuses_existing_relay_node(monkeypatch):
     calls = []
 
     monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_BUILTIN_ENABLED", False)
+    monkeypatch.setattr(register, "_proxy_relay_external_retry_at", 0)
     monkeypatch.setattr(register, "PROXY_RELAY_HOST", "127.0.0.1")
     monkeypatch.setattr(register, "PROXY_RELAY_PROXY_SCHEME", "auto")
     register._proxy_relay_link_cache.clear()
@@ -311,6 +356,8 @@ def test_proxy_pool_share_link_imports_via_relay(monkeypatch):
     calls = []
 
     monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_BUILTIN_ENABLED", False)
+    monkeypatch.setattr(register, "_proxy_relay_external_retry_at", 0)
     monkeypatch.setattr(register, "PROXY_RELAY_KERNEL", "auto")
     monkeypatch.setattr(register, "PROXY_RELAY_HOST", "127.0.0.1")
     monkeypatch.setattr(register, "PROXY_RELAY_PROXY_SCHEME", "auto")
@@ -334,6 +381,33 @@ def test_proxy_pool_share_link_imports_via_relay(monkeypatch):
     )
 
 
+def test_proxy_pool_share_link_falls_back_to_builtin_relay(monkeypatch):
+    link = "vless://node@example.test:443?encryption=none#relay"
+    external_calls = []
+    builtin_calls = []
+
+    monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_BUILTIN_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_KERNEL", "auto")
+    monkeypatch.setattr(register, "_proxy_relay_external_retry_at", 0)
+    register._proxy_relay_link_cache.clear()
+
+    def fake_relay_json(method, path, payload=None):
+        external_calls.append((method, path, payload))
+        raise RuntimeError("connection refused")
+
+    def fake_builtin_import(share_link, kernel="sing-box", local_port=""):
+        builtin_calls.append((share_link, kernel, local_port))
+        return "http://127.0.0.1:19080"
+
+    monkeypatch.setattr(register, "_proxy_relay_json", fake_relay_json)
+    monkeypatch.setattr(register, "_builtin_proxy_relay_import", fake_builtin_import)
+
+    assert register._normalize_proxy_line(link) == "http://127.0.0.1:19080"
+    assert external_calls == [("GET", "/api/state", None)]
+    assert builtin_calls == [(link, "sing-box", "")]
+
+
 def test_proxy_pool_retries_failed_share_link_after_retry_window(monkeypatch, tmp_path):
     proxy_file = tmp_path / "proxy.txt"
     proxy_file.write_text("vless://node@example.test:443#relay\n", encoding="utf-8")
@@ -341,6 +415,7 @@ def test_proxy_pool_retries_failed_share_link_after_retry_window(monkeypatch, tm
 
     monkeypatch.setattr(register, "PROXY_POOL_FILE", str(proxy_file))
     monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_AUTO_CONFIG", register.ProxyAutoConfig(enabled=False))
     monkeypatch.setattr(register, "PROXY_RELAY_RETRY_SEC", 30)
     monkeypatch.setattr(register, "PROXY_POOL_STRATEGY", "round_robin")
     register._proxy_pool_cache.update({"path": None, "mtime_ns": None, "items": (), "index": 0})
@@ -387,6 +462,123 @@ def test_proxy_pool_mixes_manual_and_auto_active_proxies(monkeypatch, tmp_path):
         items = register._load_proxy_pool_locked()
 
     assert items == ("http://manual.example:8080", "socks5://auto.example:1080")
+
+
+def test_proxy_pool_uses_tested_auto_pool_after_startup_validation(monkeypatch, tmp_path):
+    proxy_file = tmp_path / "proxy.txt"
+    proxy_file.write_text("http://manual-untested.example:8080\n", encoding="utf-8")
+    auto_dir = tmp_path / "auto"
+    auto_dir.mkdir()
+    (auto_dir / "active.txt").write_text("socks5://tested.example:1080\n", encoding="utf-8")
+
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", str(proxy_file))
+    monkeypatch.setattr(register, "PROXY_POOL_USE_TESTED_ONLY", True)
+    monkeypatch.setattr(register, "_proxy_auto_startup_validated", True)
+    monkeypatch.setattr(
+        register,
+        "PROXY_AUTO_CONFIG",
+        register.ProxyAutoConfig(
+            enabled=True,
+            output_dir=str(auto_dir),
+            active_file="active.txt",
+            export_formats=("raw",),
+        ),
+    )
+    register._proxy_pool_cache.update(
+        {"path": None, "mtime_ns": None, "auto_mtime_ns": None, "items": (), "index": 0}
+    )
+
+    with register._proxy_pool_lock:
+        items = register._load_proxy_pool_locked()
+
+    assert items == ("socks5://tested.example:1080",)
+
+
+def test_auto_bootstrap_skips_stale_builtin_relay_ports(monkeypatch, tmp_path):
+    auto_dir = tmp_path / "auto"
+    auto_dir.mkdir()
+    (auto_dir / "active.txt").write_text(
+        "\n".join(
+            [
+                "http://127.0.0.1:19080",
+                "http://real-proxy.example:8080",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(register, "PROXY_POOL_FILE", "")
+    monkeypatch.setattr(register, "PROXY_RELAY_HOST", "127.0.0.1")
+    monkeypatch.setattr(register, "PROXY_RELAY_START_PORT", 19080)
+    monkeypatch.setattr(
+        register,
+        "PROXY_AUTO_CONFIG",
+        register.ProxyAutoConfig(
+            enabled=True,
+            output_dir=str(auto_dir),
+            active_file="active.txt",
+            export_formats=("raw",),
+        ),
+    )
+    register._proxy_pool_cache.update(
+        {"path": None, "mtime_ns": None, "auto_mtime_ns": None, "items": (), "index": 0}
+    )
+
+    assert register._auto_bootstrap_proxies() == ["http://real-proxy.example:8080"]
+
+
+def test_proxy_auto_no_active_message_mentions_relay_failure(monkeypatch, tmp_path):
+    auto_dir = tmp_path / "auto"
+    auto_dir.mkdir()
+    config = register.ProxyAutoConfig(
+        enabled=True,
+        output_dir=str(auto_dir),
+        state_file="state.json",
+    )
+    config.state_path.write_text(
+        json.dumps({"error_summary": {"unsupported proxy": 5}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(register, "PROXY_AUTO_CONFIG", config)
+    monkeypatch.setattr(register, "PROXY_RELAY_ENABLED", True)
+    monkeypatch.setattr(register, "PROXY_RELAY_URL", "http://127.0.0.1:18080")
+
+    def fake_relay_json(method, path, payload=None):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(register, "_proxy_relay_json", fake_relay_json)
+
+    message = register._proxy_auto_no_active_message()
+
+    assert "unsupported proxy x5" in message
+    assert "proxy-relay is not reachable at http://127.0.0.1:18080" in message
+    assert "start proxy-relay" in message
+
+
+def test_prepare_auto_proxy_pool_before_start_logs_and_validates(monkeypatch, tmp_path):
+    auto_dir = tmp_path / "auto"
+    config = register.ProxyAutoConfig(
+        enabled=True,
+        output_dir=str(auto_dir),
+        active_file="active.txt",
+        test_urls=("https://accounts.x.ai/sign-up?redirect=grok-com",),
+    )
+    logs = []
+
+    monkeypatch.setattr(register, "PROXY_AUTO_CONFIG", config)
+    monkeypatch.setattr(register, "PROXY_AUTO_REQUIRE_ACTIVE", True)
+    monkeypatch.setattr(register, "PROXY_POOL_USE_TESTED_ONLY", True)
+    monkeypatch.setattr(register, "_proxy_auto_startup_validated", False)
+    monkeypatch.setattr(register, "_refresh_auto_proxy_pool_once", lambda: ["http://good.example:8080"])
+    monkeypatch.setattr(register, "_ensure_proxy_auto_manager_started", lambda: None)
+    monkeypatch.setattr(register, "log", logs.append)
+
+    asyncio.run(register._prepare_auto_proxy_pool_before_start())
+
+    assert register._proxy_auto_startup_validated is True
+    assert any("启动前拉取代理" in item for item in logs)
+    assert any("已优选 1 个" in item for item in logs)
 
 
 def test_relay_proxy_url_auto_uses_xray_socks(monkeypatch):
@@ -496,6 +688,120 @@ def test_email_http_request_always_mode_skips_requests(monkeypatch):
     response = register._email_post("https://mail.example.test/api/emails/generate")
 
     assert response.json() == {"transport": "post"}
+
+
+def test_cf_ares_request_uses_curl_fallback_when_package_is_incomplete(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        register,
+        "_cf_ares_get_client",
+        lambda proxy=None: (_ for _ in ()).throw(RuntimeError("cf-ares unavailable")),
+    )
+
+    def fake_curl(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return Response({"ok": True}, headers={"x": "1"})
+
+    monkeypatch.setattr(register, "_curl_cffi_request", fake_curl)
+
+    response = register._cf_ares_request(
+        "GET",
+        "https://accounts.x.ai/sign-up",
+        proxy="socks5://proxy.example:1080",
+        timeout=11,
+    )
+
+    assert response.json() == {"ok": True}
+    assert calls == [
+        (
+            "GET",
+            "https://accounts.x.ai/sign-up",
+            {"proxy": "socks5://proxy.example:1080", "timeout": 11},
+        )
+    ]
+
+
+def test_cf_ares_import_prefers_bundled_vendor(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        broken_root = tmp_path / "broken"
+        bundled_root = tmp_path / "vendor" / "CF-Ares"
+        (broken_root / "cf_ares").mkdir(parents=True)
+        (bundled_root / "cf_ares").mkdir(parents=True)
+        (broken_root / "cf_ares" / "__init__.py").write_text(
+            "raise ModuleNotFoundError('No module named cf_ares.engines')\n"
+        )
+        (bundled_root / "cf_ares" / "__init__.py").write_text(
+            "class AresClient:\n"
+            "    source = 'bundled'\n"
+        )
+
+        monkeypatch.setattr(sys, "path", [str(broken_root)] + list(sys.path))
+        monkeypatch.setattr(register, "CF_ARES_PATH", "")
+        monkeypatch.setattr(register, "CF_ARES_BUNDLED_PATH", bundled_root)
+        for name in list(sys.modules):
+            if name == "cf_ares" or name.startswith("cf_ares."):
+                monkeypatch.delitem(sys.modules, name, raising=False)
+
+        AresClient = register._cf_ares_client_class()
+
+        assert AresClient.source == "bundled"
+        assert sys.path[0] == str(bundled_root)
+
+
+def test_xai_http_request_retries_cf_ares_on_request_error(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(register, "CF_ARES_XAI_MODE", "fallback")
+    monkeypatch.setattr(
+        register.req,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("blocked")),
+    )
+
+    def fake_cf_ares(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return Response({}, headers={"grpc-status": "0"})
+
+    monkeypatch.setattr(register, "_cf_ares_request", fake_cf_ares)
+
+    response = register._xai_http_request(
+        "POST",
+        "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateEmailValidationCode",
+        data=b"body",
+        timeout=7,
+    )
+
+    assert response.headers["grpc-status"] == "0"
+    assert calls == [
+        (
+            "POST",
+            "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateEmailValidationCode",
+            {"data": b"body", "timeout": 7},
+        )
+    ]
+
+
+def test_grpc_create_code_can_use_xai_cf_ares_transport(monkeypatch):
+    calls = []
+    page = FakePage()
+
+    monkeypatch.setattr(register, "CF_ARES_XAI_MODE", "always")
+
+    async def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return Response({}, headers={"grpc-status": "0"})
+
+    monkeypatch.setattr(register, "_xai_http_request_async", fake_request)
+
+    ok = asyncio.run(register.grpc_create_code(page, "user@example.test"))
+
+    assert ok is True
+    assert not page.evaluations
+    assert calls[0][0] == "POST"
+    assert calls[0][1].endswith("/auth_mgmt.AuthManagement/CreateEmailValidationCode")
+    assert calls[0][2]["page"] is page
 
 
 class FakePage:
@@ -632,6 +938,9 @@ class FakeBrowser:
         self.pages = []
         self.contexts = []
         self.context = types.SimpleNamespace(request=object())
+        self.closed = False
+        self.close_calls = 0
+        self.close_error = None
 
     async def new_page(self):
         page = FakePage(self.context)
@@ -642,6 +951,12 @@ class FakeBrowser:
         context = FakeContext(**kwargs)
         self.contexts.append(context)
         return context
+
+    async def close(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
 
 
 class FakePair:
@@ -702,6 +1017,8 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self._old_c_set_cookie_via_request = getattr(register, "C_SET_COOKIE_VIA_REQUEST", None)
         self._old_log_mode = getattr(register, "REGISTER_LOG_MODE", None)
         self._old_rate_limit_circuit = register.REGISTRATION_RATE_LIMIT_CIRCUIT
+        self._old_cf_ares_xai_mode = getattr(register, "CF_ARES_XAI_MODE", None)
+        register.CF_ARES_XAI_MODE = "0"
 
     async def asyncTearDown(self):
         if hasattr(register, "_close_c_hot_page_pool"):
@@ -735,6 +1052,32 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         elif self._old_log_mode is not None:
             register.REGISTER_LOG_MODE = self._old_log_mode
         register.REGISTRATION_RATE_LIMIT_CIRCUIT = self._old_rate_limit_circuit
+        if self._old_cf_ares_xai_mode is None and hasattr(register, "CF_ARES_XAI_MODE"):
+            delattr(register, "CF_ARES_XAI_MODE")
+        elif self._old_cf_ares_xai_mode is not None:
+            register.CF_ARES_XAI_MODE = self._old_cf_ares_xai_mode
+
+    async def test_close_browser_safely_ignores_driver_disconnect(self):
+        messages = []
+        browser = FakeBrowser()
+        browser.close_error = Exception("Connection closed while reading from the driver")
+
+        register.REGISTER_LOG_MODE = "debug"
+        register.log = messages.append
+
+        await register._close_browser_safely(browser)
+
+        self.assertEqual(browser.close_calls, 1)
+        self.assertTrue(any("browser close ignored: Exception" in msg for msg in messages))
+
+    async def test_close_browser_safely_preserves_cancellation(self):
+        browser = FakeBrowser()
+        browser.close_error = asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await register._close_browser_safely(browser)
+
+        self.assertEqual(browser.close_calls, 1)
 
     async def test_c_worker_timeout_releases_physical_and_pair_and_counts_failure(self):
         async def slow_verify(*_args, **_kwargs):
@@ -888,6 +1231,51 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             context.request_get_calls,
             [{"url": "https://auth.grokipedia.com/set-cookie?q=abc", "timeout": 15000}],
         )
+
+    async def test_server_action_can_use_xai_cf_ares_transport(self):
+        page = FakePage()
+        context = FakeContext()
+        page.context = context
+        calls = []
+
+        old_mode = register.CF_ARES_XAI_MODE
+        old_request = register._xai_http_request_async
+        old_state = register.STATE_TREE
+        old_action = register.ACTION_ID
+        try:
+            register.CF_ARES_XAI_MODE = "always"
+            register.STATE_TREE = "state"
+            register.ACTION_ID = "action"
+
+            async def fake_request(method, url, **kwargs):
+                calls.append((method, url, kwargs))
+                if method == "POST":
+                    return Response(
+                        {},
+                        text='0:"https:\\/\\/auth.grokipedia.com\\/set-cookie?q=abc"1:',
+                    )
+                return Response(
+                    {},
+                    headers={"set-cookie": "sso=" + ("y" * 152) + "; Path=/; Secure; HttpOnly"},
+                    cookies={"sso": "y" * 152},
+                )
+
+            register._xai_http_request_async = fake_request
+
+            sso = await register.server_action_register(
+                page, "e@example.test", "pw", "123456", "token"
+            )
+        finally:
+            register.CF_ARES_XAI_MODE = old_mode
+            register._xai_http_request_async = old_request
+            register.STATE_TREE = old_state
+            register.ACTION_ID = old_action
+
+        self.assertEqual(sso, "y" * 152)
+        self.assertEqual(page.goto_calls, [])
+        self.assertEqual(context.request_get_calls, [])
+        self.assertEqual(calls[0][0], "POST")
+        self.assertEqual(calls[1][0], "GET")
 
     async def test_server_action_raises_a_distinct_error_for_a_rate_limited_signup_page(self):
         page = FakePage()
@@ -1100,6 +1488,7 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(roomy[2], register.Q_PENDING_CAP + 2)
         self.assertEqual(roomy[3], 10)
         self.assertEqual(tight[0], 1)
+        self.assertEqual(tight[2], 2)
 
     async def test_default_auto_capacity_is_conservative(self):
         physical, s_workers, _p_workers, c_workers = register.derive_capacity(
@@ -1111,6 +1500,11 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(physical, 4)
         self.assertEqual(s_workers, 6)
         self.assertEqual(c_workers, 6)
+
+    async def test_p_batch_max_is_bounded_by_physical_capacity(self):
+        self.assertEqual(register.derive_p_batch_max(1, configured=4), 1)
+        self.assertEqual(register.derive_p_batch_max(3, configured=4), 3)
+        self.assertEqual(register.derive_p_batch_max(8, configured=4), 4)
 
     async def test_explicit_physical_cap_overrides_auto_capacity(self):
         physical, s_workers, _p_workers, c_workers = register.derive_capacity(
@@ -1178,10 +1572,19 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             t_target=4,
             q_target=4,
         )
+        low = register.derive_admission_watermarks(
+            physical_cap=1,
+            t_slot_cap=8,
+            q_pending_cap=12,
+            t_target=4,
+            q_target=4,
+        )
 
         self.assertEqual(watermarks["t_high"], 6)
         self.assertEqual(watermarks["t_low"], 3)
         self.assertEqual(bounded["t_high"], 8)
+        self.assertEqual(low["t_high"], 1)
+        self.assertEqual(low["t_low"], 0)
 
     async def test_admission_t_high_override_remains_explicit(self):
         watermarks = register.derive_admission_watermarks(
@@ -1217,7 +1620,7 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             4,
         )
 
-    async def test_send_q_request_batch_reuses_one_page_for_multiple_emails(self):
+    async def test_send_q_request_batch_uses_account_fingerprint_per_email(self):
         emails = []
 
         async def fake_create_code(_page, email):
@@ -1229,9 +1632,24 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         physical_sem = asyncio.Semaphore(1)
         p_send_sem = asyncio.Semaphore(1)
         requests = [
-            {"handle": "h1", "email": "a@example.test", "password": "pw1"},
-            {"handle": "h2", "email": "b@example.test", "password": "pw2"},
-            {"handle": "h3", "email": "c@example.test", "password": "pw3"},
+            {
+                "handle": "h1",
+                "email": "a@example.test",
+                "password": "pw1",
+                "browser_fingerprint_id": "bf-account-a",
+            },
+            {
+                "handle": "h2",
+                "email": "b@example.test",
+                "password": "pw2",
+                "browser_fingerprint_id": "bf-account-b",
+            },
+            {
+                "handle": "h3",
+                "email": "c@example.test",
+                "password": "pw3",
+                "browser_fingerprint_id": "bf-account-c",
+            },
         ]
 
         results = await register._send_q_request_batch(
@@ -1240,8 +1658,15 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(emails, [item["email"] for item in requests])
         self.assertEqual([item["sent"] for item in results], [True, True, True])
-        self.assertEqual(len(browser.pages), 1)
-        self.assertTrue(browser.pages[0].closed)
+        self.assertEqual(len(browser.contexts), 3)
+        self.assertEqual(
+            [context.kwargs for context in browser.contexts],
+            [
+                register.browser_context_options(item["browser_fingerprint_id"])
+                for item in requests
+            ],
+        )
+        self.assertTrue(all(context.closed for context in browser.contexts))
         self.assertEqual(physical_sem._value, 1)
         self.assertEqual(p_send_sem._value, 1)
 
@@ -1290,6 +1715,22 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             register._pick_grok_proxy = old_pick
 
+    async def test_new_grok_page_uses_account_browser_fingerprint_context(self):
+        browser = FakeBrowser()
+
+        context, page = await register._new_grok_page(
+            browser,
+            proxy="",
+            browser_fingerprint_id="bf-account-a",
+        )
+
+        self.assertIs(context, browser.contexts[0])
+        self.assertIs(page, browser.contexts[0].pages[0])
+        self.assertEqual(
+            browser.contexts[0].kwargs,
+            register.browser_context_options("bf-account-a"),
+        )
+
     async def test_poll_and_admit_q_resends_code_before_admitting(self):
         old_pick = register._pick_grok_proxy
         old_timeout = register.P_REQUEST_TIMEOUT
@@ -1319,7 +1760,12 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             inventory = FakeQInventory()
 
             admitted = await register._poll_and_admit_q(
-                {"handle": "h1", "email": "a@example.test", "password": "pw"},
+                {
+                    "handle": "h1",
+                    "email": "a@example.test",
+                    "password": "pw",
+                    "browser_fingerprint_id": "bf-account-a",
+                },
                 inventory,
                 q_pending_sem,
                 q_slot_sem,
@@ -1335,6 +1781,10 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(metrics.q_sent, 1)
             self.assertEqual(q_pending_sem._value, 1)
             self.assertEqual(inventory.q_items[0].value["code"], "123456")
+            self.assertEqual(
+                inventory.q_items[0].value["browser_fingerprint_id"],
+                "bf-account-a",
+            )
         finally:
             register._pick_grok_proxy = old_pick
             register.P_REQUEST_TIMEOUT = old_timeout
@@ -1855,6 +2305,144 @@ class RegisterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(register.SOLVER_MOUSE_CLICK_INTERVAL_MS, 600)
         self.assertEqual(register.PAGE_GOTO_WAIT_UNTIL, "domcontentloaded")
         self.assertEqual(register.PAGE_POST_WAIT_MS, 500)
+        self.assertEqual(register.TURNSTILE_SOLVER, "d3vin")
+
+    def test_turnstile_api_result_state_theyka_formats(self):
+        self.assertEqual(
+            register._turnstile_api_result_state("CAPTCHA_NOT_READY"),
+            ("pending", None),
+        )
+        self.assertEqual(
+            register._turnstile_api_result_state({"value": "CAPTCHA_FAIL", "elapsed_time": 1.0}),
+            ("failed", None),
+        )
+        state, token = register._turnstile_api_result_state(
+            {"value": "0.KBtT-r" + "x" * 20, "elapsed_time": 7.6}
+        )
+        self.assertEqual(state, "ready")
+        self.assertTrue(token.startswith("0.KBtT-r"))
+
+    def test_turnstile_api_result_state_d3vin_formats(self):
+        self.assertEqual(
+            register._turnstile_api_result_state({"status": "processing"}),
+            ("pending", None),
+        )
+        self.assertEqual(
+            register._turnstile_api_result_state(
+                {"status": "error", "errorCode": "ERROR_CAPTCHA_UNSOLVABLE"}
+            ),
+            ("failed", None),
+        )
+        state, token = register._turnstile_api_result_state(
+            {
+                "status": "ready",
+                "solution": {"token": "0.token-from-d3vin-solver-abcdef"},
+                "elapsed_time": 8.1,
+            }
+        )
+        self.assertEqual(state, "ready")
+        self.assertEqual(token, "0.token-from-d3vin-solver-abcdef")
+
+    def test_turnstile_api_task_id_aliases(self):
+        self.assertEqual(
+            register._turnstile_api_task_id({"task_id": "abc"}),
+            "abc",
+        )
+        self.assertEqual(
+            register._turnstile_api_task_id({"taskId": "def"}),
+            "def",
+        )
+        self.assertIsNone(register._turnstile_api_task_id({"status": "error"}))
+
+    async def test_solve_one_turnstile_via_api_success(self):
+        class FakeResp:
+            def __init__(self, status_code, payload=None, text=""):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = text if text else ("" if payload is None else "")
+
+            def json(self):
+                if self._payload is None:
+                    raise ValueError("no json")
+                return self._payload
+
+        calls = []
+
+        def fake_get(url, timeout):
+            calls.append(url)
+            if "/turnstile?" in url:
+                return FakeResp(202, {"task_id": "tid-1"})
+            return FakeResp(
+                200,
+                {"value": "0.solved-token-value-long-enough", "elapsed_time": 3.2},
+            )
+
+        old_site = register.SITE_KEY
+        old_url = register.TURNSTILE_API_URL
+        old_interval = register.TURNSTILE_API_POLL_INTERVAL_MS
+        old_timeout = register.TURNSTILE_API_TIMEOUT
+        old_http = register._turnstile_api_http_get
+        old_sleep = register.asyncio.sleep
+        try:
+            register.SITE_KEY = "0x4AAAAAAAtestkey"
+            register.TURNSTILE_API_URL = "http://127.0.0.1:5000"
+            register.TURNSTILE_API_POLL_INTERVAL_MS = 10
+            register.TURNSTILE_API_TIMEOUT = 30
+            register._turnstile_api_http_get = fake_get
+
+            async def no_sleep(_s):
+                return None
+
+            register.asyncio.sleep = no_sleep
+            token, trace = await register.solve_one_turnstile_via_api()
+        finally:
+            register.SITE_KEY = old_site
+            register.TURNSTILE_API_URL = old_url
+            register.TURNSTILE_API_POLL_INTERVAL_MS = old_interval
+            register.TURNSTILE_API_TIMEOUT = old_timeout
+            register._turnstile_api_http_get = old_http
+            register.asyncio.sleep = old_sleep
+
+        self.assertEqual(token, "0.solved-token-value-long-enough")
+        self.assertEqual(trace["backend"], "api")
+        self.assertEqual(trace["task_id"], "tid-1")
+        self.assertTrue(any("/turnstile?" in u for u in calls))
+        self.assertTrue(any("/result?id=tid-1" in u for u in calls))
+
+    async def test_solve_one_turnstile_dispatches_to_api_backend(self):
+        called = []
+
+        async def fake_api():
+            called.append("api")
+            return "api-token-value", {"backend": "api"}
+
+        async def fake_start(*_a, **_k):
+            called.append("local")
+            return {"page": object()}
+
+        async def fake_wait(_item):
+            return "local-token"
+
+        old_backend = register.TURNSTILE_SOLVER
+        old_api = register.solve_one_turnstile_via_api
+        old_start = register._start_turnstile_challenge
+        old_wait = register._wait_turnstile_challenge
+        try:
+            for backend in ("api", "d3vin", "theyka"):
+                called.clear()
+                register.TURNSTILE_SOLVER = backend
+                register.solve_one_turnstile_via_api = fake_api
+                register._start_turnstile_challenge = fake_start
+                register._wait_turnstile_challenge = fake_wait
+                token, trace = await register.solve_one_turnstile_with_trace(object())
+                self.assertEqual(token, "api-token-value")
+                self.assertEqual(trace.get("backend"), "api")
+                self.assertEqual(called, ["api"])
+        finally:
+            register.TURNSTILE_SOLVER = old_backend
+            register.solve_one_turnstile_via_api = old_api
+            register._start_turnstile_challenge = old_start
+            register._wait_turnstile_challenge = old_wait
 
 
 if __name__ == "__main__":

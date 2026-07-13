@@ -1,9 +1,12 @@
 #!/bin/bash
-# 一键启动:自动装依赖 → 引导配置 → 运行
+# 一键启动:自动装依赖 → 校验 Python+Go+Rust → 引导配置 → 运行
+# 硬性条件: 必须同时具备 Python venv、Go workers、Rust inventory-worker
 # 用法:
 #   bash start.sh              # 首次会引导选模式,之后直接启动
+#   bash start.sh --dashboard  # Web 控制面板
 #   bash start.sh --reconfig   # 重新选择邮箱模式
 #   bash start.sh --debug      # 保留完整调试面板
+#   bash scripts/polyglot_gate.sh check
 set -e
 cd "$(dirname "$0")"
 
@@ -22,6 +25,35 @@ if [ "${1:-}" = "--email-service" ]; then
     fi
     echo "[*] 启动邮箱服务... (Ctrl-C 停止)"
     exec .venv/bin/python -m grok_register.email_server "$@"
+fi
+
+if [ "${1:-}" = "--turnstile-solver" ]; then
+    shift
+    action="${1:-start}"
+    if [ "$#" -gt 0 ]; then
+        shift
+    fi
+    case "$action" in
+        start|stop|status|install)
+            exec .venv/bin/python -m grok_register.turnstile_solver "$action" "$@"
+            ;;
+        *)
+            # allow: bash start.sh --turnstile-solver  (default start)
+            # or pass-through unknown as start args
+            exec .venv/bin/python -m grok_register.turnstile_solver start "$action" "$@"
+            ;;
+    esac
+fi
+
+if [ "${1:-}" = "--scrape-proxies" ]; then
+    shift
+    exec .venv/bin/python -m grok_register.proxy_scraper scrape "$@"
+fi
+
+if [ "${1:-}" = "--dashboard" ]; then
+    shift
+    echo "[*] 启动 Web 控制面板... (默认 http://127.0.0.1:8787/)"
+    exec .venv/bin/python -m grok_register.dashboard "$@"
 fi
 
 reconfig=0
@@ -107,15 +139,20 @@ KEY_EXPORT_FORMATS=${key_export_formats}
 # 代理池:仅用于 Grok/xAI 链路;在项目目录创建 代理.txt,一行一个 http/socks5 代理或节点分享链接
 # PROXY_POOL_FILE=代理.txt
 # PROXY_POOL_STRATEGY=round_robin
-# 分享链接需本机 proxy-relay 服务,默认 http://127.0.0.1:18080
+# 分享链接会优先交给本项目内置 sing-box relay 转成本地代理;也兼容外部 proxy-relay
 # PROXY_RELAY_URL=http://127.0.0.1:18080
+# PROXY_RELAY_BUILTIN_ENABLED=1
+# PROXY_RELAY_AUTO_INSTALL=1
 # 可选:自动拉取订阅并多线程测试可访问 xAI 的代理,默认每20分钟刷新
 # PROXY_AUTO_FETCH_ENABLED=0
 # PROXY_AUTO_FETCH_SOURCES_FILE=proxy-sources.txt
 # PROXY_AUTO_FETCH_WORKERS=8
 # PROXY_AUTO_TEST_WORKERS=16
-# 可选:CF-Ares 已随默认依赖安装;开启后可做邮箱 HTTP Cloudflare 兜底
+# PROXY_AUTO_REQUIRE_ACTIVE=1
+# PROXY_POOL_USE_TESTED_ONLY=1
+# 可选:CF-Ares 已内置在 vendor/CF-Ares;开启后可做邮箱/xAI HTTP Cloudflare 兜底
 # CF_ARES_EMAIL=fallback
+# CF_ARES_XAI=fallback
 # CF_ARES_PATH=
 # CSP 容量(可选,0=按 CPU/内存启动期静态派生)
 # PHYSICAL_CAP=0
@@ -130,6 +167,30 @@ KEY_EXPORT_DIR=keys
 KEY_EXPORT_FORMATS=${key_export_formats}
 ENV
     fi
+    cat >> .env <<ENV
+PROXY_POOL_FILE=代理.txt
+PROXY_POOL_STRATEGY=random
+PROXY_RELAY_ENABLED=1
+PROXY_RELAY_BUILTIN_ENABLED=1
+PROXY_RELAY_AUTO_INSTALL=1
+PROXY_RELAY_WORK_DIR=logs/proxy-relay
+PROXY_RELAY_MAX_NODES=48
+PROXY_AUTO_FETCH_ENABLED=1
+PROXY_AUTO_FETCH_SOURCES_FILE=proxy-sources.txt
+PROXY_AUTO_FETCH_WORKERS=16
+PROXY_AUTO_TEST_WORKERS=32
+PROXY_AUTO_TEST_TIMEOUT=6
+PROXY_AUTO_TEST_ACCEPT_STATUS=200-399
+PROXY_AUTO_MAX_ACTIVE=3
+PROXY_AUTO_EXPORT_FORMATS=raw,sub2api,cpa
+PROXY_AUTO_REQUIRE_ACTIVE=1
+PROXY_AUTO_INCLUDE_BOOTSTRAP_CANDIDATES=1
+PROXY_POOL_USE_TESTED_ONLY=1
+CF_ARES_EMAIL=fallback
+CF_ARES_XAI=fallback
+CF_ARES_BROWSER_ENGINE=auto
+CF_ARES_HEADLESS=1
+ENV
     echo "[*] 已写入 .env"
 fi
 

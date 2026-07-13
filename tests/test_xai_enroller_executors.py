@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from xai_enroller.executors import HTTPProbeExecutor, PlaywrightExecutor
+from xai_enroller.fingerprints import browser_context_options
 from xai_enroller.models import AuthorizationStatus, DeviceFlow, SourceRecord
 
 
@@ -79,10 +80,11 @@ class FakePage:
 
 
 class FakeContext:
-    def __init__(self):
+    def __init__(self, **kwargs):
         self.cookies = []
         self.page = FakePage()
         self.closed = False
+        self.kwargs = kwargs
 
     async def add_cookies(self, cookies):
         self.cookies.extend(cookies)
@@ -100,8 +102,8 @@ class FakeBrowser:
         self.contexts = []
         self.closed = False
 
-    async def new_context(self):
-        context = FakeContext()
+    async def new_context(self, **kwargs):
+        context = FakeContext(**kwargs)
         self.contexts.append(context)
         return context
 
@@ -177,6 +179,19 @@ def test_playwright_executor_isolates_context_and_scopes_exact_cookie():
     assert context.page.closed
     assert context.closed
     assert factory.browser.closed
+
+
+def test_playwright_executor_uses_source_browser_fingerprint_context():
+    factory = FakePlaywrightFactory()
+    executor = PlaywrightExecutor(playwright_factory=factory)
+    source = SourceRecord("source", "secret-token", (), "bf-account-a")
+    flow = DeviceFlow("device", "ABCD", "https://accounts.x.ai/oauth2/device", 60, 1)
+
+    result = asyncio.run(executor.confirm(source, flow))
+    asyncio.run(executor.close())
+
+    assert result.status is AuthorizationStatus.AUTHORIZED
+    assert factory.browser.contexts[0].kwargs == browser_context_options("bf-account-a")
 
 
 def test_playwright_executor_closes_context_when_page_creation_fails():

@@ -22,6 +22,7 @@ COOKIE_FIELDS = frozenset(
         "sameSite",
     }
 )
+FINGERPRINTS_FILENAME = "browser-fingerprints.json"
 MAX_RECORD_BYTES = 256 * 1024
 LEGACY_COOKIE_SCOPE = {
     "name": "sso",
@@ -68,7 +69,49 @@ def _decode_json_line(raw, label):
         except UnicodeEncodeError as exc:
             raise ValueError(f"invalid {label} record") from exc
         normalized.append(filtered)
-    return {"email": email, "cookies": normalized}
+    result = {"email": email, "cookies": normalized}
+    browser_fingerprint_id = document.get("browser_fingerprint_id")
+    if browser_fingerprint_id is not None:
+        if not isinstance(browser_fingerprint_id, str) or not browser_fingerprint_id:
+            raise ValueError(f"invalid {label} record")
+        try:
+            browser_fingerprint_id.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"invalid {label} record") from exc
+        result["browser_fingerprint_id"] = browser_fingerprint_id
+    return result
+
+
+def _load_browser_fingerprints(path):
+    if not path.exists():
+        return {}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    accounts = document.get("accounts") if isinstance(document, dict) else None
+    if not isinstance(accounts, dict):
+        return {}
+    fingerprints = {}
+    for email, record in accounts.items():
+        if not isinstance(email, str):
+            continue
+        if isinstance(record, dict):
+            browser_fingerprint_id = record.get("browser_fingerprint_id")
+        else:
+            browser_fingerprint_id = record
+        if isinstance(browser_fingerprint_id, str) and browser_fingerprint_id:
+            fingerprints[email.strip().lower()] = browser_fingerprint_id
+    return fingerprints
+
+
+def _attach_browser_fingerprint(document, fingerprints):
+    if document.get("browser_fingerprint_id"):
+        return document
+    browser_fingerprint_id = fingerprints.get(document["email"].strip().lower())
+    if not browser_fingerprint_id:
+        return document
+    return {**document, "browser_fingerprint_id": browser_fingerprint_id}
 
 
 def _complete_lines(data):
@@ -84,17 +127,19 @@ def _read_complete_file(path):
     return [line for line in lines if line]
 
 
-def load_snapshots(path, *, raw_lines=None):
+def load_snapshots(path, *, raw_lines=None, fingerprints=None):
     snapshots = {}
     scopes = {}
+    fingerprints = fingerprints or {}
     lines = _read_complete_file(path) if raw_lines is None else raw_lines
     for line in lines:
         document = _decode_json_line(line, "session")
+        document = _attach_browser_fingerprint(document, fingerprints)
         email = document["email"]
         cookies = document["cookies"]
         if email in snapshots:
             continue
-        snapshots[email] = {"email": email, "cookies": cookies}
+        snapshots[email] = document
         for cookie in cookies:
             name = cookie.get("name")
             domain = cookie.get("domain")
@@ -111,7 +156,12 @@ def load_snapshots(path, *, raw_lines=None):
 
 
 def export_sessions(sessions_path, accounts_path, *, session_lines=None):
-    snapshots, scopes = load_snapshots(sessions_path, raw_lines=session_lines)
+    fingerprints = _load_browser_fingerprints(sessions_path.parent / FINGERPRINTS_FILENAME)
+    snapshots, scopes = load_snapshots(
+        sessions_path,
+        raw_lines=session_lines,
+        fingerprints=fingerprints,
+    )
     for document in snapshots.values():
         yield document
     if not accounts_path.exists():
@@ -125,7 +175,10 @@ def export_sessions(sessions_path, accounts_path, *, session_lines=None):
         if not email or not sso or email in snapshots:
             continue
         cookies = [{**scope, "value": sso} for scope in legacy_scopes]
-        yield {"email": email, "cookies": cookies}
+        yield _attach_browser_fingerprint(
+            {"email": email, "cookies": cookies},
+            fingerprints,
+        )
 
 
 def _write_document(document):
@@ -165,7 +218,13 @@ def export_and_follow(sessions_path, accounts_path, *, poll_seconds=0.25):
                     raise ValueError("invalid session record")
                 for raw in complete:
                     if raw:
-                        _write_document(_decode_json_line(raw, "session"))
+                        document = _decode_json_line(raw, "session")
+                        fingerprints = _load_browser_fingerprints(
+                            sessions_path.parent / FINGERPRINTS_FILENAME
+                        )
+                        _write_document(
+                            _attach_browser_fingerprint(document, fingerprints)
+                        )
                 sys.stdout.flush()
                 continue
 

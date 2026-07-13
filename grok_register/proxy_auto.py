@@ -80,6 +80,7 @@ class ProxyAutoConfig:
     max_candidates: int = 0
     max_active: int = 0
     source_list_depth: int = 1
+    include_bootstrap_candidates: bool = True
 
     @classmethod
     def from_env(cls, env=os.environ):
@@ -111,6 +112,11 @@ class ProxyAutoConfig:
             max_candidates=max(0, _env_int(env, "PROXY_AUTO_MAX_CANDIDATES", 0)),
             max_active=max(0, _env_int(env, "PROXY_AUTO_MAX_ACTIVE", 0)),
             source_list_depth=max(0, _env_int(env, "PROXY_AUTO_SOURCE_LIST_DEPTH", 1)),
+            include_bootstrap_candidates=_env_bool(
+                env,
+                "PROXY_AUTO_INCLUDE_BOOTSTRAP_CANDIDATES",
+                True,
+            ),
         )
 
     @property
@@ -183,15 +189,18 @@ class ProxyAutoManager:
         config: ProxyAutoConfig,
         normalize_proxy: Callable[[str], str | None],
         bootstrap_proxies: Callable[[], Iterable[str]] | None = None,
+        cleanup_proxy: Callable[[str, str | None, bool], None] | None = None,
         logger: Callable[[str], None] | None = None,
     ):
         self.config = config
         self.normalize_proxy = normalize_proxy
         self.bootstrap_proxies = bootstrap_proxies or (lambda: ())
+        self.cleanup_proxy = cleanup_proxy or (lambda _candidate, _proxy, _ok: None)
         self.logger = logger or (lambda _msg: None)
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._refresh_lock = threading.Lock()
+        self._last_refresh_at = 0.0
 
     def start(self):
         if not self.config.enabled:
@@ -207,35 +216,68 @@ class ProxyAutoManager:
 
     def _run(self):
         while not self._stop.is_set():
+            if self._last_refresh_at > 0:
+                elapsed = time.monotonic() - self._last_refresh_at
+                wait_for = max(0, max(1, self.config.interval_sec) - elapsed)
+                if wait_for and self._stop.wait(wait_for):
+                    break
             try:
                 self.refresh_once()
             except Exception as exc:
+                self._last_refresh_at = time.monotonic()
                 self.logger(f"[proxy-auto] refresh failed: {exc}")
-            self._stop.wait(max(1, self.config.interval_sec))
 
     def refresh_once(self):
         if not self.config.enabled:
             return []
         if not self._refresh_lock.acquire(blocking=False):
+            self._last_refresh_at = time.monotonic()
             return []
         try:
             previous_active = load_active_proxies(self.config)
+            previous_candidates = load_previous_candidates(self.config)
             bootstrap = list(_unique(list(self.bootstrap_proxies()) + previous_active))
             bodies = fetch_source_bodies(self.config, bootstrap)
-            candidates = list(previous_active)
+            candidates = list(previous_candidates or previous_active)
+            if self.config.include_bootstrap_candidates:
+                candidates.extend(bootstrap)
             for body in bodies:
-                candidates.extend(extract_nodes_from_text(body.text))
+                # share links + free-proxy host:port lines
+                candidates.extend(extract_candidates_from_text(body.text))
+            # Optional: candidates produced by proxy_scraper (public free lists).
+            # Disable with PROXY_SCRAPER_MERGE=0 (tests should set this when isolating).
+            if _env_bool(os.environ, "PROXY_SCRAPER_MERGE", True):
+                scraper_file = (
+                    os.environ.get("PROXY_SCRAPER_OUT") or "logs/proxy-scraper-candidates.txt"
+                ).strip()
+                if scraper_file:
+                    try:
+                        scraper_path = Path(scraper_file).expanduser()
+                        if not scraper_path.is_absolute():
+                            scraper_path = Path.cwd() / scraper_path
+                        for line in scraper_path.read_text(encoding="utf-8").splitlines():
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                candidates.append(line)
+                    except OSError:
+                        pass
             candidates = list(_unique(candidates))
             if self.config.max_candidates:
                 candidates = candidates[: self.config.max_candidates]
 
-            results = test_candidates(self.config, candidates, self.normalize_proxy)
+            results = test_candidates(
+                self.config,
+                candidates,
+                self.normalize_proxy,
+                cleanup_proxy=self.cleanup_proxy,
+            )
             active = [item for item in results if item.ok and item.proxy]
-            active.sort(key=lambda item: item.latency_ms if item.latency_ms is not None else 10**9)
+            active.sort(key=_proxy_result_sort_key)
             if self.config.max_active:
                 active = active[: self.config.max_active]
             proxies = list(_unique(item.proxy for item in active if item.proxy))
-            write_outputs(self.config, active)
+            write_outputs(self.config, results)
+            self._last_refresh_at = time.monotonic()
             self.logger(
                 f"[proxy-auto] sources={len(bodies)} candidates={len(candidates)} active={len(proxies)}"
             )
@@ -253,6 +295,24 @@ def load_active_proxies(config: ProxyAutoConfig):
         ]
     except OSError:
         return []
+
+
+def load_previous_candidates(config: ProxyAutoConfig):
+    try:
+        state = json.loads(config.state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    proxies = state.get("proxies") if isinstance(state, dict) else None
+    if not isinstance(proxies, list):
+        return []
+    candidates = []
+    for item in proxies:
+        if not isinstance(item, dict):
+            continue
+        candidate = str(item.get("candidate") or "").strip()
+        proxy = str(item.get("proxy") or "").strip()
+        candidates.append(candidate or proxy)
+    return list(_unique(candidates))
 
 
 def fetch_source_bodies(
@@ -328,23 +388,67 @@ def extract_nodes_from_text(text: str):
     return list(_unique(seen))
 
 
+def extract_candidates_from_text(text: str, *, default_scheme: str = "http"):
+    """Extract share links + bare host:port proxies for free-proxy lists."""
+    nodes = extract_nodes_from_text(text)
+    bare = extract_bare_host_ports(text, default_scheme=default_scheme)
+    return list(_unique(list(nodes) + list(bare)))
+
+
 def test_candidates(
     config: ProxyAutoConfig,
     candidates: Iterable[str],
     normalize_proxy: Callable[[str], str | None],
+    cleanup_proxy: Callable[[str, str | None, bool], None] | None = None,
     request_get: Callable[[str, str | None, int, dict[str, str]], object] | None = None,
 ):
     candidates = list(_unique(candidates))
     if not candidates:
         return []
 
+    # Prefer Go proxy-worker for bulk HTTP/SOCKS testing when available.
+    # Custom request_get (unit tests) always uses the Python path.
+    engine = (os.environ.get("PROXY_WORKER_ENGINE") or "auto").strip().lower()
+    if request_get is None and engine in {"auto", "go"}:
+        go_results = _test_candidates_via_go(config, candidates, normalize_proxy)
+        if go_results is not None:
+            if cleanup_proxy:
+                for result in go_results:
+                    try:
+                        cleanup_proxy(result.candidate, result.proxy, result.ok)
+                    except Exception:
+                        pass
+            return go_results
+        if engine == "go":
+            # Forced Go but unavailable/failed — fall through only if auto would;
+            # for explicit go we still fall back so registration does not die.
+            pass
+
+    return _test_candidates_python(
+        config,
+        candidates,
+        normalize_proxy,
+        cleanup_proxy=cleanup_proxy,
+        request_get=request_get,
+    )
+
+
+def _test_candidates_python(
+    config: ProxyAutoConfig,
+    candidates: list[str],
+    normalize_proxy: Callable[[str], str | None],
+    cleanup_proxy: Callable[[str, str | None, bool], None] | None = None,
+    request_get: Callable[[str, str | None, int, dict[str, str]], object] | None = None,
+):
     def run(candidate):
         started = time.monotonic()
         proxy = None
+        result = None
         try:
             proxy = normalize_proxy(candidate)
             if not proxy:
-                return ProxyTestResult(candidate, None, False, error="unsupported proxy")
+                result = ProxyTestResult(candidate, None, False, error="unsupported proxy")
+                return result
             status_code = None
             for url in config.test_urls:
                 response = _request_get(
@@ -356,7 +460,7 @@ def test_candidates(
                 )
                 status_code = getattr(response, "status_code", None)
                 if status_code is None or not _status_allowed(int(status_code), config.accept_status):
-                    return ProxyTestResult(
+                    result = ProxyTestResult(
                         candidate,
                         proxy,
                         False,
@@ -364,30 +468,201 @@ def test_candidates(
                         status_code=status_code,
                         error=f"status {status_code}",
                     )
-            return ProxyTestResult(
+                    return result
+            result = ProxyTestResult(
                 candidate,
                 proxy,
                 True,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 status_code=status_code,
             )
+            return result
         except Exception as exc:
-            return ProxyTestResult(
+            result = ProxyTestResult(
                 candidate,
                 proxy,
                 False,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 error=str(exc),
             )
+            return result
+        finally:
+            if cleanup_proxy and result is not None:
+                try:
+                    cleanup_proxy(candidate, proxy, result.ok)
+                except Exception:
+                    pass
+
+    results = []
+    stop_after_active = max(0, int(config.max_active or 0))
+    active_count = 0
+    pending_candidates = iter(candidates)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=config.test_workers) as executor:
-        futures = [executor.submit(run, candidate) for candidate in candidates]
-        return [future.result() for future in concurrent.futures.as_completed(futures)]
+        futures = set()
+        for _ in range(min(config.test_workers, len(candidates))):
+            try:
+                futures.add(executor.submit(run, next(pending_candidates)))
+            except StopIteration:
+                break
+        while futures:
+            done, futures = concurrent.futures.wait(
+                futures,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                result = future.result()
+                results.append(result)
+                if result.ok and result.proxy:
+                    active_count += 1
+            if stop_after_active and active_count >= stop_after_active:
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                return results
+            while len(futures) < config.test_workers:
+                try:
+                    futures.add(executor.submit(run, next(pending_candidates)))
+                except StopIteration:
+                    break
+    return results
 
 
-def write_outputs(config: ProxyAutoConfig, active_results: Iterable[ProxyTestResult]):
-    active_results = list(active_results)
+def resolve_proxy_worker_bin() -> Path | None:
+    raw = (os.environ.get("PROXY_WORKER_BIN") or "").strip()
+    candidates = []
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    root = Path(__file__).resolve().parents[1]
+    candidates.append(root / "native" / "proxy-worker" / "proxy-worker")
+    for path in candidates:
+        try:
+            if path.is_file() and os.access(path, os.X_OK):
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _test_candidates_via_go(
+    config: ProxyAutoConfig,
+    candidates: list[str],
+    normalize_proxy: Callable[[str], str | None],
+) -> list[ProxyTestResult] | None:
+    """Return results from Go worker, or None to fall back to Python."""
+    payload = {
+        "candidates": list(candidates),
+        "test_urls": list(config.test_urls),
+        "timeout_sec": int(config.test_timeout),
+        "workers": int(config.test_workers),
+        "accept_status": [[int(a), int(b)] for a, b in config.accept_status],
+        "max_active": int(config.max_active or 0),
+        "user_agent": USER_AGENT,
+    }
+    worker_url = (os.environ.get("PROXY_WORKER_URL") or "").strip().rstrip("/")
+    try:
+        if worker_url:
+            data = _go_worker_http_test(worker_url, payload)
+        else:
+            binary = resolve_proxy_worker_bin()
+            if binary is None:
+                return None
+            data = _go_worker_cli_test(binary, payload)
+    except Exception:
+        return None
+
+    raw_results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(raw_results, list):
+        return None
+
+    out: list[ProxyTestResult] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        candidate = str(item.get("candidate") or "")
+        proxy = item.get("proxy")
+        if proxy is not None:
+            proxy = str(proxy)
+        # Prefer Python-side normalize when Go left proxy empty but candidate is valid.
+        if not proxy:
+            try:
+                proxy = normalize_proxy(candidate)
+            except Exception:
+                proxy = None
+        ok = bool(item.get("ok"))
+        latency = item.get("latency_ms")
+        try:
+            latency_ms = int(latency) if latency is not None else None
+        except (TypeError, ValueError):
+            latency_ms = None
+        status = item.get("status_code")
+        try:
+            status_code = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status_code = None
+        error = item.get("error")
+        out.append(
+            ProxyTestResult(
+                candidate,
+                proxy,
+                ok,
+                latency_ms=latency_ms,
+                status_code=status_code,
+                error=str(error) if error else None,
+            )
+        )
+    return out
+
+
+def _go_worker_cli_test(binary: Path, payload: dict) -> dict:
+    import subprocess
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # Wall clock ≈ rounds * per-proxy timeout. rounds = ceil(n / workers).
+    n = len(payload.get("candidates") or [])
+    workers = max(1, int(payload.get("workers") or 64))
+    per = max(1, int(payload.get("timeout_sec") or 10))
+    rounds = max(1, (n + workers - 1) // workers)
+    # +2 rounds slack for scheduling; hard cap 2 hours.
+    timeout = max(60, min(7200, (rounds + 2) * per + 30))
+    proc = subprocess.run(
+        [str(binary), "test"],
+        input=body,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode("utf-8", "replace")[:500] or f"exit {proc.returncode}")
+    return json.loads(proc.stdout.decode("utf-8"))
+
+
+def _go_worker_http_test(base_url: str, payload: dict) -> dict:
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        timeout = max(30, int(payload.get("timeout_sec") or 10) * 3 + 60)
+        resp = session.post(
+            base_url.rstrip("/") + "/v1/test",
+            json=payload,
+            timeout=timeout,
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"proxy-worker HTTP {resp.status_code}")
+        return resp.json()
+    finally:
+        session.close()
+
+
+def write_outputs(config: ProxyAutoConfig, test_results: Iterable[ProxyTestResult]):
+    test_results = list(test_results)
+    active_results = [item for item in test_results if item.ok and item.proxy]
+    active_results.sort(key=_proxy_result_sort_key)
+    if config.max_active:
+        active_results = active_results[: config.max_active]
     proxies = list(_unique(item.proxy for item in active_results if item.proxy))
+    failed_count = sum(1 for item in test_results if not item.ok)
     config.output_path.mkdir(parents=True, exist_ok=True)
     _atomic_write(config.active_path, "\n".join(proxies) + ("\n" if proxies else ""))
     if "base64" in config.export_formats or "b64" in config.export_formats:
@@ -396,6 +671,9 @@ def write_outputs(config: ProxyAutoConfig, active_results: Iterable[ProxyTestRes
     state = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "active_count": len(proxies),
+        "test_count": len(test_results),
+        "failed_count": failed_count,
+        "error_summary": _proxy_test_error_summary(test_results),
         "proxies": [
             {
                 "candidate": item.candidate,
@@ -412,6 +690,47 @@ def write_outputs(config: ProxyAutoConfig, active_results: Iterable[ProxyTestRes
         _atomic_write(config.sub2api_path, json.dumps(sub2api_payload(proxies), ensure_ascii=False, indent=2) + "\n")
     if "cpa" in config.export_formats:
         _atomic_write(config.cpa_path, json.dumps(sub2api_payload(proxies), ensure_ascii=False, indent=2) + "\n")
+
+
+def _proxy_result_sort_key(item: ProxyTestResult):
+    latency = item.latency_ms if item.latency_ms is not None else 10**9
+    return (latency, item.proxy or item.candidate)
+
+
+def _proxy_test_error_summary(results: Iterable[ProxyTestResult]):
+    summary = {}
+    for item in results:
+        if item.ok:
+            continue
+        reason = item.error
+        if not reason and item.status_code is not None:
+            reason = f"status {item.status_code}"
+        reason = _compact_error_reason(reason or "unknown error")
+        summary[reason] = summary.get(reason, 0) + 1
+    return dict(sorted(summary.items(), key=lambda pair: (-pair[1], pair[0])))
+
+
+def _compact_error_reason(reason: str):
+    line = str(reason or "unknown error").splitlines()[0].strip()
+    if not line:
+        return "unknown error"
+    status = re.search(r"\bstatus\s+(\d{3})\b", line, re.I)
+    if status:
+        return f"status {status.group(1)}"
+    lowered = line.lower()
+    if "unsupported proxy" in lowered:
+        return "unsupported proxy"
+    if "tunnel connection failed" in lowered:
+        return "proxy tunnel failed"
+    if "unable to connect to proxy" in lowered:
+        return "unable to connect to proxy"
+    if "sslcertverificationerror" in lowered:
+        return "proxy TLS verification failed"
+    if "connection refused" in lowered:
+        return "connection refused"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timeout"
+    return line[:200]
 
 
 def sub2api_payload(proxies: Iterable[str]):
@@ -468,6 +787,20 @@ def _fetch_specs(config, specs, bootstrap_proxies, request_get=None):
                 return FetchResult(spec.url, "", proxy=proxy, error=f"status {response.status_code}"), spec
             return FetchResult(spec.url, getattr(response, "text", "") or "", proxy=proxy), spec
         except Exception as exc:
+            if proxy:
+                try:
+                    response = _request_get(
+                        spec.url,
+                        None,
+                        config.fetch_timeout,
+                        {"User-Agent": USER_AGENT, "Accept": "*/*"},
+                        request_get=request_get,
+                    )
+                    if getattr(response, "status_code", 200) >= 400:
+                        return FetchResult(spec.url, "", error=f"status {response.status_code}"), spec
+                    return FetchResult(spec.url, getattr(response, "text", "") or ""), spec
+                except Exception:
+                    pass
             return FetchResult(spec.url, "", proxy=proxy, error=str(exc)), spec
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=config.fetch_workers) as executor:
@@ -504,9 +837,150 @@ def _extract_nodes_into(text, out, depth):
         link = _clean_node_link(match.group("link"))
         if _looks_like_proxy_or_node(link):
             out.append(link)
+    # Clash/Meta YAML proxy blocks → approximate share/proxy URLs
+    for link in extract_clash_proxy_links(text):
+        out.append(link)
     decoded = _try_decode_base64_payload(text)
     if decoded and decoded != text:
         _extract_nodes_into(decoded, out, depth + 1)
+
+
+def extract_bare_host_ports(text: str, *, default_scheme: str = "http"):
+    """Parse free-proxy list lines like `1.2.3.4:8080` or `1.2.3.4:1080:user:pass`."""
+    if not text:
+        return []
+    scheme = (default_scheme or "http").strip().lower() or "http"
+    if scheme not in {"http", "https", "socks4", "socks5", "socks5h"}:
+        scheme = "http"
+    out = []
+    # ip:port or host:port
+    host_port = re.compile(
+        r"(?m)^\s*(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9])"
+        r":(?P<port>\d{2,5})"
+        r"(?::(?P<user>[^\s:#]+):(?P<password>[^\s#]+))?\s*$"
+    )
+    for match in host_port.finditer(text):
+        host = match.group("host")
+        port = int(match.group("port"))
+        if port < 1 or port > 65535:
+            continue
+        # skip obvious non-proxy high-noise ports sometimes found in docs
+        if host.lower() in {"0.0.0.0", "127.0.0.1", "localhost"}:
+            continue
+        user = match.group("user")
+        password = match.group("password")
+        if user and password:
+            out.append(f"{scheme}://{user}:{password}@{host}:{port}")
+        else:
+            out.append(f"{scheme}://{host}:{port}")
+    return list(_unique(out))
+
+
+def extract_clash_proxy_links(text: str):
+    """Best-effort extraction of Clash YAML proxy entries into usable URLs.
+
+    Full Clash conversion is complex; we cover common ss/trojan/http/socks5 and
+    leave vmess/vless when uuid/server/port are present as share links when possible.
+    """
+    if not text or "type:" not in text or "server:" not in text:
+        return []
+    # Split loosely on list items under proxies
+    blocks = re.split(r"(?m)^\s*-\s+(?=name:|\{)", text)
+    out = []
+    for block in blocks:
+        if "server:" not in block or "type:" not in block:
+            # one-line map style: { name: x, type: ss, server: y, port: 1, ... }
+            if not re.search(r"\btype\s*:", block):
+                continue
+        item = _parse_clash_proxy_block(block)
+        if not item:
+            continue
+        link = _clash_item_to_link(item)
+        if link:
+            out.append(link)
+    return list(_unique(out))
+
+
+def _parse_clash_proxy_block(block: str):
+    data = {}
+    # inline JSON-ish / flow style
+    for key in (
+        "name", "type", "server", "port", "uuid", "password", "cipher", "method",
+        "username", "udp", "tls", "network", "sni", "skip-cert-verify",
+    ):
+        m = re.search(
+            rf"(?i)(?:^|[\s,{{]){re.escape(key)}\s*:\s*([^\n,}}]+)",
+            block,
+        )
+        if not m:
+            continue
+        value = m.group(1).strip().strip("'\"")
+        data[key.lower().replace("-", "_")] = value
+    if "server" not in data or "type" not in data:
+        return None
+    if "port" not in data:
+        return None
+    try:
+        data["port"] = int(str(data["port"]).strip())
+    except ValueError:
+        return None
+    return data
+
+
+def _clash_item_to_link(item: dict):
+    ptype = str(item.get("type") or "").lower()
+    server = item.get("server")
+    port = item.get("port")
+    if not server or not port:
+        return None
+    if ptype in {"http", "https"}:
+        user = item.get("username")
+        password = item.get("password")
+        if user or password:
+            return f"http://{user or ''}:{password or ''}@{server}:{port}"
+        return f"http://{server}:{port}"
+    if ptype in {"socks5", "socks"}:
+        user = item.get("username")
+        password = item.get("password")
+        if user or password:
+            return f"socks5://{user or ''}:{password or ''}@{server}:{port}"
+        return f"socks5://{server}:{port}"
+    if ptype in {"ss", "shadowsocks"}:
+        method = item.get("cipher") or item.get("method") or "aes-256-gcm"
+        password = item.get("password") or ""
+        # ss://base64(method:password)@host:port
+        userinfo = base64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
+        return f"ss://{userinfo}@{server}:{port}"
+    if ptype == "trojan":
+        password = item.get("password") or ""
+        sni = item.get("sni") or ""
+        q = f"?sni={sni}" if sni else ""
+        return f"trojan://{password}@{server}:{port}{q}"
+    if ptype == "vmess":
+        uuid = item.get("uuid") or ""
+        if not uuid:
+            return None
+        payload = {
+            "v": "2",
+            "ps": item.get("name") or server,
+            "add": server,
+            "port": str(port),
+            "id": uuid,
+            "aid": "0",
+            "net": item.get("network") or "tcp",
+            "type": "none",
+            "tls": "tls" if str(item.get("tls") or "").lower() in {"true", "1", "yes"} else "",
+        }
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, ensure_ascii=False).encode()
+        ).decode().rstrip("=")
+        return f"vmess://{encoded}"
+    if ptype == "vless":
+        uuid = item.get("uuid") or ""
+        if not uuid:
+            return None
+        return f"vless://{uuid}@{server}:{port}"
+    return None
 
 
 def _clean_node_link(link):

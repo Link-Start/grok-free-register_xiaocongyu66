@@ -1,10 +1,11 @@
 import asyncio
 import json
+import zipfile
 
 import httpx
 
 from xai_enroller.models import OAuthCredential
-from xai_enroller.sinks import CPAAuthFileSink, SinkError
+from xai_enroller.sinks import CPAAuthFileSink, LocalAuthFileSink, SinkError
 
 
 def credential():
@@ -77,3 +78,19 @@ def test_cpa_sink_maps_non_2xx_without_retry_or_secret_leak():
     else:
         raise AssertionError("expected SinkError")
     assert count == 1
+
+
+def test_local_auth_file_sink_writes_single_only_no_merge_bundle(tmp_path):
+    # leftover merge files must be purged
+    (tmp_path / "accounts.cpa.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "accounts.cpa.zip").write_bytes(b"PK\x03\x04")
+    sink = LocalAuthFileSink(tmp_path, name_secret=b"name-secret", email="user@example.test")
+
+    receipt = asyncio.run(sink.store(credential()))
+
+    auth_file = tmp_path / f"{receipt.fingerprint}.json"
+    assert auth_file.exists()
+    document = json.loads(auth_file.read_text(encoding="utf-8"))
+    assert document["email"] == "user@example.test"
+    assert not (tmp_path / "accounts.cpa.json").exists()
+    assert not (tmp_path / "accounts.cpa.zip").exists()

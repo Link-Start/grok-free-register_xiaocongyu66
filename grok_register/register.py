@@ -26,7 +26,7 @@ except ImportError:
     pass
 import requests as req
 from pathlib import Path
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 from playwright.async_api import async_playwright
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,8 +36,15 @@ from grok_register.core.envelope import ResourceEnvelope
 from grok_register.core.inventory import Inventory
 from grok_register.core.observer import Metrics
 from grok_register.proxy_auto import ProxyAutoConfig, ProxyAutoManager, load_active_proxies
+from grok_register.proxy_relay import BuiltinProxyRelay, BuiltinProxyRelayConfig
+from xai_enroller.fingerprints import (
+    BROWSER_FINGERPRINT_FILENAME,
+    browser_context_options,
+    get_or_create_browser_fingerprint,
+)
 
 SITE_URL = "https://accounts.x.ai"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # ── 配置（环境变量 / .env，见 .env.example）──
 def _env_int(key, default):
@@ -128,7 +135,19 @@ PROXY_RELAY_HOST = (os.environ.get("PROXY_RELAY_HOST") or "127.0.0.1").strip()
 PROXY_RELAY_PROXY_SCHEME = (os.environ.get("PROXY_RELAY_PROXY_SCHEME") or "auto").strip().lower()
 PROXY_RELAY_TIMEOUT = _env_int("PROXY_RELAY_TIMEOUT", 8)
 PROXY_RELAY_RETRY_SEC = _env_int("PROXY_RELAY_RETRY_SEC", 30)
+PROXY_RELAY_BUILTIN_ENABLED = _env_bool("PROXY_RELAY_BUILTIN_ENABLED", True)
+PROXY_RELAY_AUTO_INSTALL = _env_bool("PROXY_RELAY_AUTO_INSTALL", True)
+PROXY_RELAY_SING_BOX_BIN = (os.environ.get("PROXY_RELAY_SING_BOX_BIN") or "").strip()
+PROXY_RELAY_WORK_DIR = (os.environ.get("PROXY_RELAY_WORK_DIR") or "logs/proxy-relay").strip()
+PROXY_RELAY_START_PORT = _env_int("PROXY_RELAY_START_PORT", 19080)
+PROXY_RELAY_MAX_NODES = _env_int("PROXY_RELAY_MAX_NODES", 48)
+PROXY_RELAY_START_TIMEOUT = _env_int("PROXY_RELAY_START_TIMEOUT", 8)
 PROXY_AUTO_CONFIG = ProxyAutoConfig.from_env(os.environ)
+PROXY_AUTO_REQUIRE_ACTIVE = _env_bool("PROXY_AUTO_REQUIRE_ACTIVE", PROXY_AUTO_CONFIG.enabled)
+PROXY_POOL_USE_TESTED_ONLY = _env_bool(
+    "PROXY_POOL_USE_TESTED_ONLY",
+    PROXY_AUTO_CONFIG.enabled and PROXY_AUTO_REQUIRE_ACTIVE,
+)
 CF_ARES_EMAIL_MODE = (os.environ.get("CF_ARES_EMAIL") or "0").strip().lower()
 CF_ARES_BROWSER_ENGINE = (os.environ.get("CF_ARES_BROWSER_ENGINE") or "auto").strip()
 CF_ARES_HEADLESS = (
@@ -141,8 +160,15 @@ CF_ARES_PROXY = (
     or os.environ.get("HTTP_PROXY")
     or ""
 ).strip()
+CF_ARES_XAI_MODE = (
+    os.environ.get("CF_ARES_XAI")
+    or os.environ.get("CF_ARES_GROK")
+    or (CF_ARES_EMAIL_MODE if CF_ARES_EMAIL_MODE in ("1", "true", "yes", "on", "fallback", "always") else "0")
+).strip().lower()
+CF_ARES_IMPERSONATE = (os.environ.get("CF_ARES_IMPERSONATE") or "chrome120").strip()
 CF_ARES_CHROME_PATH = (os.environ.get("CF_ARES_CHROME_PATH") or "").strip()
 CF_ARES_PATH = (os.environ.get("CF_ARES_PATH") or "").strip()
+CF_ARES_BUNDLED_PATH = PROJECT_ROOT / "vendor" / "CF-Ares"
 CF_ARES_TIMEOUT = _env_int("CF_ARES_TIMEOUT", 30)
 MIN_FREE_MEM_MB = _env_int("MIN_FREE_MEM_MB", 500)   # 自动容量派生时保留的内存(MB)
 T_TARGET        = _env_int("T_TARGET", 4)            # token 池缓冲目标
@@ -169,7 +195,7 @@ C_WORKERS       = _env_int("C_WORKERS", 0)
 C_HOT_PAGE_POOL = (os.environ.get("C_HOT_PAGE_POOL", "0").strip().lower() in ("1", "true", "yes"))
 C_HOT_PAGE_POOL_SIZE = _env_int("C_HOT_PAGE_POOL_SIZE", 0)
 C_SET_COOKIE_VIA_REQUEST = (
-    os.environ.get("C_SET_COOKIE_VIA_REQUEST", "1" if C_HOT_PAGE_POOL else "0")
+    os.environ.get("C_SET_COOKIE_VIA_REQUEST", "1")
     .strip()
     .lower()
     in ("1", "true", "yes")
@@ -192,8 +218,9 @@ REGISTRATION_DIAGNOSTICS = (
     os.environ.get("REGISTRATION_DIAGNOSTICS", "0").strip().lower()
     in ("1", "true", "yes")
 )
+REGISTER_HEARTBEAT_INTERVAL = max(0, _env_int("REGISTER_HEARTBEAT_INTERVAL", 60))
 REGISTRATION_RATE_LIMIT_COOLDOWN = max(
-    60, _env_int("REGISTRATION_RATE_LIMIT_COOLDOWN", 60)
+    30, _env_int("REGISTRATION_RATE_LIMIT_COOLDOWN", 60)
 )
 REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS = max(
     1, _env_int("REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS", 60)
@@ -201,6 +228,13 @@ REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS = max(
 REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL = max(
     1, _env_int("REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL", 3)
 )
+# proxy = cool only the rate-limited exit IP (recommended with multi-proxy pools)
+# global = pause all C workers after any rate limit (legacy)
+REGISTRATION_RATE_LIMIT_SCOPE = (
+    os.environ.get("REGISTRATION_RATE_LIMIT_SCOPE") or "proxy"
+).strip().lower()
+if REGISTRATION_RATE_LIMIT_SCOPE not in {"proxy", "global"}:
+    REGISTRATION_RATE_LIMIT_SCOPE = "proxy"
 REGISTER_LOG_MODE = "user"
 
 SITE_KEY = None
@@ -256,6 +290,8 @@ def format_user_registration_event(
     rate_per_minute=None,
     wait_seconds=None,
     remaining=None,
+    proxy=None,
+    proxy_key=None,
 ):
     if kind == "service_started":
         progress = f"剩余 {remaining}" if remaining is not None else "持续运行"
@@ -269,6 +305,9 @@ def format_user_registration_event(
     if kind == "failed":
         return f"[✗] 注册失败 #{task_id} | 已跳过，继续下一任务"
     if kind == "rate_limited":
+        label = proxy_key or proxy
+        if label:
+            return f"[⏸] 出口限流 {label} | {wait_seconds}秒后换 IP 重试"
         return f"[⏸] 触发限流 | {wait_seconds}秒后恢复探测"
     if kind == "recovered":
         return f"[▶] 限流解除 | 实际等待 {wait_seconds}秒"
@@ -281,8 +320,29 @@ class RegistrationRateLimited(RuntimeError):
     """注册提交被目标站点的限流页替代。"""
 
 
+def _proxy_rate_limit_key(proxy):
+    """Stable key for per-exit cooldowns (host:port, or 'direct')."""
+    if not proxy:
+        return "direct"
+    try:
+        parsed = urlparse(proxy)
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+        if host and port:
+            return f"{host}:{port}"
+        if host:
+            return host
+    except Exception:
+        pass
+    return str(proxy).strip() or "direct"
+
+
 class RegistrationRateLimitCircuit:
-    """在检测到注册限流后暂停新的 C 阶段提交。"""
+    """在检测到注册限流后暂停新的 C 阶段提交。
+
+    scope=global: 任一出口限流后全局冷却（旧行为）。
+    scope=proxy:  只冷却触发限流的代理 IP，其它出口继续跑。
+    """
 
     def __init__(
         self,
@@ -290,25 +350,95 @@ class RegistrationRateLimitCircuit:
         recovery_seconds=60,
         recovery_interval=3,
         clock=time.monotonic,
+        scope="global",
     ):
         self.cooldown_seconds = cooldown_seconds
         self.recovery_seconds = recovery_seconds
         self.recovery_interval = recovery_interval
         self._clock = clock
+        self.scope = "proxy" if str(scope).lower() == "proxy" else "global"
         self._blocked_until = 0.0
         self._tripped_at = None
         self._probe_active = False
         self._probe_token = None
         self._recovering_until = 0.0
         self._next_recovery_submit = 0.0
+        self._proxy_blocked_until = {}
+        self._proxy_lock = threading.Lock()
 
-    def remaining_seconds(self):
+    def remaining_seconds(self, proxy=None):
+        if self.scope == "proxy":
+            now = self._clock()
+            with self._proxy_lock:
+                self._purge_proxy_blocks_locked(now)
+                if proxy is not None:
+                    key = _proxy_rate_limit_key(proxy)
+                    until = self._proxy_blocked_until.get(key, 0.0)
+                    return max(0, int(until - now + 0.999))
+                blocked = dict(self._proxy_blocked_until)
+            if not blocked:
+                return 0
+            # Snapshot pool outside proxy_lock to avoid pool_lock/proxy_lock deadlocks.
+            if self._pool_has_unblocked(blocked):
+                return 0
+            soonest = min(blocked.values())
+            return max(0, int(soonest - now + 0.999))
         return max(0, int(self._blocked_until - self._clock() + 0.999))
 
-    def is_open(self):
-        return self.remaining_seconds() > 0
+    def is_open(self, proxy=None):
+        return self.remaining_seconds(proxy) > 0
 
-    def trip(self):
+    def is_proxy_blocked(self, proxy):
+        if self.scope != "proxy":
+            return self.is_open()
+        return self.remaining_seconds(proxy) > 0
+
+    def _purge_proxy_blocks_locked(self, now=None):
+        now = self._clock() if now is None else now
+        expired = [k for k, until in self._proxy_blocked_until.items() if until <= now]
+        for key in expired:
+            self._proxy_blocked_until.pop(key, None)
+
+    def _snapshot_pool_keys(self):
+        try:
+            with _proxy_pool_lock:
+                items = list(_load_proxy_pool_locked())
+        except Exception:
+            items = []
+        if not items:
+            return [_proxy_rate_limit_key(None)]
+        return [_proxy_rate_limit_key(proxy) for proxy in items]
+
+    def _pool_has_unblocked(self, blocked):
+        """True if at least one pool exit is not in the blocked map."""
+        for key in self._snapshot_pool_keys():
+            if key not in blocked:
+                return True
+        return False
+
+    def available_proxy_count(self):
+        if self.scope != "proxy":
+            return 0 if self.is_open() else 1
+        now = self._clock()
+        with self._proxy_lock:
+            self._purge_proxy_blocks_locked(now)
+            blocked = dict(self._proxy_blocked_until)
+        keys = self._snapshot_pool_keys()
+        return sum(1 for key in keys if key not in blocked)
+
+    def trip(self, proxy=None):
+        if self.scope == "proxy" and proxy is not None:
+            key = _proxy_rate_limit_key(proxy)
+            now = self._clock()
+            with self._proxy_lock:
+                prev = self._proxy_blocked_until.get(key, 0.0)
+                starts_new_window = prev <= now
+                self._proxy_blocked_until[key] = max(
+                    prev,
+                    now + self.cooldown_seconds,
+                )
+            return starts_new_window
+
         starts_new_window = not self.is_open()
         if self._tripped_at is None:
             self._tripped_at = self._clock()
@@ -320,9 +450,22 @@ class RegistrationRateLimitCircuit:
             self._blocked_until,
             self._clock() + self.cooldown_seconds,
         )
+        # Also cool the specific proxy so subsequent picks avoid it during global cool-down.
+        if proxy is not None:
+            key = _proxy_rate_limit_key(proxy)
+            with self._proxy_lock:
+                self._proxy_blocked_until[key] = max(
+                    self._proxy_blocked_until.get(key, 0.0),
+                    self._clock() + self.cooldown_seconds,
+                )
         return starts_new_window
 
     async def wait(self):
+        if self.scope == "proxy":
+            while True:
+                if not self.is_open():
+                    return False
+                await asyncio.sleep(min(max(self.remaining_seconds(), 1), 5))
         while True:
             if self.is_open():
                 await asyncio.sleep(min(self.remaining_seconds(), 5))
@@ -349,6 +492,8 @@ class RegistrationRateLimitCircuit:
 
     def can_submit(self, probe_token=False):
         """仅允许正常态任务或当前恢复探针发起注册提交。"""
+        if self.scope == "proxy":
+            return not self.is_open()
         if self._tripped_at is None and not self._recovering_until:
             return True
         return (
@@ -358,6 +503,8 @@ class RegistrationRateLimitCircuit:
         )
 
     def consume_recovery_seconds(self, probe_token=None):
+        if self.scope == "proxy":
+            return None
         if self._tripped_at is None:
             self.complete_recovery_submission(probe_token)
             return None
@@ -374,6 +521,8 @@ class RegistrationRateLimitCircuit:
 
     def complete_recovery_submission(self, probe_token):
         """完成恢复期内的一次成功提交，并按固定节奏放行下一项。"""
+        if self.scope == "proxy":
+            return False
         if probe_token is not self._probe_token or not self._recovering_until:
             return False
         self._probe_active = False
@@ -383,12 +532,16 @@ class RegistrationRateLimitCircuit:
 
     def release_probe(self, probe_token):
         """提交前资源已失效时让出探针，不额外增加冷却窗口。"""
+        if self.scope == "proxy":
+            return
         if probe_token is self._probe_token:
             self._probe_active = False
             self._probe_token = None
 
     def defer_probe(self, probe_token):
         """真正的探针失败后重新进入完整冷却。"""
+        if self.scope == "proxy":
+            return
         if probe_token is not self._probe_token:
             return
         self._probe_active = False
@@ -406,6 +559,7 @@ REGISTRATION_RATE_LIMIT_CIRCUIT = RegistrationRateLimitCircuit(
     REGISTRATION_RATE_LIMIT_COOLDOWN,
     recovery_seconds=REGISTRATION_RATE_LIMIT_RECOVERY_SECONDS,
     recovery_interval=REGISTRATION_RATE_LIMIT_RECOVERY_INTERVAL,
+    scope=REGISTRATION_RATE_LIMIT_SCOPE,
 )
 
 def _signup_response_markers(text):
@@ -524,9 +678,14 @@ def derive_capacity(
         physical = auto_cap
 
     s_workers = S_WORKERS if S_WORKERS > 0 else physical + 2
-    p_workers = P_WORKERS if P_WORKERS > 0 else Q_PENDING_CAP + 2
+    p_workers = P_WORKERS if P_WORKERS > 0 else min(Q_PENDING_CAP + 2, max(2, physical * 2))
     c_workers = C_WORKERS if C_WORKERS > 0 else physical + 2
     return physical, s_workers, p_workers, c_workers
+
+
+def derive_p_batch_max(physical_cap, configured=None):
+    configured = P_BATCH_MAX if configured is None else configured
+    return max(1, min(max(1, configured), max(1, physical_cap)))
 
 
 def derive_admission_watermarks(
@@ -557,7 +716,7 @@ def derive_admission_watermarks(
     q_low_cfg = _Q_LOW_WATER_OVERRIDE if q_low_override is None else q_low_override
 
     if t_high_cfg is None:
-        t_high = min(max(1, t_slot), max(1, t_goal, physical_cap))
+        t_high = min(max(1, t_slot), max(1, physical_cap))
     else:
         t_high = max(1, min(max(1, t_slot), t_high_cfg))
 
@@ -598,55 +757,186 @@ def derive_c_hot_page_pool_size(physical_cap, c_workers, configured_size=None):
 async def fetch_config():
     global SITE_KEY, ACTION_ID, STATE_TREE
     debug_log('[*] Fetching config...')
+    # Prefer each live proxy once, then a few round-robin picks.
+    # Empty-string proxy was previously treated as a real value and skipped the pool.
+    pool = []
+    try:
+        with _proxy_pool_lock:
+            pool = list(_load_proxy_pool_locked())
+    except Exception:
+        pool = []
+    attempts = list(pool[:8])
+    if not attempts:
+        attempts = [None, None, None]
+    else:
+        # a couple extra random/round-robin picks for flaky exits
+        attempts = attempts + [None, None]
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
-        context = None
-        page = None
-        try:
-            context, page = await _new_grok_page(browser)
-            await page.goto(f'{SITE_URL}/sign-up?redirect=grok-com', timeout=30000)
-            await page.wait_for_timeout(5000)
-            html = await page.content()
-            m = re.search(r'0x4AAAAAAA[a-zA-Z0-9_-]+', html)
-            if m: SITE_KEY = m.group(0); debug_log(f'[+] SITE_KEY: {SITE_KEY}')
-            for chunk in re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL):
-                if 'sign-up' not in chunk: continue
-                decoded = chunk.replace('\\"', '"')
-                f_match = re.search(r'"f":\[\[\[', decoded)
-                if not f_match: continue
-                f_start = f_match.start() + 5
-                end_idx = decoded.find('"$undefined"', f_start)
-                if end_idx < 0: continue
-                STATE_TREE = quote(decoded[f_start:end_idx].replace('\\\\"', '"').replace('\\', ''), safe='')
-                debug_log(f'[+] STATE_TREE: {STATE_TREE[:50]}...')
-                break
-            js_urls = re.findall(r'src="(/_next/static/[^"]+\.js)"', html)
-            for js_url in js_urls[:50]:
-                try:
-                    js = await page.evaluate(f"(async()=>{{return await fetch('{js_url}').then(r=>r.text()).catch(()=>\"\" )}})()")
-                    if not js: continue
-                    if not any(kw in js for kw in ['createUser','registerUser','emailValidation']): continue
-                    hexes = re.findall(r'[a-fA-F0-9]{40,50}', js)
-                    if hexes: ACTION_ID = hexes[0]; break
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    continue
-            if ACTION_ID: debug_log(f'[+] ACTION_ID: {ACTION_ID}')
-        finally:
-            await _close_grok_page(context, page)
-            await browser.close()
-    if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
-        raise RuntimeError("Config fetch failed")
+        for attempt, proxy in enumerate(attempts, 1):
+            browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
+            context = None
+            page = None
+            try:
+                SITE_KEY = ACTION_ID = STATE_TREE = None
+                # None → _new_grok_page picks from pool; explicit proxy uses that exit.
+                context, page = await _new_grok_page(browser, proxy=proxy)
+                used = _page_proxy(page) or proxy or "direct"
+                debug_log(f'[*] config fetch attempt {attempt} via {_proxy_rate_limit_key(used) if used != "direct" else "direct"}')
+                await page.goto(
+                    f'{SITE_URL}/sign-up?redirect=grok-com',
+                    timeout=45000,
+                    wait_until="domcontentloaded",
+                )
+                await page.wait_for_timeout(3000)
+                html = await page.content()
+                m = re.search(r'0x4AAAAAAA[a-zA-Z0-9_-]+', html)
+                if m: SITE_KEY = m.group(0); debug_log(f'[+] SITE_KEY: {SITE_KEY}')
+                for chunk in re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL):
+                    if 'sign-up' not in chunk: continue
+                    decoded = chunk.replace('\\"', '"')
+                    f_match = re.search(r'"f":\[\[\[', decoded)
+                    if not f_match: continue
+                    f_start = f_match.start() + 5
+                    end_idx = decoded.find('"$undefined"', f_start)
+                    if end_idx < 0: continue
+                    STATE_TREE = quote(decoded[f_start:end_idx].replace('\\\\"', '"').replace('\\', ''), safe='')
+                    debug_log(f'[+] STATE_TREE: {STATE_TREE[:50]}...')
+                    break
+                js_urls = re.findall(r'src="(/_next/static/[^"]+\.js)"', html)
+                for js_url in js_urls[:50]:
+                    try:
+                        js = await page.evaluate(f"(async()=>{{return await fetch('{js_url}').then(r=>r.text()).catch(()=>\"\" )}})()")
+                        if not js: continue
+                        if not any(kw in js for kw in ['createUser','registerUser','emailValidation']): continue
+                        hexes = re.findall(r'[a-fA-F0-9]{40,50}', js)
+                        if hexes: ACTION_ID = hexes[0]; break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        continue
+                if ACTION_ID: debug_log(f'[+] ACTION_ID: {ACTION_ID}')
+                if all([SITE_KEY, ACTION_ID, STATE_TREE]):
+                    return
+                debug_log(f'[*] config fetch attempt {attempt} incomplete')
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                debug_log(f'[*] config fetch attempt {attempt} failed: {sanitize_terminal_error(exc)}')
+            finally:
+                await _close_grok_page(context, page)
+                await _close_browser_safely(browser)
+    raise RuntimeError("Config fetch failed")
 
 
 # ──────────────────────────────────────────────
 #  异步操作
 # ──────────────────────────────────────────────
+def _remember_page_proxy(page, proxy):
+    try:
+        setattr(page, "_grok_proxy", proxy)
+    except Exception:
+        pass
+
+def _page_proxy(page):
+    try:
+        return getattr(page, "_grok_proxy", None)
+    except Exception:
+        return None
+
+def _xai_http_request(method, url, *, page=None, proxy=None, **kwargs):
+    proxy = proxy if proxy is not None else _page_proxy(page)
+    request_kwargs = dict(kwargs)
+    if proxy and "proxies" not in request_kwargs:
+        request_kwargs.update(_requests_proxy_kwargs(proxy))
+    cf_kwargs = dict(kwargs)
+    if proxy:
+        cf_kwargs["proxy"] = proxy
+
+    if _cf_ares_xai_mode_always():
+        return _cf_ares_request(method, url, **cf_kwargs)
+
+    try:
+        response = getattr(req, method.lower())(url, **request_kwargs)
+    except Exception:
+        debug_log("[xAI] HTTP retry via CF-Ares after request error")
+        return _cf_ares_request(method, url, **cf_kwargs)
+    if _looks_like_cloudflare_block(response):
+        debug_log("[xAI] HTTP retry via CF-Ares after Cloudflare block")
+        return _cf_ares_request(method, url, **cf_kwargs)
+    return response
+
+async def _xai_http_request_async(method, url, *, page=None, proxy=None, **kwargs):
+    return await asyncio.to_thread(
+        _xai_http_request,
+        method,
+        url,
+        page=page,
+        proxy=proxy,
+        **kwargs,
+    )
+
+def _xai_grpc_status_from_response(response):
+    if response is None or not hasattr(response, "headers"):
+        return None
+    status_code = getattr(response, "status_code", 200) or 200
+    if status_code >= 400:
+        return str(status_code)
+    return _response_header(response, "grpc-status", "0") or "0"
+
+async def _grpc_create_code_http(page, email):
+    inner = pb_str(1, email)
+    frame = b'\x00' + struct.pack('>I', len(inner)) + inner
+    response = await _xai_http_request_async(
+        "POST",
+        f"{SITE_URL}/auth_mgmt.AuthManagement/CreateEmailValidationCode",
+        page=page,
+        headers={
+            "accept": "*/*",
+            "content-type": "application/grpc-web+proto",
+            "origin": SITE_URL,
+            "referer": f"{SITE_URL}/sign-up?redirect=grok-com",
+            "x-grpc-web": "1",
+            "x-user-agent": "connect-es/2.1.1",
+        },
+        data=frame,
+        timeout=20,
+    )
+    return _xai_grpc_status_from_response(response)
+
+async def _grpc_verify_code_http(page, email, code):
+    inner = pb_str(1, email) + pb_str(2, code)
+    frame = b'\x00' + struct.pack('>I', len(inner)) + inner
+    response = await _xai_http_request_async(
+        "POST",
+        f"{SITE_URL}/auth_mgmt.AuthManagement/VerifyEmailValidationCode",
+        page=page,
+        headers={
+            "accept": "*/*",
+            "content-type": "application/grpc-web+proto",
+            "origin": SITE_URL,
+            "referer": f"{SITE_URL}/sign-up?redirect=grok-com",
+            "x-grpc-web": "1",
+            "x-user-agent": "connect-es/2.1.1",
+        },
+        data=frame,
+        timeout=20,
+    )
+    return _xai_grpc_status_from_response(response)
+
 async def grpc_create_code(page, email):
     inner = pb_str(1, email)
     frame = b'\x00' + struct.pack('>I', len(inner)) + inner
     fb64 = base64.b64encode(frame).decode()
+    if _cf_ares_xai_mode_enabled():
+        try:
+            status = await _grpc_create_code_http(page, email)
+            if status is not None:
+                return status == '0'
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            debug_log(f"[xAI] create code HTTP fallback to page fetch: {sanitize_terminal_error(exc)}")
     s = await page.evaluate(f"(async()=>{{var fb=Uint8Array.from(atob('{fb64}'),c=>c.charCodeAt(0));var r=await fetch('{SITE_URL}/auth_mgmt.AuthManagement/CreateEmailValidationCode',{{method:'POST',headers:{{'content-type':'application/grpc-web+proto','x-grpc-web':'1','x-user-agent':'connect-es/2.1.1'}},body:fb.buffer}});return r.headers.get('grpc-status')||'0';}})()")
     return s == '0'
 
@@ -676,6 +966,17 @@ async def grpc_verify_code(page, email, code):
     inner = pb_str(1, email) + pb_str(2, code)
     frame = b'\x00' + struct.pack('>I', len(inner)) + inner
     fb64 = base64.b64encode(frame).decode()
+    if _cf_ares_xai_mode_enabled():
+        try:
+            status = await _grpc_verify_code_http(page, email, code)
+            if status is not None:
+                if REGISTRATION_DIAGNOSTICS and status != '0':
+                    debug_log('[C] verify rejected')
+                return status == '0'
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            debug_log(f"[xAI] verify code HTTP fallback to page fetch: {sanitize_terminal_error(exc)}")
     s = await page.evaluate(f"(async()=>{{var fb=Uint8Array.from(atob('{fb64}'),c=>c.charCodeAt(0));var r=await fetch('{SITE_URL}/auth_mgmt.AuthManagement/VerifyEmailValidationCode',{{method:'POST',headers:{{'content-type':'application/grpc-web+proto','x-grpc-web':'1','x-user-agent':'connect-es/2.1.1'}},body:fb.buffer}});return r.headers.get('grpc-status')||'0';}})()")
     if REGISTRATION_DIAGNOSTICS and s != '0':
         debug_log('[C] verify rejected')
@@ -690,6 +991,100 @@ def auth_cookie_snapshot(cookies):
         for cookie in cookies
         if cookie.get("name") in {"sso", "sso-rw"}
     ]
+
+def _cookie_items_from_response(response):
+    cookies = []
+    jar = getattr(response, "cookies", None)
+    try:
+        iterator = jar.items()
+    except Exception:
+        iterator = ()
+    for name, value in iterator:
+        cookies.append(
+            {
+                "name": str(name),
+                "value": str(value),
+                "domain": "accounts.x.ai",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        )
+    set_cookie = _response_header(response, "set-cookie", "")
+    if set_cookie:
+        for part in str(set_cookie).split(","):
+            match = re.match(r"\s*([^=;,]+)=([^;]*)", part)
+            if not match:
+                continue
+            name, value = match.group(1), match.group(2)
+            if name in {"sso", "sso-rw"}:
+                cookies.append(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": "accounts.x.ai",
+                        "path": "/",
+                        "httpOnly": "httponly" in part.lower(),
+                        "secure": "secure" in part.lower(),
+                        "sameSite": "Lax",
+                    }
+                )
+    return cookies
+
+def _sso_from_cookie_items(cookies):
+    return next((c.get("value") for c in cookies if c.get("name") == "sso"), None)
+
+async def _server_action_register_http(page, payload):
+    response = await _xai_http_request_async(
+        "POST",
+        f"{SITE_URL}/sign-up",
+        page=page,
+        headers={
+            "accept": "text/x-component",
+            "content-type": "text/plain;charset=UTF-8",
+            "next-router-state-tree": STATE_TREE,
+            "next-action": ACTION_ID,
+            "origin": SITE_URL,
+            "referer": f"{SITE_URL}/sign-up?redirect=grok-com",
+        },
+        data=payload,
+        timeout=30,
+    )
+    if response is None or not hasattr(response, "text"):
+        return None
+    return {
+        "status": getattr(response, "status_code", 200) or 200,
+        "retryAfter": _response_header(response, "retry-after", ""),
+        "text": _response_text(response),
+    }
+
+async def _get_sso_via_ares_set_cookie(page, url, *, include_session=False):
+    if not _cf_ares_xai_mode_enabled():
+        return None
+    try:
+        response = await _xai_http_request_async(
+            "GET",
+            url,
+            page=page,
+            headers={
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "referer": f"{SITE_URL}/sign-up?redirect=grok-com",
+            },
+            timeout=15,
+        )
+        cookies = _cookie_items_from_response(response)
+        sso = _sso_from_cookie_items(cookies)
+        if not sso:
+            return None
+        if include_session:
+            return sso, auth_cookie_snapshot(cookies)
+        return sso
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        debug_log(f"[xAI] set-cookie via CF-Ares failed: {sanitize_terminal_error(exc)}")
+        return None
 
 
 async def server_action_register(
@@ -712,11 +1107,24 @@ async def server_action_register(
         "turnstileToken": turnstile_token, "promptOnDuplicateEmail": True
     }])
     pb64 = base64.b64encode(payload.encode()).decode()
-    if REGISTRATION_DIAGNOSTICS:
+    diagnostic = None
+    result_text = None
+    if _cf_ares_xai_mode_enabled():
+        try:
+            diagnostic = await _server_action_register_http(page, payload)
+            if diagnostic is not None:
+                result_text = diagnostic["text"]
+                debug_log("[xAI] signup submitted via CF-Ares HTTP")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            debug_log(f"[xAI] signup HTTP fallback to page fetch: {sanitize_terminal_error(exc)}")
+
+    if result_text is None and REGISTRATION_DIAGNOSTICS:
         diagnostic_json = await page.evaluate(f"""(async()=>{{var r=await fetch('{SITE_URL}/sign-up',{{method:'POST',headers:{{'accept':'text/x-component','content-type':'text/plain;charset=UTF-8','next-router-state-tree':'{STATE_TREE}','next-action':'{ACTION_ID}'}},body:atob('{pb64}')}});return JSON.stringify({{status:r.status,retryAfter:r.headers.get('retry-after')||'',text:await r.text()}});}})()""")
         diagnostic = json.loads(diagnostic_json)
         result_text = diagnostic['text']
-    else:
+    elif result_text is None:
         diagnostic = None
         result_text = await page.evaluate(f"""(async()=>{{var r=await fetch('{SITE_URL}/sign-up',{{method:'POST',headers:{{'accept':'text/x-component','content-type':'text/plain;charset=UTF-8','next-router-state-tree':'{STATE_TREE}','next-action':'{ACTION_ID}'}},body:atob('{pb64}')}});return await r.text();}})()""")
     # 注册响应里带一个 set-cookie 重定向 URL,必须访问它,x.ai 才会下发真正的 sso cookie(152 字符 JWT)。
@@ -737,6 +1145,13 @@ async def server_action_register(
             raise RegistrationRateLimited("signup_rate_limited")
         return None
     url = m.group(1)
+    ares_result = await _get_sso_via_ares_set_cookie(
+        page,
+        url,
+        include_session=include_session,
+    )
+    if ares_result:
+        return ares_result
     if C_SET_COOKIE_VIA_REQUEST:
         try:
             await page.context.request.get(url, timeout=15000)
@@ -784,6 +1199,31 @@ SOLVER_MOUSE_CLICK_RETRIES = _env_int("SOLVER_MOUSE_CLICK_RETRIES", 3)
 SOLVER_MOUSE_CLICK_INTERVAL_MS = _env_int("SOLVER_MOUSE_CLICK_INTERVAL_MS", 600)
 SOLVER_TIMELINE_TRACE = (os.environ.get("SOLVER_TIMELINE_TRACE", "0").strip().lower() in ("1", "true", "yes"))
 SOLVER_TIMELINE_SAMPLE = _env_int("SOLVER_TIMELINE_SAMPLE", 8)
+# Turnstile 后端(默认 hybrid=Go 网关多核异步):
+#   hybrid — native/solver-gateway + Rust 看门狗 + C++ util + Python browser worker
+#   d3vin  — 旧 vendor d3vin(兼容，后续删除)
+#   theyka — 旧 vendor theyka(兼容，后续删除)
+#   local  — 本机 Playwright 注入
+#   api    — 外部 REST API
+from grok_register.turnstile_solver import (
+    ensure_solver_for_register,
+    ensure_solver_if_needed,
+    health_check as turnstile_health_check,
+    is_api_backend,
+    resolve_api_url,
+    resolve_engine,
+    resolve_solver_mode,
+    stop_managed_solver as _stop_managed_turnstile_solver,
+)
+
+TURNSTILE_SOLVER = resolve_solver_mode()
+TURNSTILE_API_URL = resolve_api_url(TURNSTILE_SOLVER)
+TURNSTILE_API_POLL_INTERVAL_MS = max(50, _env_int("TURNSTILE_API_POLL_INTERVAL_MS", 400))
+# hybrid 默认稍长超时；旧引擎仍可用 SOLVER_HARD_TIMEOUT
+_default_api_timeout = 120 if TURNSTILE_SOLVER == "hybrid" else SOLVER_HARD_TIMEOUT
+TURNSTILE_API_TIMEOUT = max(10, _env_int("TURNSTILE_API_TIMEOUT", _default_api_timeout))
+TURNSTILE_API_ACTION = (os.environ.get("TURNSTILE_API_ACTION") or "").strip()
+TURNSTILE_API_CDATA = (os.environ.get("TURNSTILE_API_CDATA") or "").strip()
 _solver_timeline_emitted = 0
 _solver_timeline_next_id = 0
 
@@ -1240,12 +1680,270 @@ async def _wait_turnstile_challenge(item):
         await _put_solver_page(item, ok)
 
 
+def _turnstile_api_task_id(payload):
+    if not isinstance(payload, dict):
+        return None
+    for key in ("task_id", "taskId", "id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _turnstile_api_result_state(payload):
+    """归一化 Theyka / D3-vin 的 /result 响应。
+
+    返回 (state, token):
+      pending  — 仍在求解
+      ready    — 拿到 token
+      failed   — 明确失败
+      error    — 响应不可解析
+    """
+    if payload is None:
+        return "error", None
+    if isinstance(payload, str):
+        text = payload.strip()
+        if text in ("CAPTCHA_NOT_READY", "processing", "PENDING", "pending"):
+            return "pending", None
+        if text in ("CAPTCHA_FAIL", "error", "failed", "ERROR"):
+            return "failed", None
+        if len(text) > 10:
+            return "ready", text
+        return "error", None
+    if not isinstance(payload, dict):
+        return "error", None
+
+    status = str(payload.get("status") or "").strip().lower()
+    if status in ("processing", "pending", "captcha_not_ready", "in_progress"):
+        return "pending", None
+    if status in ("error", "failed", "fail"):
+        return "failed", None
+
+    value = payload.get("value")
+    if value is None and isinstance(payload.get("solution"), dict):
+        value = payload["solution"].get("token") or payload["solution"].get("value")
+    if value is None:
+        value = payload.get("token")
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text in ("CAPTCHA_NOT_READY", "processing", "PENDING", "pending"):
+            return "pending", None
+        if text in ("CAPTCHA_FAIL", "error", "failed", "ERROR"):
+            return "failed", None
+        if len(text) > 10:
+            return "ready", text
+
+    if status == "ready":
+        return "error", None
+    if payload.get("error") or payload.get("errorCode"):
+        return "failed", None
+    return "error", None
+
+
+def _turnstile_api_http_get(url, *, timeout):
+    """同步 GET;不走代理(外部 solver 通常在本机/内网)。
+
+    timeout 可为 float 秒,或 (connect, read) 元组。
+    """
+    return req.get(url, timeout=timeout, proxies={"http": None, "https": None})
+
+
+# 限制同时打到内置 solver 的任务数,避免 5 个 S_Worker 把 2 线程 solver 打满后互相拖死
+_turnstile_api_inflight = None
+
+
+def _get_turnstile_api_inflight():
+    global _turnstile_api_inflight
+    if _turnstile_api_inflight is None:
+        # hybrid: align with effective slots (workers × concurrency), else threads
+        if TURNSTILE_SOLVER == "hybrid":
+            workers_raw = (os.environ.get("SOLVER_GATEWAY_WORKERS") or "auto").strip().lower()
+            try:
+                import os as _os
+
+                cores = max(1, (_os.cpu_count() or 2) - 1)
+            except Exception:
+                cores = 2
+            if workers_raw in ("", "auto", "0"):
+                workers = max(1, min(cores, _env_int("SOLVER_GATEWAY_WORKERS_MAX", 6)))
+            else:
+                try:
+                    workers = max(1, int(workers_raw))
+                except ValueError:
+                    workers = max(1, _env_int("TURNSTILE_SOLVER_THREADS", 2))
+            conc = _env_int("SOLVER_WORKER_CONCURRENCY", 0)
+            if conc <= 0:
+                conc = 2 if workers <= 2 and cores >= 3 else 1
+            default_inflight = max(1, workers * conc)
+        else:
+            default_inflight = max(1, _env_int("TURNSTILE_SOLVER_THREADS", 2))
+        inflight = max(1, _env_int("TURNSTILE_API_INFLIGHT", default_inflight))
+        _turnstile_api_inflight = asyncio.Semaphore(inflight)
+        debug_log(
+            f"[solver-api] inflight={inflight} mode={TURNSTILE_SOLVER} engine={resolve_engine()}"
+        )
+    return _turnstile_api_inflight
+
+
+async def solve_one_turnstile_via_api():
+    """通过 Theyka / D3-vin 兼容 REST API 获取 Turnstile token。
+
+    On-demand: if API is down, try to start managed hybrid/d3vin once, then retry.
+    """
+    if not SITE_KEY:
+        debug_log("[solver-api] SITE_KEY missing")
+        return None, {"backend": "api", "error": "no_sitekey"}
+
+    global TURNSTILE_API_URL
+    # Lazy start when on-demand and solver not yet listening
+    if is_api_backend(TURNSTILE_SOLVER) and not turnstile_health_check(TURNSTILE_API_URL, timeout=1.0):
+        try:
+            meta = await asyncio.to_thread(
+                ensure_solver_if_needed, log=lambda m: debug_log(m)
+            )
+            TURNSTILE_API_URL = meta.get("api_url") or TURNSTILE_API_URL
+            if meta.get("managed"):
+                atexit.register(_stop_managed_turnstile_solver)
+                debug_log(f"[solver-api] on-demand started {TURNSTILE_API_URL}")
+        except Exception as exc:
+            debug_log(f"[solver-api] on-demand start failed: {sanitize_terminal_error(exc)}")
+
+    sem = _get_turnstile_api_inflight()
+    await sem.acquire()
+    try:
+        return await _solve_one_turnstile_via_api_unlocked()
+    finally:
+        sem.release()
+
+
+async def _solve_one_turnstile_via_api_unlocked():
+    base = TURNSTILE_API_URL
+    page_url = f"{SITE_URL}/sign-up"
+    params = [f"url={quote(page_url, safe='')}", f"sitekey={quote(SITE_KEY, safe='')}"]
+    if TURNSTILE_API_ACTION:
+        params.append(f"action={quote(TURNSTILE_API_ACTION, safe='')}")
+    if TURNSTILE_API_CDATA:
+        params.append(f"cdata={quote(TURNSTILE_API_CDATA, safe='')}")
+    create_url = f"{base}/turnstile?{'&'.join(params)}"
+
+    trace = {
+        "backend": "api",
+        "api_url": base,
+        "goto_s": 0.0,
+        "inject_s": 0.0,
+        "initial_s": 0.0,
+        "click_s": 0.0,
+        "wait_s": 0.0,
+        "reused": False,
+        "visible_frame": False,
+        "task_id": None,
+        "polls": 0,
+        "error": None,
+    }
+    # create 在 D3-vin 上应很快返回 taskId;给足 connect/read 避免偶发阻塞
+    create_timeout = (5, min(30, TURNSTILE_API_TIMEOUT))
+    try:
+        create_started = time.time()
+        response = await asyncio.to_thread(
+            _turnstile_api_http_get, create_url, timeout=create_timeout
+        )
+        trace["inject_s"] = time.time() - create_started
+    except Exception as exc:
+        trace["error"] = type(exc).__name__
+        debug_log(f"[solver-api] create failed: {sanitize_terminal_error(exc)}")
+        return None, trace
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if response.status_code >= 400:
+        trace["error"] = f"http_{response.status_code}"
+        debug_log(f"[solver-api] create HTTP {response.status_code}: {str(response.text)[:200]}")
+        return None, trace
+
+    task_id = _turnstile_api_task_id(payload)
+    if not task_id:
+        # 少数实现可能同步直接返回 token
+        state, token = _turnstile_api_result_state(payload)
+        if state == "ready" and token:
+            return token, trace
+        trace["error"] = "no_task_id"
+        debug_log(f"[solver-api] create missing task_id: {str(payload)[:200]}")
+        return None, trace
+    trace["task_id"] = task_id
+
+    result_url = f"{base}/result?id={quote(task_id, safe='')}"
+    poll_interval = TURNSTILE_API_POLL_INTERVAL_MS / 1000.0
+    deadline = time.time() + TURNSTILE_API_TIMEOUT
+    wait_started = time.time()
+    consecutive_timeouts = 0
+    while time.time() < deadline:
+        await asyncio.sleep(poll_interval)
+        trace["polls"] += 1
+        # D3-vin /result 在 event loop 忙时可能慢;用短 connect + 中等 read,超时后重试
+        remaining = max(1.0, deadline - time.time())
+        poll_timeout = (3, min(20.0, remaining))
+        try:
+            result_resp = await asyncio.to_thread(
+                _turnstile_api_http_get,
+                result_url,
+                timeout=poll_timeout,
+            )
+            consecutive_timeouts = 0
+        except Exception as exc:
+            consecutive_timeouts += 1
+            trace["error"] = type(exc).__name__
+            if consecutive_timeouts <= 3 or consecutive_timeouts % 10 == 0:
+                debug_log(
+                    f"[solver-api] poll error ({consecutive_timeouts}x): "
+                    f"{sanitize_terminal_error(exc)}"
+                )
+            continue
+        try:
+            result_payload = result_resp.json()
+        except Exception:
+            # Theyka 未就绪时可能直接返回 JSON 字符串 "CAPTCHA_NOT_READY"
+            text = (result_resp.text or "").strip()
+            if text.startswith('"') and text.endswith('"'):
+                try:
+                    result_payload = json.loads(text)
+                except Exception:
+                    result_payload = text.strip('"')
+            else:
+                result_payload = text or None
+
+        state, token = _turnstile_api_result_state(result_payload)
+        if state == "ready" and token:
+            trace["wait_s"] = time.time() - wait_started
+            trace["error"] = None
+            return token, trace
+        if state == "failed":
+            trace["wait_s"] = time.time() - wait_started
+            trace["error"] = "captcha_fail"
+            debug_log(f"[solver-api] task {task_id} failed")
+            return None, trace
+        # pending / error with non-4xx keep polling until deadline
+        if result_resp.status_code == 422:
+            trace["wait_s"] = time.time() - wait_started
+            trace["error"] = "http_422"
+            return None, trace
+
+    trace["wait_s"] = time.time() - wait_started
+    trace["error"] = "timeout"
+    debug_log(f"[solver-api] task {task_id} timeout after {TURNSTILE_API_TIMEOUT}s")
+    return None, trace
+
+
 async def solve_one_turnstile(browser):
     token, _trace = await solve_one_turnstile_with_trace(browser)
     return token
 
 
 async def solve_one_turnstile_with_trace(browser):
+    if is_api_backend(TURNSTILE_SOLVER):
+        return await solve_one_turnstile_via_api()
     item = await _start_turnstile_challenge(browser, fast_click=SOLVER_FAST_CLICK)
     token = await _wait_turnstile_challenge(item)
     return token, item.get("trace", {})
@@ -1282,9 +1980,17 @@ TEMPMAIL_BASES = ["https://api.mail.tm", "https://api.mail.gw", "https://api.duc
 _proxy_pool_cache = {"path": None, "mtime_ns": None, "items": (), "index": 0}
 _proxy_pool_lock = threading.Lock()
 _proxy_relay_link_cache = {}
+_proxy_relay_external_retry_at = 0.0
+_builtin_proxy_relay = None
+_builtin_proxy_relay_lock = threading.Lock()
 _proxy_auto_manager = None
 _proxy_auto_manager_lock = threading.Lock()
-_SHARE_LINK_SCHEMES = ("vmess", "vless", "trojan", "ss", "hy2", "hysteria2", "tuic", "anytls")
+_proxy_auto_startup_validated = False
+_SHARE_LINK_SCHEMES = (
+    "vmess", "vless", "trojan", "ss", "hy2", "hysteria2", "tuic", "anytls",
+    # socks5 with auth is relayed via sing-box (Chromium cannot do SOCKS5 auth)
+    "socks", "socks5", "socks5h",
+)
 _cf_ares_clients = {}
 _cf_ares_import_error = None
 _cf_ares_lock = threading.Lock()
@@ -1293,8 +1999,13 @@ def _normalize_proxy_line(line):
     proxy = (line or "").strip()
     if not proxy or proxy.startswith("#"):
         return None
+    # telegram socks deep links → socks5h://user:pass@host:port
+    if "t.me/socks" in proxy or "telegram.me/socks" in proxy:
+        proxy = _telegram_socks_to_url(proxy) or proxy
     if _share_link_scheme(proxy):
-        return _proxy_from_share_link(proxy)
+        if _proxy_needs_relay(proxy):
+            return _proxy_from_share_link(proxy)
+        return _normalize_direct_proxy_url(proxy)
     lowered = proxy.lower()
     if "://" not in lowered:
         if ":" not in proxy:
@@ -1303,6 +2014,71 @@ def _normalize_proxy_line(line):
         lowered = proxy.lower()
     if not lowered.startswith(("http://", "https://", "socks4://", "socks5://", "socks5h://")):
         return None
+    if _proxy_needs_relay(proxy):
+        return _proxy_from_share_link(proxy)
+    return _normalize_direct_proxy_url(proxy)
+
+
+def _telegram_socks_to_url(text):
+    """Convert https://t.me/socks?server=...&port=...&user=...&pass=... to socks5h URL."""
+    try:
+        parsed = urlparse((text or "").strip())
+    except Exception:
+        return None
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if "t.me" not in host and "telegram.me" not in host:
+        return None
+    if "socks" not in path:
+        return None
+    qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    server = (qs.get("server") or "").strip()
+    port = (qs.get("port") or "").strip()
+    user = (qs.get("user") or "").strip()
+    password = (qs.get("pass") or qs.get("password") or "").strip()
+    if not server or not port:
+        return None
+    if user or password:
+        return f"socks5h://{quote(user, safe='')}:{quote(password, safe='')}@{server}:{port}"
+    return f"socks5h://{server}:{port}"
+
+
+def _proxy_needs_relay(proxy):
+    """Whether this proxy URL must be converted to a local HTTP relay.
+
+    Playwright/Chromium cannot use SOCKS5 with username/password
+    ("Browser does not support socks5 proxy authentication"), so authenticated
+    socks5/socks5h are relayed to 127.0.0.1 HTTP via sing-box.
+
+    Share-link protocols (vmess/vless/trojan/ss/...) also need a relay.
+    """
+    try:
+        parsed = urlparse((proxy or "").strip())
+    except Exception:
+        return False
+    scheme = (parsed.scheme or "").lower()
+    if scheme in _SHARE_LINK_SCHEMES and scheme not in {
+        "socks",
+        "socks5",
+        "socks5h",
+        "http",
+        "https",
+    }:
+        return True
+    if scheme in {"socks", "socks5", "socks5h"} and (parsed.username or parsed.password):
+        return True
+    return False
+
+
+def _normalize_direct_proxy_url(proxy):
+    try:
+        parsed = urlparse((proxy or "").strip())
+    except Exception:
+        return proxy
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "socks":
+        rest = (proxy or "").split("://", 1)[-1]
+        return f"socks5://{rest}"
     return proxy
 
 def _share_link_scheme(text):
@@ -1358,6 +2134,88 @@ def _proxy_relay_json(method, path, payload=None):
         raise RuntimeError(message or getattr(response, "text", "proxy relay request failed"))
     return data
 
+def _builtin_proxy_relay_manager():
+    global _builtin_proxy_relay
+    if not PROXY_RELAY_BUILTIN_ENABLED:
+        return None
+    with _builtin_proxy_relay_lock:
+        if _builtin_proxy_relay is None:
+            _builtin_proxy_relay = BuiltinProxyRelay(
+                BuiltinProxyRelayConfig(
+                    enabled=PROXY_RELAY_BUILTIN_ENABLED,
+                    host=PROXY_RELAY_HOST,
+                    proxy_scheme=PROXY_RELAY_PROXY_SCHEME,
+                    work_dir=PROXY_RELAY_WORK_DIR,
+                    sing_box_bin=PROXY_RELAY_SING_BOX_BIN,
+                    auto_install=PROXY_RELAY_AUTO_INSTALL,
+                    start_port=PROXY_RELAY_START_PORT,
+                    max_nodes=PROXY_RELAY_MAX_NODES,
+                    start_timeout=PROXY_RELAY_START_TIMEOUT,
+                ),
+                logger=debug_log,
+            )
+        return _builtin_proxy_relay
+
+def _builtin_proxy_relay_import(share_link, kernel="sing-box", local_port=""):
+    manager = _builtin_proxy_relay_manager()
+    if manager is None:
+        raise RuntimeError("built-in proxy relay is disabled")
+    node = manager.import_link(share_link, kernel=kernel, local_port=local_port)
+    proxy = _proxy_from_relay_node(node)
+    if not proxy:
+        proxy = node.get("proxy") if isinstance(node, dict) else None
+    return proxy
+
+def _prune_builtin_proxy_relay(active_proxies):
+    manager = _builtin_proxy_relay
+    if manager is None:
+        return
+    try:
+        manager.prune(active_proxies)
+    except Exception as exc:
+        debug_log(f"built-in proxy relay prune failed: {sanitize_terminal_error(exc)}")
+
+def _is_builtin_relay_proxy(proxy):
+    try:
+        parsed = urlparse(proxy)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    relay_host = (PROXY_RELAY_HOST or "127.0.0.1").strip().lower()
+    if host not in {relay_host, "localhost", "127.0.0.1", "::1"}:
+        return False
+    try:
+        port = int(parsed.port)
+    except Exception:
+        return False
+    start = max(1, int(PROXY_RELAY_START_PORT))
+    return start <= port < min(65536, start + 2000)
+
+def _cleanup_tested_proxy(candidate, proxy, ok):
+    if ok or not proxy or not _share_link_scheme(candidate):
+        return
+    _proxy_relay_link_cache.pop((candidate or "").strip(), None)
+    manager = _builtin_proxy_relay
+    if manager is None:
+        return
+    try:
+        manager.stop_link(candidate)
+    except Exception as exc:
+        debug_log(f"built-in proxy relay cleanup failed: {sanitize_terminal_error(exc)}")
+
+def _proxy_relay_runtime_hint():
+    manager = _builtin_proxy_relay_manager() if PROXY_RELAY_BUILTIN_ENABLED else None
+    if manager is None:
+        return "built-in proxy relay disabled"
+    return manager.runtime_hint()
+
+def _external_proxy_relay_allowed():
+    return bool(PROXY_RELAY_URL and time.time() >= float(_proxy_relay_external_retry_at or 0))
+
+def _mark_external_proxy_relay_failed():
+    global _proxy_relay_external_retry_at
+    _proxy_relay_external_retry_at = time.time() + max(1, PROXY_RELAY_RETRY_SEC)
+
 def _relay_state_nodes(state):
     if not isinstance(state, dict):
         return []
@@ -1408,32 +2266,46 @@ def _proxy_from_share_link(share_link):
 
     scheme = _share_link_scheme(share_link)
     last_error = None
-    try:
-        state = _proxy_relay_json("GET", "/api/state")
-        proxy = _proxy_from_relay_node(_find_relay_node(state, share_link))
-        if proxy:
-            _proxy_relay_link_cache[share_link] = proxy
-            return proxy
+    if _external_proxy_relay_allowed():
+        try:
+            state = _proxy_relay_json("GET", "/api/state")
+            proxy = _proxy_from_relay_node(_find_relay_node(state, share_link))
+            if proxy:
+                _proxy_relay_link_cache[share_link] = proxy
+                return proxy
 
+            for kernel in _relay_kernel_candidates(scheme):
+                try:
+                    result = _proxy_relay_json(
+                        "POST",
+                        "/api/nodes/import",
+                        {"share_link": share_link, "kernel": kernel, "local_port": ""},
+                    )
+                    state = _proxy_relay_json("GET", "/api/state")
+                    proxy = _proxy_from_relay_node(_find_relay_node(state, share_link))
+                    if not proxy:
+                        port = _extract_relay_message_port(result.get("message", ""))
+                        proxy = _relay_proxy_url(port, kernel) if port else None
+                    if proxy:
+                        _proxy_relay_link_cache[share_link] = proxy
+                        return proxy
+                except Exception as exc:
+                    last_error = exc
+        except Exception as exc:
+            last_error = exc
+            _mark_external_proxy_relay_failed()
+
+    if PROXY_RELAY_BUILTIN_ENABLED:
         for kernel in _relay_kernel_candidates(scheme):
+            if kernel != "sing-box":
+                continue
             try:
-                result = _proxy_relay_json(
-                    "POST",
-                    "/api/nodes/import",
-                    {"share_link": share_link, "kernel": kernel, "local_port": ""},
-                )
-                state = _proxy_relay_json("GET", "/api/state")
-                proxy = _proxy_from_relay_node(_find_relay_node(state, share_link))
-                if not proxy:
-                    port = _extract_relay_message_port(result.get("message", ""))
-                    proxy = _relay_proxy_url(port, kernel) if port else None
+                proxy = _builtin_proxy_relay_import(share_link, kernel=kernel, local_port="")
                 if proxy:
                     _proxy_relay_link_cache[share_link] = proxy
                     return proxy
             except Exception as exc:
                 last_error = exc
-    except Exception as exc:
-        last_error = exc
 
     if last_error:
         debug_log(f"代理池分享链接转换失败({scheme or 'unknown'}): {last_error}")
@@ -1453,7 +2325,11 @@ def _unique_proxies(items):
 def _auto_bootstrap_proxies():
     cached = []
     with _proxy_pool_lock:
-        cached.extend(_proxy_pool_cache.get("items", ()) or ())
+        cached.extend(
+            proxy
+            for proxy in (_proxy_pool_cache.get("items", ()) or ())
+            if not _is_builtin_relay_proxy(proxy)
+        )
     manual = []
     for candidate in _proxy_pool_paths():
         try:
@@ -1465,7 +2341,12 @@ def _auto_bootstrap_proxies():
             if proxy:
                 manual.append(proxy)
         break
-    return _unique_proxies(cached + manual + load_active_proxies(PROXY_AUTO_CONFIG))
+    active = [
+        proxy
+        for proxy in load_active_proxies(PROXY_AUTO_CONFIG)
+        if not _is_builtin_relay_proxy(proxy)
+    ]
+    return _unique_proxies(cached + manual + active)
 
 def _ensure_proxy_auto_manager_started():
     global _proxy_auto_manager
@@ -1477,10 +2358,101 @@ def _ensure_proxy_auto_manager_started():
                 PROXY_AUTO_CONFIG,
                 _normalize_proxy_line,
                 bootstrap_proxies=_auto_bootstrap_proxies,
+                cleanup_proxy=_cleanup_tested_proxy,
                 logger=debug_log,
             )
         _proxy_auto_manager.start()
         return _proxy_auto_manager
+
+def _refresh_auto_proxy_pool_once():
+    """Refresh the auto proxy pool synchronously before starting workers."""
+    global _proxy_auto_manager
+    if not PROXY_AUTO_CONFIG.enabled:
+        return load_active_proxies(PROXY_AUTO_CONFIG)
+    with _proxy_auto_manager_lock:
+        if _proxy_auto_manager is None:
+            _proxy_auto_manager = ProxyAutoManager(
+                PROXY_AUTO_CONFIG,
+                _normalize_proxy_line,
+                bootstrap_proxies=_auto_bootstrap_proxies,
+                cleanup_proxy=_cleanup_tested_proxy,
+                logger=debug_log,
+            )
+        manager = _proxy_auto_manager
+    proxies = manager.refresh_once()
+    proxies = proxies or load_active_proxies(PROXY_AUTO_CONFIG)
+    _prune_builtin_proxy_relay(proxies)
+    return proxies
+
+def _proxy_auto_no_active_message():
+    message = "Proxy auto fetch produced no active proxies"
+    hints = []
+    try:
+        state = json.loads(PROXY_AUTO_CONFIG.state_path.read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+
+    if isinstance(state, dict):
+        test_count = state.get("test_count")
+        failed_count = state.get("failed_count")
+        if test_count is not None:
+            hints.append(f"tested={test_count}")
+        if failed_count is not None:
+            hints.append(f"failed={failed_count}")
+
+    error_summary = state.get("error_summary") if isinstance(state, dict) else None
+    if isinstance(error_summary, dict) and error_summary:
+        failures = ", ".join(
+            f"{reason} x{count}"
+            for reason, count in list(error_summary.items())[:3]
+        )
+        hints.append(f"failures: {failures}")
+
+    if (
+        PROXY_RELAY_ENABLED
+        and isinstance(error_summary, dict)
+        and error_summary.get("unsupported proxy")
+    ):
+        try:
+            _proxy_relay_json("GET", "/api/state")
+        except Exception as exc:
+            hints.append(
+                f"proxy-relay is not reachable at {PROXY_RELAY_URL}: {exc}"
+            )
+        hints.append(
+            f"built-in relay: {_proxy_relay_runtime_hint()}"
+        )
+        hints.append(
+            "start proxy-relay, enable built-in relay, or provide http/socks proxies instead of share links"
+        )
+
+    hints.append(f"state={PROXY_AUTO_CONFIG.state_path}")
+    if not hints:
+        return message
+    return f"{message} ({'; '.join(hints)})"
+
+async def _prepare_auto_proxy_pool_before_start():
+    global _proxy_auto_startup_validated
+    if not PROXY_AUTO_CONFIG.enabled:
+        return
+    test_targets = ", ".join(PROXY_AUTO_CONFIG.test_urls)
+    log(f"[proxy-auto] 启动前拉取代理并测试 Grok 连通性: {test_targets}")
+    debug_log("[proxy-auto] refreshing before registration start")
+    proxies = await asyncio.to_thread(_refresh_auto_proxy_pool_once)
+    debug_log(f"[proxy-auto] startup active={len(proxies)}")
+    if PROXY_AUTO_REQUIRE_ACTIVE and not proxies:
+        message = _proxy_auto_no_active_message()
+        log(f"[proxy-auto] 未筛出可用代理: {message}")
+        raise RuntimeError(message)
+    if proxies:
+        _proxy_auto_startup_validated = True
+        log(
+            f"[proxy-auto] 已优选 {len(proxies)} 个可访问 Grok/xAI 的代理, "
+            f"写入 {PROXY_AUTO_CONFIG.active_path}"
+        )
+    else:
+        log("[proxy-auto] 未筛出可用代理,按当前配置继续运行")
+    _ensure_proxy_auto_manager_started()
 
 def _auto_proxy_mtime_ns():
     if not PROXY_AUTO_CONFIG.enabled:
@@ -1511,6 +2483,7 @@ def _proxy_pool_paths():
 
 def _load_proxy_pool_locked():
     auto_mtime_ns = _auto_proxy_mtime_ns()
+    tested_only = _use_tested_proxy_pool_only()
     if not PROXY_POOL_FILE:
         items = tuple(_unique_proxies(_load_auto_proxy_items()))
         _proxy_pool_cache.update(
@@ -1571,7 +2544,11 @@ def _load_proxy_pool_locked():
     except OSError:
         items = []
         relay_pending = False
-    items = _unique_proxies(items + _load_auto_proxy_items())
+    auto_items = _load_auto_proxy_items()
+    if tested_only:
+        items = _unique_proxies(auto_items)
+    else:
+        items = _unique_proxies(items + auto_items)
     _proxy_pool_cache.update(
         {
             "path": str(path),
@@ -1585,18 +2562,128 @@ def _load_proxy_pool_locked():
     )
     return _proxy_pool_cache["items"]
 
-def _pick_grok_proxy():
-    """Pick one proxy from the Grok/XAI proxy pool; missing file means direct."""
+def _use_tested_proxy_pool_only():
+    return bool(PROXY_AUTO_CONFIG.enabled and PROXY_POOL_USE_TESTED_ONLY and _proxy_auto_startup_validated)
+
+def _pick_grok_proxy(*, prefer_unblocked=True):
+    """Pick one proxy from the Grok/XAI proxy pool; missing file means direct.
+
+    When prefer_unblocked is True and rate-limit scope is per-proxy, skip exits
+    that are currently cooling down so concurrent C workers fan out across IPs.
+    """
     _ensure_proxy_auto_manager_started()
     with _proxy_pool_lock:
-        items = _load_proxy_pool_locked()
+        items = list(_load_proxy_pool_locked())
         if not items:
             return None
+        candidates = items
+        if prefer_unblocked and REGISTRATION_RATE_LIMIT_SCOPE == "proxy":
+            free = [
+                proxy
+                for proxy in items
+                if not REGISTRATION_RATE_LIMIT_CIRCUIT.is_proxy_blocked(proxy)
+            ]
+            if free:
+                candidates = free
         if PROXY_POOL_STRATEGY == "random":
-            return random.choice(items)
-        idx = int(_proxy_pool_cache.get("index", 0)) % len(items)
-        _proxy_pool_cache["index"] = (idx + 1) % len(items)
-        return items[idx]
+            return random.choice(candidates)
+        # round-robin over the full pool index, but only return unblocked candidates
+        start = int(_proxy_pool_cache.get("index", 0)) % max(len(items), 1)
+        _proxy_pool_cache["index"] = (start + 1) % max(len(items), 1)
+        ordered = items[start:] + items[:start]
+        for proxy in ordered:
+            if proxy in candidates:
+                return proxy
+        return candidates[0]
+
+
+def _write_turnstile_solver_proxies(pool_items=None):
+    """Write Chromium-safe proxies for vendored Turnstile solver.
+
+    Registration may use authenticated SOCKS5 directly (Playwright supports it),
+    but the Turnstile solver's raw Chromium needs local HTTP relays. Build those
+    from the manual pool (via sing-box) and emit only 127.0.0.1 HTTP endpoints.
+    """
+    if pool_items is None:
+        with _proxy_pool_lock:
+            pool_items = list(_load_proxy_pool_locked())
+    lines = []
+    sources = list(pool_items or [])
+    # Also re-read manual file lines so we can still relay SOCKS auth for solver
+    # even when the registration pool keeps socks5h URLs direct.
+    try:
+        for path in _proxy_pool_paths():
+            if not path.is_file():
+                continue
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                raw = (raw or "").strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                if raw not in sources:
+                    sources.append(raw)
+    except Exception:
+        pass
+
+    for proxy in sources:
+        try:
+            parsed = urlparse(proxy if "://" in proxy else f"socks5h://{proxy}")
+        except Exception:
+            continue
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        if scheme in {"http", "https"} and host in {"127.0.0.1", "localhost", "::1"}:
+            lines.append(proxy)
+            continue
+        if scheme in {"http", "https"} and not (parsed.username or parsed.password):
+            lines.append(proxy)
+            continue
+        # SOCKS with auth (or share links): create/reuse local HTTP relay for solver
+        if scheme in {"socks", "socks5", "socks5h"} and (parsed.username or parsed.password):
+            if PROXY_RELAY_ENABLED:
+                try:
+                    # force through share-link relay path regardless of pool direct mode
+                    relayed = _proxy_from_share_link(proxy)
+                    if relayed:
+                        lines.append(relayed)
+                except Exception as exc:
+                    debug_log(
+                        f"turnstile relay for {host}:{parsed.port} failed: "
+                        f"{sanitize_terminal_error(exc)}"
+                    )
+            continue
+        if scheme in _SHARE_LINK_SCHEMES and PROXY_RELAY_ENABLED:
+            try:
+                relayed = _proxy_from_share_link(proxy)
+                if relayed:
+                    lines.append(relayed)
+            except Exception:
+                pass
+    # de-dupe preserve order
+    seen = set()
+    unique = []
+    for item in lines:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    out = PROJECT_ROOT / "turnstile-proxies.txt"
+    text = ("\n".join(unique) + ("\n" if unique else ""))
+    try:
+        out.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    # Write into active solver work dirs (hybrid + legacy engines for transition)
+    for eng in ("hybrid", "d3vin", "theyka"):
+        try:
+            work = PROJECT_ROOT / "logs" / "turnstile-solver" / eng / "proxies.txt"
+            work.parent.mkdir(parents=True, exist_ok=True)
+            work.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+    # Auto-enable solver proxy when we have usable local endpoints
+    if unique and not os.environ.get("TURNSTILE_SOLVER_PROXY"):
+        os.environ["TURNSTILE_SOLVER_PROXY"] = "1"
+    return len(unique)
 
 def _pick_email_proxy():
     """Backward-compatible alias; proxy pool is used for Grok/XAI, not email providers."""
@@ -1628,15 +2715,21 @@ def _playwright_proxy(proxy):
         item["password"] = parsed.password
     return item
 
-async def _new_grok_page(browser, proxy=None, *, always_context=False):
+async def _new_grok_page(browser, proxy=None, *, always_context=False, browser_fingerprint_id=None):
     proxy = _pick_grok_proxy() if proxy is None else proxy
     playwright_proxy = _playwright_proxy(proxy)
-    if playwright_proxy or always_context:
-        kwargs = {"proxy": playwright_proxy} if playwright_proxy else {}
+    context_kwargs = browser_context_options(
+        browser_fingerprint_id,
+        proxy=playwright_proxy,
+    )
+    if context_kwargs or always_context:
+        kwargs = dict(context_kwargs)
         context = await browser.new_context(**kwargs)
         page = await context.new_page()
+        _remember_page_proxy(page, proxy)
         return context, page
     page = await browser.new_page()
+    _remember_page_proxy(page, proxy)
     return None, page
 
 async def _close_grok_page(context, page):
@@ -1652,36 +2745,61 @@ async def _close_grok_page(context, page):
         except Exception:
             pass
 
-def _cf_ares_mode_enabled():
-    return CF_ARES_EMAIL_MODE in ("1", "true", "yes", "on", "fallback", "always")
-
-def _cf_ares_mode_always():
-    return CF_ARES_EMAIL_MODE == "always"
-
-def _cf_ares_add_import_path():
-    if not CF_ARES_PATH:
+async def _close_browser_safely(browser):
+    if browser is None:
         return
-    path = Path(CF_ARES_PATH).expanduser()
+    try:
+        await browser.close()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        debug_log(f'[*] browser close ignored: {sanitize_terminal_error(exc)}')
+
+def _cf_ares_mode_enabled(mode=None):
+    mode = CF_ARES_EMAIL_MODE if mode is None else (mode or "")
+    return mode in ("1", "true", "yes", "on", "fallback", "always")
+
+def _cf_ares_mode_always(mode=None):
+    mode = CF_ARES_EMAIL_MODE if mode is None else (mode or "")
+    return mode == "always"
+
+def _cf_ares_xai_mode_enabled():
+    return _cf_ares_mode_enabled(CF_ARES_XAI_MODE)
+
+def _cf_ares_xai_mode_always():
+    return _cf_ares_mode_always(CF_ARES_XAI_MODE)
+
+def _cf_ares_normalize_source_path(path):
     if path.is_file():
         path = path.parent
     if path.name == "cf_ares":
         path = path.parent
-    candidate = path if (path / "cf_ares").is_dir() else path
-    text = str(candidate)
-    if candidate.exists() and text not in sys.path:
+    return path if (path / "cf_ares").is_dir() else path
+
+def _cf_ares_add_import_path():
+    raw_paths = [CF_ARES_BUNDLED_PATH]
+    if CF_ARES_PATH:
+        raw_paths.append(Path(CF_ARES_PATH).expanduser())
+    for raw_path in raw_paths:
+        candidate = _cf_ares_normalize_source_path(raw_path)
+        if not candidate.exists():
+            continue
+        text = str(candidate)
+        if text in sys.path:
+            sys.path.remove(text)
         sys.path.insert(0, text)
 
 def _cf_ares_client_class():
+    _cf_ares_add_import_path()
     try:
         from cf_ares import AresClient
         return AresClient
     except Exception:
-        if not CF_ARES_PATH:
-            raise
-    _cf_ares_add_import_path()
+        pass
     for name in list(sys.modules):
         if name == "cf_ares" or name.startswith("cf_ares."):
             sys.modules.pop(name, None)
+    _cf_ares_add_import_path()
     from cf_ares import AresClient
     return AresClient
 
@@ -1747,11 +2865,51 @@ def _looks_like_cloudflare_block(response):
 def _cf_ares_request(method, url, **kwargs):
     with _cf_ares_lock:
         proxy = kwargs.pop("proxy", None)
-        client = _cf_ares_get_client(proxy=proxy)
         timeout = kwargs.pop("timeout", None)
         if timeout is not None:
             kwargs["timeout"] = timeout
-        return getattr(client, method.lower())(url, **kwargs)
+        try:
+            client = _cf_ares_get_client(proxy=proxy)
+            return getattr(client, method.lower())(url, **kwargs)
+        except Exception as exc:
+            debug_log(f"CF-Ares client unavailable, falling back to curl_cffi: {sanitize_terminal_error(exc)}")
+            return _curl_cffi_request(method, url, proxy=proxy, **kwargs)
+
+def _curl_cffi_request(method, url, **kwargs):
+    try:
+        from curl_cffi import requests as curl_requests
+    except Exception as exc:
+        raise RuntimeError("curl_cffi unavailable") from exc
+
+    request_kwargs = dict(kwargs)
+    proxy = request_kwargs.pop("proxy", None)
+    if proxy and "proxy" not in request_kwargs and "proxies" not in request_kwargs:
+        request_kwargs["proxy"] = proxy
+    if CF_ARES_IMPERSONATE and "impersonate" not in request_kwargs:
+        request_kwargs["impersonate"] = CF_ARES_IMPERSONATE
+    return curl_requests.request(method.upper(), url, **request_kwargs)
+
+def _response_header(response, name, default=""):
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return default
+    try:
+        return headers.get(name, headers.get(name.lower(), default))
+    except Exception:
+        lowered = name.lower()
+        for key, value in dict(headers).items():
+            if str(key).lower() == lowered:
+                return value
+    return default
+
+def _response_text(response):
+    try:
+        return response.text
+    except Exception:
+        try:
+            return response.content.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
 
 def _email_http_request(method, url, **kwargs):
     """External email-provider HTTP with optional CF-Ares fallback."""
@@ -2058,7 +3216,7 @@ class _NoopAsyncSemaphore:
 
 
 async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, metrics=None):
-    """使用一个页面发送一批 Q 请求。
+    """使用每个账号自己的浏览器指纹页面发送一批 Q 请求。
 
     返回每个请求的 sent 状态。等待 Q 返回不在此函数内发生,因此这里释放
     Physical_Sem 后不会占用本地重资源。
@@ -2079,36 +3237,38 @@ async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, met
         if metrics is not None:
             metrics.p_physical_count += 1
             metrics.p_physical_wait_seconds += physical_hold_started - physical_wait_started
-        context, page = await _new_grok_page(browser)
-        await page.set_viewport_size({"width": 800, "height": 600})
-        try:
-            stage_started = time.time()
-            await _prepare_signup_page(page, redirect=True, timeout=30000)
-            if metrics is not None:
-                metrics.p_page_prepare_count += 1
-                metrics.p_page_prepare_seconds += time.time() - stage_started
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return [{**item, "sent": False} for item in requests]
-
         results = []
         send_started = time.time()
         for item in requests:
+            context = None
+            page = None
             sent = False
             try:
+                browser_fingerprint_id = item.get("browser_fingerprint_id")
+                context, page = await _new_grok_page(
+                    browser,
+                    browser_fingerprint_id=browser_fingerprint_id,
+                )
+                if not browser_fingerprint_id:
+                    await page.set_viewport_size({"width": 800, "height": 600})
+                stage_started = time.time()
+                await _prepare_signup_page(page, redirect=True, timeout=30000)
+                if metrics is not None:
+                    metrics.p_page_prepare_count += 1
+                    metrics.p_page_prepare_seconds += time.time() - stage_started
                 sent = await grpc_create_code(page, item["email"])
             except asyncio.CancelledError:
                 raise
             except Exception:
                 sent = False
+            finally:
+                await _close_grok_page(context, page)
             results.append({**item, "sent": sent})
         if metrics is not None:
             metrics.p_send_count += 1
             metrics.p_send_seconds += time.time() - send_started
         return results
     finally:
-        await _close_grok_page(context, page)
         if physical_acquired:
             if metrics is not None and physical_hold_started is not None:
                 metrics.p_physical_hold_seconds += time.time() - physical_hold_started
@@ -2252,6 +3412,7 @@ async def _poll_and_admit_q(
                     'email': request["email"],
                     'password': request["password"],
                     'code': code,
+                    'browser_fingerprint_id': request.get("browser_fingerprint_id"),
                 },
                 q_slot_sem,
                 expires_at=returned_at + Q_MAX_AGE,
@@ -2294,16 +3455,21 @@ def _observe_background_task(task):
 # ──────────────────────────────────────────────
 
 class _CHotPageLease:
-    def __init__(self, browser, metrics=None):
+    def __init__(self, browser, metrics=None, browser_fingerprint_id=None):
         self.browser = browser
         self.metrics = metrics
+        self.browser_fingerprint_id = browser_fingerprint_id
         self.context = None
         self.page = None
 
     async def __aenter__(self):
         started = time.time()
         try:
-            self.context, self.page = await _acquire_c_page(self.browser, self.metrics)
+            self.context, self.page = await _acquire_c_page(
+                self.browser,
+                self.metrics,
+                browser_fingerprint_id=self.browser_fingerprint_id,
+            )
             return self.page
         finally:
             if self.metrics is not None:
@@ -2311,7 +3477,12 @@ class _CHotPageLease:
                 self.metrics.c_page_acquire_seconds += time.time() - started
 
     async def __aexit__(self, exc_type, exc, tb):
-        await _release_c_page(self.context, self.page, healthy=exc_type is None)
+        await _release_c_page(
+            self.context,
+            self.page,
+            healthy=exc_type is None,
+            browser_fingerprint_id=self.browser_fingerprint_id,
+        )
         self.context = None
         self.page = None
         return False
@@ -2322,14 +3493,27 @@ _c_hot_page_lock = asyncio.Lock()
 _c_hot_page_pool_size = derive_c_hot_page_pool_size(PHYSICAL_CAP or 1, C_WORKERS or 1)
 
 
-async def _new_c_hot_page(browser):
-    context, page = await _new_grok_page(browser, always_context=True)
-    await page.set_viewport_size({"width": 800, "height": 600})
+async def _new_c_hot_page(browser, browser_fingerprint_id=None):
+    context, page = await _new_grok_page(
+        browser,
+        always_context=True,
+        browser_fingerprint_id=browser_fingerprint_id,
+    )
+    if not browser_fingerprint_id:
+        await page.set_viewport_size({"width": 800, "height": 600})
     await _prepare_signup_page(page, redirect=True, timeout=30000)
     return context, page
 
 
-async def _acquire_c_page(browser, metrics=None):
+async def _acquire_c_page(browser, metrics=None, browser_fingerprint_id=None):
+    if browser_fingerprint_id:
+        if metrics is not None:
+            metrics.c_hot_page_misses += 1
+        return await _new_c_hot_page(
+            browser,
+            browser_fingerprint_id=browser_fingerprint_id,
+        )
+
     if C_HOT_PAGE_POOL:
         async with _c_hot_page_lock:
             if _c_hot_page_pool:
@@ -2346,7 +3530,11 @@ async def _acquire_c_page(browser, metrics=None):
     return context, page
 
 
-async def _release_c_page(context, page, *, healthy):
+async def _release_c_page(context, page, *, healthy, browser_fingerprint_id=None):
+    if browser_fingerprint_id:
+        await _close_grok_page(context, page)
+        return
+
     if not C_HOT_PAGE_POOL:
         await _close_grok_page(context, page)
         return
@@ -2386,8 +3574,8 @@ async def _release_c_page(context, page, *, healthy):
             pass
 
 
-def _c_page_lease(browser, metrics=None):
-    return _CHotPageLease(browser, metrics)
+def _c_page_lease(browser, metrics=None, browser_fingerprint_id=None):
+    return _CHotPageLease(browser, metrics, browser_fingerprint_id)
 
 
 async def _close_c_hot_page_pool():
@@ -2406,28 +3594,35 @@ async def _close_c_hot_page_pool():
 
 async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, admission_gate=None):
     """S_Worker: 生成 T 并入库。"""
+    use_api_solver = is_api_backend(TURNSTILE_SOLVER)
     while not STOP.is_set():
         t_lease = None
         try:
             if admission_gate is not None:
                 t_lease = await admission_gate.acquire_t_production()
 
+            # 外部 API solver 不占用本机浏览器物理并发槽
+            physical_held = False
             physical_wait_started = time.time()
-            await physical_sem.acquire()
-            physical_hold_started = time.time()
-            metrics.s_physical_count += 1
-            metrics.s_physical_wait_seconds += physical_hold_started - physical_wait_started
+            physical_hold_started = physical_wait_started
+            if not use_api_solver:
+                await physical_sem.acquire()
+                physical_held = True
+                physical_hold_started = time.time()
+                metrics.s_physical_count += 1
+                metrics.s_physical_wait_seconds += physical_hold_started - physical_wait_started
             token = None
             trace = {}
             solve_started = time.time()
+            hard_timeout = TURNSTILE_API_TIMEOUT if use_api_solver else SOLVER_HARD_TIMEOUT
             try:
                 try:
                     token, trace = await asyncio.wait_for(
                         solve_one_turnstile_with_trace(browser),
-                        timeout=SOLVER_HARD_TIMEOUT,
+                        timeout=hard_timeout,
                     )
                 except asyncio.TimeoutError:
-                    debug_log(f'[S] {wid} solver timeout after {SOLVER_HARD_TIMEOUT}s')
+                    debug_log(f'[S] {wid} solver timeout after {hard_timeout}s')
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -2435,8 +3630,9 @@ async def s_worker(wid, browser, inventory, physical_sem, t_slot_sem, metrics, a
             finally:
                 solve_elapsed = time.time() - solve_started
                 _record_solver_trace(metrics, trace, solve_elapsed, token)
-                metrics.s_physical_hold_seconds += time.time() - physical_hold_started
-                physical_sem.release()
+                if physical_held:
+                    metrics.s_physical_hold_seconds += time.time() - physical_hold_started
+                    physical_sem.release()
 
             if token is None:
                 metrics.t_discarded += 1
@@ -2511,9 +3707,20 @@ async def p_worker(
                 email_started = time.time()
                 try:
                     handle, email, password = await _create_email_async(loop)
+                    browser_fingerprint_id = await asyncio.to_thread(
+                        _remember_account_browser_fingerprint,
+                        email,
+                    )
                     metrics.p_email_create_count += 1
                     metrics.p_email_create_seconds += time.time() - email_started
-                    requests.append({"handle": handle, "email": email, "password": password})
+                    requests.append(
+                        {
+                            "handle": handle,
+                            "email": email,
+                            "password": password,
+                            "browser_fingerprint_id": browser_fingerprint_id,
+                        }
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -2609,6 +3816,18 @@ _key_export_tasks = set()
 
 def _key_export_path(*parts):
     return Path(KEY_EXPORT_DIR).joinpath(*parts)
+
+
+def _browser_fingerprint_path():
+    return _key_export_path(BROWSER_FINGERPRINT_FILENAME)
+
+
+def _remember_account_browser_fingerprint(email, browser_fingerprint_id=None):
+    return get_or_create_browser_fingerprint(
+        _browser_fingerprint_path(),
+        email,
+        browser_fingerprint_id,
+    )
 
 
 def _key_export_oauth_formats():
@@ -2770,6 +3989,7 @@ class _LocalKeyExportSink:
             receipt = await LocalAuthFileSink(
                 _key_export_path("cpa"),
                 name_secret=self.name_secret,
+                email=self.email,
             ).store(credential)
             fingerprints.append(receipt.fingerprint)
         if "sub2api" in self.formats:
@@ -2791,7 +4011,7 @@ class _SingleRegistrationSource:
         yield self.record
 
 
-async def _run_key_export_enrollment(email, sso, session_cookies):
+async def _run_key_export_enrollment(email, sso, session_cookies, browser_fingerprint_id=None):
     formats = _key_export_oauth_formats()
     if not formats:
         return None
@@ -2803,10 +4023,15 @@ async def _run_key_export_enrollment(email, sso, session_cookies):
     from xai_enroller.protocol import XAIProfile, XAIProtocol
 
     name_secret = _load_or_create_key_export_salt()
+    browser_fingerprint_id = _remember_account_browser_fingerprint(
+        email,
+        browser_fingerprint_id,
+    )
     record = SourceRecord(
         email,
         sso,
         tuple(session_cookies or ()),
+        browser_fingerprint_id,
     )
     proxy = _pick_grok_proxy()
     client_kwargs = {}
@@ -2844,14 +4069,21 @@ async def _run_key_export_enrollment(email, sso, session_cookies):
         await client.aclose()
 
 
-def _schedule_key_export_enrollment(email, sso, session_cookies):
+def _schedule_key_export_enrollment(email, sso, session_cookies, browser_fingerprint_id=None):
     if not _key_export_oauth_formats():
         return None
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
-    task = loop.create_task(_run_key_export_enrollment(email, sso, session_cookies))
+    task = loop.create_task(
+        _run_key_export_enrollment(
+            email,
+            sso,
+            session_cookies,
+            browser_fingerprint_id,
+        )
+    )
     _key_export_tasks.add(task)
 
     def done(completed):
@@ -2885,10 +4117,18 @@ async def _drain_key_export_tasks(timeout=None):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _persist_registration(email, password, sso, session_cookies):
+def _persist_registration(email, password, sso, session_cookies, browser_fingerprint_id=None):
+    browser_fingerprint_id = _remember_account_browser_fingerprint(
+        email,
+        browser_fingerprint_id,
+    )
     if session_cookies:
         document = json.dumps(
-            {"email": email, "cookies": session_cookies},
+            {
+                "email": email,
+                "cookies": session_cookies,
+                "browser_fingerprint_id": browser_fingerprint_id,
+            },
             separators=(",", ":"),
         )
         _append_registration_line(
@@ -2903,6 +4143,7 @@ def _persist_registration(email, password, sso, session_cookies):
             f"{email}:{password}:{sso}\n",
         )
         _append_registration_line(str(_key_export_path("grok.txt")), sso + "\n")
+    return browser_fingerprint_id
 
 
 async def _consume_pair(
@@ -2918,6 +4159,7 @@ async def _consume_pair(
     email = pair.q.value['email']
     password = pair.q.value['password']
     code = pair.q.value['code']
+    browser_fingerprint_id = pair.q.value.get('browser_fingerprint_id')
     token = pair.t.value
 
     # c_worker 在单次消费超时开始前完成冷却等待。保留这里的默认路径，
@@ -2935,6 +4177,7 @@ async def _consume_pair(
     physical_acquired = False
     physical_hold_started = None
     recovery_completed = False
+    limited_proxy = None
     try:
         physical_wait_started = time.time()
         await physical_sem.acquire()
@@ -2944,7 +4187,12 @@ async def _consume_pair(
         metrics.c_physical_wait_seconds += physical_hold_started - physical_wait_started
         t0 = time.time()
         try:
-            async with _c_page_lease(browser, metrics) as page:
+            async with _c_page_lease(
+                browser,
+                metrics,
+                browser_fingerprint_id=browser_fingerprint_id,
+            ) as page:
+                limited_proxy = _page_proxy(page)
                 sso = None
                 session_cookies = []
                 verify_started = time.time()
@@ -2956,10 +4204,18 @@ async def _consume_pair(
                 # 限流可能由另一项并发任务在本任务验证码校验期间触发。
                 # 非当前 probe 不得在 circuit 打开后开始新的注册提交；同时
                 # 避免使用校验过程中刚过期的 T/Q。
+                # per-proxy scope: skip submit only if THIS exit is cooling.
+                submit_ok = REGISTRATION_RATE_LIMIT_CIRCUIT.can_submit(recovery_probe)
+                if (
+                    submit_ok
+                    and REGISTRATION_RATE_LIMIT_SCOPE == "proxy"
+                    and REGISTRATION_RATE_LIMIT_CIRCUIT.is_proxy_blocked(limited_proxy)
+                ):
+                    submit_ok = False
                 if (
                     verified
                     and not _pair_is_expired(pair)
-                    and REGISTRATION_RATE_LIMIT_CIRCUIT.can_submit(recovery_probe)
+                    and submit_ok
                 ):
                     register_started = time.time()
                     try:
@@ -2977,11 +4233,15 @@ async def _consume_pair(
                         metrics.c_register_count += 1
                         metrics.c_register_seconds += time.time() - register_started
         except RegistrationRateLimited:
-            if REGISTRATION_RATE_LIMIT_CIRCUIT.trip():
+            if REGISTRATION_RATE_LIMIT_CIRCUIT.trip(limited_proxy):
+                wait_sec = REGISTRATION_RATE_LIMIT_CIRCUIT.remaining_seconds(
+                    limited_proxy
+                )
                 log(
                     format_user_registration_event(
                         "rate_limited",
-                        wait_seconds=REGISTRATION_RATE_LIMIT_CIRCUIT.remaining_seconds(),
+                        wait_seconds=wait_sec,
+                        proxy_key=_proxy_rate_limit_key(limited_proxy),
                     )
                 )
             return False
@@ -2989,8 +4249,19 @@ async def _consume_pair(
         if sso:
             elapsed = time.time() - t0
             async with file_lock:
-                _persist_registration(email, password, sso, session_cookies)
-                _schedule_key_export_enrollment(email, sso, session_cookies)
+                browser_fingerprint_id = _persist_registration(
+                    email,
+                    password,
+                    sso,
+                    session_cookies,
+                    browser_fingerprint_id,
+                )
+                _schedule_key_export_enrollment(
+                    email,
+                    sso,
+                    session_cookies,
+                    browser_fingerprint_id,
+                )
                 metrics.record_success()
                 success_count = metrics.success_count
                 count = metrics.success_count
@@ -3091,12 +4362,60 @@ async def c_worker(wid, browser, inventory, physical_sem, metrics, admission_gat
 # ──────────────────────────────────────────────
 #  只读监控
 # ──────────────────────────────────────────────
-async def monitor(inventory, sems, metrics, interval=8):
-    """定期输出系统状态。"""
+async def monitor(inventory, sems, metrics, interval=8, runtime_extra=None):
+    """定期输出系统状态,并写入 runtime-status.json 供控制面板读取。"""
+    from grok_register.runtime_status import build_register_snapshot, publish as publish_runtime
+
+    last_user_heartbeat = 0.0
     while not STOP.is_set():
         await asyncio.sleep(interval)
+        try:
+            extra = dict(runtime_extra or {})
+            extra.update(
+                {
+                    "target": TARGET,
+                    "email_mode": EMAIL_MODE,
+                    "turnstile_solver": TURNSTILE_SOLVER,
+                    "turnstile_api_url": TURNSTILE_API_URL if is_api_backend(TURNSTILE_SOLVER) else "",
+                    "log_mode": REGISTER_LOG_MODE,
+                    "rate_limit_open": bool(REGISTRATION_RATE_LIMIT_CIRCUIT.is_open()),
+                    "rate_limit_remaining_sec": float(
+                        REGISTRATION_RATE_LIMIT_CIRCUIT.remaining_seconds()
+                    ),
+                    "rate_limit_scope": REGISTRATION_RATE_LIMIT_SCOPE,
+                    "rate_limit_free_proxies": int(
+                        REGISTRATION_RATE_LIMIT_CIRCUIT.available_proxy_count()
+                    ),
+                }
+            )
+            publish_runtime(
+                build_register_snapshot(
+                    metrics=metrics,
+                    inventory=inventory,
+                    sems=sems,
+                    extra=extra,
+                )
+            )
+        except Exception:
+            pass
         if REGISTER_LOG_MODE == "debug":
             log(metrics.snapshot(inventory, sems))
+        elif REGISTER_HEARTBEAT_INTERVAL > 0:
+            now = time.monotonic()
+            if now - last_user_heartbeat >= REGISTER_HEARTBEAT_INTERVAL:
+                last_user_heartbeat = now
+                solver_part = (
+                    f" token失败:{metrics.t_solve_failed}"
+                    if metrics.t_solve_failed
+                    else ""
+                )
+                log(
+                    "[*] 运行中 | "
+                    f"T:{inventory.t_depth} Q:{inventory.q_depth} "
+                    f"发码:{metrics.q_sent} 回码:{metrics.q_returned} "
+                    f"开始:{metrics.registration_starts} 成功:{metrics.success_count}"
+                    f"{solver_part}"
+                )
         if TARGET and metrics.success_count >= TARGET:
             log(f'[*] 已达目标 {TARGET} 个,停止。'); STOP.set()
 
@@ -3105,7 +4424,15 @@ async def monitor(inventory, sems, metrics, interval=8):
 #  主入口
 # ──────────────────────────────────────────────
 async def main():
-    global TARGET, _c_hot_page_pool_size
+    from grok_register.polyglot import PolyglotError, print_stack_banner, require_polyglot_stack
+
+    try:
+        require_polyglot_stack()
+    except PolyglotError as exc:
+        print(f"[✗] {exc}", file=sys.stderr)
+        return 2
+    print_stack_banner()
+    global TARGET, _c_hot_page_pool_size, TURNSTILE_API_URL
     max_mem_arg = None
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg == '--max-mem' and i + 1 < len(sys.argv):
@@ -3123,6 +4450,7 @@ async def main():
         resources['max_mem'],
         profile_physical_cap=capacity_profile.get("physical_cap"),
     )
+    p_batch_max = derive_p_batch_max(physical_cap)
     p_send_cap = P_SEND_CAP if P_SEND_CAP > 0 else 0
     admission_watermarks = derive_admission_watermarks(physical_cap)
     _c_hot_page_pool_size = derive_c_hot_page_pool_size(physical_cap, c_workers)
@@ -3147,7 +4475,7 @@ async def main():
         f"  Admission: T_LOW/HIGH={admission_watermarks['t_low']}/{admission_watermarks['t_high']}  "
         f"Q_LOW/HIGH={admission_watermarks['q_low']}/{admission_watermarks['q_high']}"
     )
-    debug_log(f"  P_BatchMax={P_BATCH_MAX}  P_Send_Sem={'disabled' if p_send_cap == 0 else p_send_cap}")
+    debug_log(f"  P_BatchMax={p_batch_max}  P_Send_Sem={'disabled' if p_send_cap == 0 else p_send_cap}")
     debug_log(
         f"  C_HotPagePool={'on' if C_HOT_PAGE_POOL else 'off'}"
         f" size={_c_hot_page_pool_size if C_HOT_PAGE_POOL else 0}"
@@ -3159,6 +4487,14 @@ async def main():
         f"P_Request={P_REQUEST_TIMEOUT}s C_Consume={C_CONSUME_TIMEOUT}s"
     )
     debug_log(
+        f"  SolverBackend: {TURNSTILE_SOLVER}"
+        + (
+            f" api={TURNSTILE_API_URL} timeout={TURNSTILE_API_TIMEOUT}s"
+            if is_api_backend(TURNSTILE_SOLVER)
+            else ""
+        )
+    )
+    debug_log(
         f"  SolverMouseClick: retries={SOLVER_MOUSE_CLICK_RETRIES} "
         f"interval={SOLVER_MOUSE_CLICK_INTERVAL_MS}ms"
     )
@@ -3166,7 +4502,79 @@ async def main():
         debug_log(f"  Target: {TARGET}")
     debug_log("=" * 50)
 
+    # 先加载代理池(会把带认证 SOCKS5 经 sing-box 转成本地 HTTP),
+    # 再把可用本地 HTTP 代理写给内置 Turnstile solver(Chromium 不支持 SOCKS5 auth)。
+    await _prepare_auto_proxy_pool_before_start()
+    try:
+        with _proxy_pool_lock:
+            pool_items = list(_load_proxy_pool_locked())
+        written = _write_turnstile_solver_proxies(pool_items)
+        if written:
+            debug_log(f"[*] Turnstile solver proxies: {written} local HTTP endpoints")
+            log(f"[*] 已为 Turnstile solver 写入 {written} 个本地 HTTP 代理(SOCKS5 鉴权中继)")
+        elif pool_items:
+            debug_log(f"[*] proxy pool has {len(pool_items)} items but none suitable for Chromium solver")
+    except Exception as exc:
+        debug_log(f"[*] write turnstile solver proxies failed: {sanitize_terminal_error(exc)}")
+
+    # Turnstile: on-demand by default — do not pre-start heavy hybrid/d3vin.
+    # Local browser inject works without external solver; API path auto-starts
+    # on first ConnectionError via ensure_solver_if_needed.
+    if is_api_backend(TURNSTILE_SOLVER):
+        try:
+            if TURNSTILE_SOLVER in ("d3vin", "theyka"):
+                log(
+                    f"[!] 旧版 Turnstile 引擎 {TURNSTILE_SOLVER}；"
+                    "推荐 hybrid 或 local"
+                )
+            solver_meta = await asyncio.to_thread(ensure_solver_for_register, log=log)
+            TURNSTILE_API_URL = solver_meta.get("api_url") or resolve_api_url(TURNSTILE_SOLVER)
+            if solver_meta.get("managed"):
+                atexit.register(_stop_managed_turnstile_solver)
+            eng = solver_meta.get("engine") or resolve_engine(TURNSTILE_SOLVER)
+            if solver_meta.get("deferred"):
+                log(
+                    f"[*] Turnstile 按需模式 | mode={TURNSTILE_SOLVER} engine={eng} "
+                    f"url={TURNSTILE_API_URL}（遇到问题再自动拉起）"
+                )
+            elif solver_meta.get("managed") or solver_meta.get("already_running"):
+                log(
+                    f"[*] Turnstile API 就绪 | mode={TURNSTILE_SOLVER} "
+                    f"engine={eng} url={TURNSTILE_API_URL}"
+                )
+            else:
+                log(f"[*] Turnstile API: {TURNSTILE_API_URL}")
+        except Exception as exc:
+            log(f"[!] Turnstile 配置检查失败: {sanitize_terminal_error(exc)}")
+            # Non-fatal for local fallback paths
+            if TURNSTILE_SOLVER not in ("local",):
+                log("[!] 将在首次求解失败时再尝试启动 solver")
+
     await fetch_config()
+
+    # Protocol register (HTTP / Go worker) — preferred when REGISTER_ENGINE=go|protocol
+    reg_engine = (os.environ.get("REGISTER_ENGINE") or "python").strip().lower()
+    if reg_engine in {"go", "protocol", "http"}:
+        from grok_register.go_register import maybe_run_go_register_from_python
+
+        if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
+            log("[!] 协议注册需要 SITE_KEY/ACTION_ID/STATE_TREE，config fetch 不完整")
+            return 2
+        # On-demand Turnstile: protocol path solves captcha only after mailbox+code.
+        # Do not warm-start solver here; first solve_turnstile_sync will force-start.
+        if is_api_backend(TURNSTILE_SOLVER):
+            if turnstile_health_check(TURNSTILE_API_URL, timeout=1.2):
+                log(f"[*] 协议注册：复用已运行的 Turnstile {TURNSTILE_API_URL}")
+            else:
+                log(
+                    f"[*] 协议注册：Turnstile 暂不启动（按需）；"
+                    f"邮箱/验证码通过后首次 signup 再拉起 {TURNSTILE_API_URL}"
+                )
+        log("[*] 协议注册引擎 (HTTP 协议路径，不写 accounts.cpa.json)")
+        if TURNSTILE_API_URL:
+            os.environ["TURNSTILE_API_URL"] = TURNSTILE_API_URL
+        code = maybe_run_go_register_from_python(SITE_KEY, ACTION_ID, STATE_TREE)
+        return 0 if code is None else int(code)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(executable_path=find_chrome(), headless=True)
@@ -3219,7 +4627,7 @@ async def main():
                     metrics,
                     admission_gate,
                     p_send_sem,
-                    P_BATCH_MAX,
+                    p_batch_max,
                 )
             ))
 
@@ -3229,8 +4637,15 @@ async def main():
                 c_worker(i, browser, inventory, physical_sem, metrics, admission_gate)
             ))
 
-        # Monitor
-        tasks.append(asyncio.create_task(monitor(inventory, sems, metrics)))
+        # Monitor (+ runtime status for web control plane)
+        runtime_extra = {
+            "workers": {"S": s_workers, "P": p_workers, "C": c_workers},
+            "physical_cap": physical_cap,
+            "proxy_auto_enabled": bool(PROXY_AUTO_CONFIG.enabled),
+        }
+        tasks.append(
+            asyncio.create_task(monitor(inventory, sems, metrics, runtime_extra=runtime_extra))
+        )
 
         debug_log(f'[*] CSP up: S={s_workers} P={p_workers} C={c_workers} workers')
         log(
@@ -3249,7 +4664,21 @@ async def main():
                 t.cancel()
             await _drain_key_export_tasks()
             await _close_c_hot_page_pool()
-            await browser.close()
+            await _close_browser_safely(browser)
+            try:
+                from grok_register.runtime_status import clear_pid, publish
+
+                publish(
+                    {
+                        "service": "register",
+                        "running": False,
+                        "pid": os.getpid(),
+                        "success_count": metrics.success_count,
+                    }
+                )
+                clear_pid()
+            except Exception:
+                pass
             log(format_user_registration_event("stopped", count=metrics.success_count))
     return 0
 
@@ -3260,8 +4689,21 @@ if __name__ == "__main__":
         log("[!] 配置错误：REGISTER_LOG_MODE 应为 user 或 debug")
         raise SystemExit(2)
     try:
+        from grok_register.runtime_status import write_pid
+
+        write_pid(os.getpid())
+    except Exception:
+        pass
+    try:
         exit_code = asyncio.run(main())
     except ValueError as exc:
         log(f"[!] 配置错误：{sanitize_terminal_error(exc)}")
         exit_code = 2
+    finally:
+        try:
+            from grok_register.runtime_status import clear_pid
+
+            clear_pid()
+        except Exception:
+            pass
     raise SystemExit(exit_code)

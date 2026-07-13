@@ -87,6 +87,33 @@ def test_source_list_expands_one_level_with_rotating_proxies(tmp_path):
     assert all("trojan://" in result.text for result in results)
 
 
+def test_fetch_sources_falls_back_to_direct_when_bootstrap_proxy_fails(tmp_path):
+    config = proxy_auto.ProxyAutoConfig(
+        enabled=True,
+        sources=("https://source-one.test/sub",),
+        source_list_depth=0,
+        fetch_workers=1,
+        output_dir=str(tmp_path),
+    )
+    calls = []
+
+    def fake_get(url, proxy, timeout, headers):
+        calls.append(proxy)
+        if proxy:
+            raise RuntimeError("dead bootstrap proxy")
+        return Response("vless://id@example.test:443#node")
+
+    results = proxy_auto.fetch_source_bodies(
+        config,
+        ["http://127.0.0.1:19080"],
+        request_get=fake_get,
+    )
+
+    assert len(results) == 1
+    assert results[0].proxy is None
+    assert calls == ["http://127.0.0.1:19080", None]
+
+
 def test_test_candidates_uses_each_candidate_as_request_proxy(tmp_path):
     config = proxy_auto.ProxyAutoConfig(
         enabled=True,
@@ -111,7 +138,55 @@ def test_test_candidates_uses_each_candidate_as_request_proxy(tmp_path):
     assert set(calls) == {"http://good-proxy.test:8080", "http://bad-proxy.test:8080"}
 
 
-def test_refresh_retests_previous_active_proxies_when_fetch_finds_nothing(monkeypatch, tmp_path):
+def test_test_candidates_cleans_up_failed_proxies(tmp_path):
+    config = proxy_auto.ProxyAutoConfig(
+        enabled=True,
+        test_urls=("https://accounts.x.ai/sign-up",),
+        test_workers=1,
+        output_dir=str(tmp_path),
+    )
+    cleaned = []
+
+    def fake_get(url, proxy, timeout, headers):
+        return Response(status_code=503)
+
+    proxy_auto.test_candidates(
+        config,
+        ["vless://node@example.test:443#node"],
+        lambda _line: "http://127.0.0.1:19080",
+        cleanup_proxy=lambda candidate, proxy, ok: cleaned.append((candidate, proxy, ok)),
+        request_get=fake_get,
+    )
+
+    assert cleaned == [("vless://node@example.test:443#node", "http://127.0.0.1:19080", False)]
+
+
+def test_test_candidates_stops_after_max_active(tmp_path):
+    config = proxy_auto.ProxyAutoConfig(
+        enabled=True,
+        test_urls=("https://accounts.x.ai/sign-up",),
+        test_workers=2,
+        max_active=3,
+        output_dir=str(tmp_path),
+    )
+    calls = []
+
+    def fake_get(url, proxy, timeout, headers):
+        calls.append(proxy)
+        return Response(status_code=200)
+
+    results = proxy_auto.test_candidates(
+        config,
+        [f"http://proxy-{idx}.test:8080" for idx in range(10)],
+        lambda line: line,
+        request_get=fake_get,
+    )
+
+    assert len([item for item in results if item.ok]) >= 3
+    assert len(calls) < 10
+
+
+def test_refresh_retests_previous_active_and_manual_proxies_when_fetch_finds_nothing(monkeypatch, tmp_path):
     config = proxy_auto.ProxyAutoConfig(
         enabled=True,
         sources=(),
@@ -127,14 +202,14 @@ def test_refresh_retests_previous_active_proxies_when_fetch_finds_nothing(monkey
         fetch_bootstrap.extend(bootstrap)
         return []
 
-    def fake_test(_config, candidates, normalize_proxy):
+    def fake_test(_config, candidates, normalize_proxy, cleanup_proxy=None):
         tested.extend(candidates)
         return [
             proxy_auto.ProxyTestResult(
                 candidate,
                 normalize_proxy(candidate),
                 True,
-                latency_ms=5,
+                latency_ms=5 if "previous" in candidate else 10,
                 status_code=200,
             )
             for candidate in candidates
@@ -142,6 +217,7 @@ def test_refresh_retests_previous_active_proxies_when_fetch_finds_nothing(monkey
 
     monkeypatch.setattr(proxy_auto, "fetch_source_bodies", fake_fetch)
     monkeypatch.setattr(proxy_auto, "test_candidates", fake_test)
+    monkeypatch.setenv("PROXY_SCRAPER_MERGE", "0")
 
     manager = proxy_auto.ProxyAutoManager(
         config,
@@ -149,10 +225,73 @@ def test_refresh_retests_previous_active_proxies_when_fetch_finds_nothing(monkey
         bootstrap_proxies=lambda: ["http://manual.test:8080"],
     )
 
-    assert manager.refresh_once() == ["http://previous-good.test:8080"]
+    assert manager.refresh_once() == ["http://previous-good.test:8080", "http://manual.test:8080"]
     assert fetch_bootstrap == ["http://manual.test:8080", "http://previous-good.test:8080"]
-    assert tested == ["http://previous-good.test:8080"]
-    assert config.active_path.read_text(encoding="utf-8").strip() == "http://previous-good.test:8080"
+    assert tested == ["http://previous-good.test:8080", "http://manual.test:8080"]
+    assert config.active_path.read_text(encoding="utf-8").splitlines() == [
+        "http://previous-good.test:8080",
+        "http://manual.test:8080",
+    ]
+
+
+def test_write_outputs_orders_active_proxies_by_latency(tmp_path):
+    config = proxy_auto.ProxyAutoConfig(
+        enabled=True,
+        output_dir=str(tmp_path),
+        export_formats=("raw",),
+    )
+    results = [
+        proxy_auto.ProxyTestResult(
+            "http://slow.test:8080",
+            "http://slow.test:8080",
+            True,
+            latency_ms=900,
+            status_code=200,
+        ),
+        proxy_auto.ProxyTestResult(
+            "http://fast.test:8080",
+            "http://fast.test:8080",
+            True,
+            latency_ms=20,
+            status_code=200,
+        ),
+    ]
+
+    proxy_auto.write_outputs(config, results)
+
+    assert config.active_path.read_text(encoding="utf-8").splitlines() == [
+        "http://fast.test:8080",
+        "http://slow.test:8080",
+    ]
+
+
+def test_write_outputs_respects_max_active_after_latency_sort(tmp_path):
+    config = proxy_auto.ProxyAutoConfig(
+        enabled=True,
+        output_dir=str(tmp_path),
+        export_formats=("raw",),
+        max_active=1,
+    )
+    results = [
+        proxy_auto.ProxyTestResult(
+            "http://slow.test:8080",
+            "http://slow.test:8080",
+            True,
+            latency_ms=900,
+            status_code=200,
+        ),
+        proxy_auto.ProxyTestResult(
+            "http://fast.test:8080",
+            "http://fast.test:8080",
+            True,
+            latency_ms=20,
+            status_code=200,
+        ),
+    ]
+
+    proxy_auto.write_outputs(config, results)
+
+    assert config.active_path.read_text(encoding="utf-8").strip() == "http://fast.test:8080"
 
 
 def test_write_outputs_supports_sub2api_and_cpa(tmp_path):
@@ -182,6 +321,69 @@ def test_write_outputs_supports_sub2api_and_cpa(tmp_path):
     assert sub2api["accounts"] == []
     assert sub2api["proxies"][0]["proxy_key"] == "http|127.0.0.1|19080|user|pass"
     assert cpa["proxies"][0]["host"] == "127.0.0.1"
+
+
+def test_write_outputs_records_failure_summary(tmp_path):
+    config = proxy_auto.ProxyAutoConfig(
+        enabled=True,
+        output_dir=str(tmp_path),
+        export_formats=("raw",),
+    )
+    results = [
+        proxy_auto.ProxyTestResult(
+            "http://good.test:8080",
+            "http://good.test:8080",
+            True,
+            latency_ms=12,
+            status_code=200,
+        ),
+        proxy_auto.ProxyTestResult(
+            "vless://id@example.test:443#node",
+            None,
+            False,
+            error="unsupported proxy",
+        ),
+        proxy_auto.ProxyTestResult(
+            "http://bad.test:8080",
+            "http://bad.test:8080",
+            False,
+            status_code=503,
+            error="status 503",
+        ),
+    ]
+
+    proxy_auto.write_outputs(config, results)
+
+    state = json.loads(config.state_path.read_text(encoding="utf-8"))
+    assert config.active_path.read_text(encoding="utf-8").strip() == "http://good.test:8080"
+    assert state["active_count"] == 1
+    assert state["test_count"] == 3
+    assert state["failed_count"] == 2
+    assert state["error_summary"]["unsupported proxy"] == 1
+    assert state["error_summary"]["status 503"] == 1
+
+
+def test_load_previous_candidates_reads_original_share_links(tmp_path):
+    config = proxy_auto.ProxyAutoConfig(
+        enabled=True,
+        output_dir=str(tmp_path),
+        state_file="state.json",
+    )
+    config.state_path.write_text(
+        json.dumps(
+            {
+                "proxies": [
+                    {
+                        "candidate": "vless://id@example.test:443#node",
+                        "proxy": "http://127.0.0.1:19080",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert proxy_auto.load_previous_candidates(config) == ["vless://id@example.test:443#node"]
 
 
 def test_sub2api_payload_skips_protocols_sub2api_cannot_import():

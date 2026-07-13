@@ -4,4 +4,6 @@ PySocks>=1.7.1
 python-dotenv>=1.0.0
 httpx>=0.28
 playwright>=1.55
-cf-ares
+-e ./vendor/CF-Ares
+# 可选:内置 Turnstile Solver(vendor/turnstile-solver);TURNSTILE_SOLVER=d3vin|theyka 时需要
+-r vendor/turnstile-solver/requirements.txt

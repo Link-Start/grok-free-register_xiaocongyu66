@@ -120,45 +120,17 @@ class Metrics:
         elapsed = max(1.0, self._clock() - self.started_monotonic)
         return self.success_count * 60.0 / elapsed
 
-    def snapshot(self, inventory, sems):
-        """生成一行监控日志。"""
+    def to_dict(self, inventory=None, sems=None):
+        """Structured metrics for control plane / dashboard."""
         elapsed = time.time() - self.start_time
-        rate = self.success_count / (elapsed / 60) if elapsed > 60 else 0
+        rate = self.success_count / (elapsed / 60) if elapsed > 60 else 0.0
         p_batch_avg = (
             self.q_send_batch_items / self.q_send_batches
-            if self.q_send_batches else 0
+            if self.q_send_batches else 0.0
         )
         t_solve_avg = (
             self.t_solve_seconds / self.t_solve_count
-            if self.t_solve_count else 0
-        )
-        solver_goto_avg = (
-            self.solver_goto_seconds / self.t_solve_count
-            if self.t_solve_count else 0
-        )
-        solver_inject_avg = (
-            self.solver_inject_seconds / self.t_solve_count
-            if self.t_solve_count else 0
-        )
-        solver_initial_avg = (
-            self.solver_initial_seconds / self.t_solve_count
-            if self.t_solve_count else 0
-        )
-        solver_click_avg = (
-            self.solver_click_seconds / self.t_solve_count
-            if self.t_solve_count else 0
-        )
-        solver_wait_avg = (
-            self.solver_wait_seconds / self.t_solve_count
-            if self.t_solve_count else 0
-        )
-        solver_reuse_ratio = (
-            self.solver_reused_count / self.t_solve_count
-            if self.t_solve_count else 0
-        )
-        solver_visible_ratio = (
-            self.solver_visible_frame_count / self.t_solve_count
-            if self.t_solve_count else 0
+            if self.t_solve_count else 0.0
         )
         s_phys_wait, s_phys_hold = self._avg_pair(
             self.s_physical_wait_seconds, self.s_physical_hold_seconds, self.s_physical_count
@@ -169,39 +141,122 @@ class Metrics:
         c_phys_wait, c_phys_hold = self._avg_pair(
             self.c_physical_wait_seconds, self.c_physical_hold_seconds, self.c_physical_count
         )
-        p_email_create = self._avg(self.p_email_create_seconds, self.p_email_create_count)
-        p_page_prepare = self._avg(self.p_page_prepare_seconds, self.p_page_prepare_count)
-        p_send_stage = self._avg(self.p_send_seconds, self.p_send_count)
-        c_page_acquire = self._avg(self.c_page_acquire_seconds, self.c_page_acquire_count)
-        c_verify = self._avg(self.c_verify_seconds, self.c_verify_count)
-        c_register = self._avg(self.c_register_seconds, self.c_register_count)
-        p_send_sem = sems.get("p_send")
-        admission = sems.get("admission")
-        p_send_part = f' p_send:{p_send_sem._value}' if p_send_sem is not None else ''
+        data = {
+            "elapsed_sec": round(elapsed, 1),
+            "success_count": self.success_count,
+            "registration_starts": self.registration_starts,
+            "rate_per_min": round(rate, 2),
+            "runtime_avg_per_min": self.runtime_average_success_rate(),
+            "five_min_avg_per_min": self.five_minute_success_rate(),
+            "t": {
+                "depth": getattr(inventory, "t_depth", None) if inventory is not None else None,
+                "produced": self.t_produced,
+                "admitted": self.t_admitted,
+                "claimed": self.t_claimed,
+                "expired": self.t_expired,
+                "discarded": self.t_discarded,
+                "solve_count": self.t_solve_count,
+                "solve_failed": self.t_solve_failed,
+                "solve_avg_sec": round(t_solve_avg, 2),
+            },
+            "q": {
+                "depth": getattr(inventory, "q_depth", None) if inventory is not None else None,
+                "sent": self.q_sent,
+                "returned": self.q_returned,
+                "admitted": self.q_admitted,
+                "claimed": self.q_claimed,
+                "expired": self.q_expired,
+                "discarded": self.q_discarded,
+                "batch_avg": round(p_batch_avg, 2),
+            },
+            "pair": {
+                "claimed": self.pair_claimed,
+                "ok": self.pair_consumed_ok,
+                "fail": self.pair_consumed_fail,
+            },
+            "stages": {
+                "s_phys_wait_hold": [round(s_phys_wait, 2), round(s_phys_hold, 2)],
+                "p_phys_wait_hold": [round(p_phys_wait, 2), round(p_phys_hold, 2)],
+                "c_phys_wait_hold": [round(c_phys_wait, 2), round(c_phys_hold, 2)],
+                "p_email_page_send": [
+                    round(self._avg(self.p_email_create_seconds, self.p_email_create_count), 2),
+                    round(self._avg(self.p_page_prepare_seconds, self.p_page_prepare_count), 2),
+                    round(self._avg(self.p_send_seconds, self.p_send_count), 2),
+                ],
+                "c_page_verify_register": [
+                    round(self._avg(self.c_page_acquire_seconds, self.c_page_acquire_count), 2),
+                    round(self._avg(self.c_verify_seconds, self.c_verify_count), 2),
+                    round(self._avg(self.c_register_seconds, self.c_register_count), 2),
+                ],
+            },
+            "solver": {
+                "goto_avg": round(self._avg(self.solver_goto_seconds, self.t_solve_count), 2),
+                "inject_avg": round(self._avg(self.solver_inject_seconds, self.t_solve_count), 2),
+                "initial_avg": round(self._avg(self.solver_initial_seconds, self.t_solve_count), 2),
+                "click_avg": round(self._avg(self.solver_click_seconds, self.t_solve_count), 2),
+                "wait_avg": round(self._avg(self.solver_wait_seconds, self.t_solve_count), 2),
+                "reuse_ratio": round(
+                    self.solver_reused_count / self.t_solve_count if self.t_solve_count else 0.0, 2
+                ),
+                "visible_ratio": round(
+                    self.solver_visible_frame_count / self.t_solve_count if self.t_solve_count else 0.0, 2
+                ),
+            },
+            "c_hot": {"hits": self.c_hot_page_hits, "misses": self.c_hot_page_misses},
+        }
+        if sems is not None:
+            data["semaphores"] = {
+                "physical": getattr(sems.get("physical"), "_value", None),
+                "t_slot": getattr(sems.get("t_slot"), "_value", None),
+                "q_slot": getattr(sems.get("q_slot"), "_value", None),
+                "q_pending": getattr(sems.get("q_pending"), "_value", None),
+                "p_send": getattr(sems.get("p_send"), "_value", None) if sems.get("p_send") else None,
+            }
+            admission = sems.get("admission")
+            if admission is not None:
+                data["admission"] = {
+                    "t_in_progress": getattr(admission, "t_in_progress", None),
+                    "q_inflight": getattr(admission, "q_inflight", None),
+                }
+        return data
+
+    def snapshot(self, inventory, sems):
+        """生成一行监控日志。"""
+        d = self.to_dict(inventory, sems)
+        t, q, pair = d["t"], d["q"], d["pair"]
+        sem = d.get("semaphores") or {}
+        adm = d.get("admission") or {}
+        p_send_part = f' p_send:{sem["p_send"]}' if sem.get("p_send") is not None else ''
         admission_part = (
-            f' t_prog:{admission.t_in_progress} q_inflight:{admission.q_inflight}'
-            if admission is not None else ''
+            f' t_prog:{adm.get("t_in_progress")} q_inflight:{adm.get("q_inflight")}'
+            if adm else ''
         )
+        s_w, s_h = d["stages"]["s_phys_wait_hold"]
+        p_w, p_h = d["stages"]["p_phys_wait_hold"]
+        c_w, c_h = d["stages"]["c_phys_wait_hold"]
+        pe, pp, ps = d["stages"]["p_email_page_send"]
+        cp, cv, cr = d["stages"]["c_page_verify_register"]
+        sol = d["solver"]
         return (
-            f'[*] T:{inventory.t_depth} Q:{inventory.q_depth} '
-            f'phys:{sems["physical"]._value}{p_send_part} t_slot:{sems["t_slot"]._value} '
-            f'q_slot:{sems["q_slot"]._value} q_pend:{sems["q_pending"]._value} '
-            f'p_batch:{p_batch_avg:.1f}{admission_part} '
-            f's_phys:{s_phys_wait:.2f}/{s_phys_hold:.2f} '
-            f'p_phys:{p_phys_wait:.2f}/{p_phys_hold:.2f} '
-            f'c_phys:{c_phys_wait:.2f}/{c_phys_hold:.2f} '
-            f'p_stage:{p_email_create:.2f}/{p_page_prepare:.2f}/{p_send_stage:.2f} '
-            f'c_stage:{c_page_acquire:.2f}/{c_verify:.2f}/{c_register:.2f} '
-            f'c_hot:{self.c_hot_page_hits}/{self.c_hot_page_misses} '
-            f't_solve_avg:{t_solve_avg:.1f} t_solve_fail:{self.t_solve_failed} '
-            f'solver_goto:{solver_goto_avg:.2f} solver_inject:{solver_inject_avg:.2f} '
-            f'solver_initial:{solver_initial_avg:.2f} solver_click:{solver_click_avg:.2f} '
-            f'solver_wait:{solver_wait_avg:.2f} solver_reuse:{solver_reuse_ratio:.2f} '
-            f'solver_visible:{solver_visible_ratio:.2f} '
-            f't_prod:{self.t_produced} t_adm:{self.t_admitted} t_exp:{self.t_expired} '
-            f'q_sent:{self.q_sent} q_ret:{self.q_returned} q_adm:{self.q_admitted} q_exp:{self.q_expired} '
-            f'pair:{self.pair_claimed} ok:{self.pair_consumed_ok} fail:{self.pair_consumed_fail} '
-            f'rate:{rate:.1f}/min #{self.success_count}'
+            f'[*] T:{t["depth"]} Q:{q["depth"]} '
+            f'phys:{sem.get("physical")}{p_send_part} t_slot:{sem.get("t_slot")} '
+            f'q_slot:{sem.get("q_slot")} q_pend:{sem.get("q_pending")} '
+            f'p_batch:{q["batch_avg"]:.1f}{admission_part} '
+            f's_phys:{s_w:.2f}/{s_h:.2f} '
+            f'p_phys:{p_w:.2f}/{p_h:.2f} '
+            f'c_phys:{c_w:.2f}/{c_h:.2f} '
+            f'p_stage:{pe:.2f}/{pp:.2f}/{ps:.2f} '
+            f'c_stage:{cp:.2f}/{cv:.2f}/{cr:.2f} '
+            f'c_hot:{d["c_hot"]["hits"]}/{d["c_hot"]["misses"]} '
+            f't_solve_avg:{t["solve_avg_sec"]:.1f} t_solve_fail:{t["solve_failed"]} '
+            f'solver_goto:{sol["goto_avg"]:.2f} solver_inject:{sol["inject_avg"]:.2f} '
+            f'solver_initial:{sol["initial_avg"]:.2f} solver_click:{sol["click_avg"]:.2f} '
+            f'solver_wait:{sol["wait_avg"]:.2f} solver_reuse:{sol["reuse_ratio"]:.2f} '
+            f'solver_visible:{sol["visible_ratio"]:.2f} '
+            f't_prod:{t["produced"]} t_adm:{t["admitted"]} t_exp:{t["expired"]} '
+            f'q_sent:{q["sent"]} q_ret:{q["returned"]} q_adm:{q["admitted"]} q_exp:{q["expired"]} '
+            f'pair:{pair["claimed"]} ok:{pair["ok"]} fail:{pair["fail"]} '
+            f'rate:{d["rate_per_min"]:.1f}/min #{d["success_count"]}'
         )
 
     @staticmethod

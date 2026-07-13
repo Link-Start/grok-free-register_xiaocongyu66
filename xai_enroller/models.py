@@ -8,6 +8,7 @@ class SourceRecord:
     source_id: str
     sso_token: str
     cookies: tuple[dict, ...] = ()
+    browser_fingerprint_id: Optional[str] = None
 
     def __repr__(self) -> str:
         return "SourceRecord(<redacted>)"

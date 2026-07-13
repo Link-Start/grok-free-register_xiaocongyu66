@@ -2,6 +2,19 @@
 
 本文档记录当前运行时架构。README 面向使用者；本文面向维护者，重点是并发边界、资源生命周期和测试不变量。
 
+## 多语言硬性栈 (Python + Go + Rust)
+
+启动路径 `start.sh` / `auth-service.sh` / `setup.sh` 经 `scripts/ensure_runtime.sh` 调用 `scripts/polyglot_gate.sh`：
+
+| 组件 | 语言 | 路径 | 失败策略 |
+|------|------|------|----------|
+| 编排 / 浏览器 / 面板 | Python | `.venv/bin/python` | 缺则安装失败 |
+| 代理测活 | Go | `native/proxy-worker/proxy-worker` | 缺则拒绝启动 |
+| HTTP 注册 worker | Go | `native/register-worker/register-worker` | 缺则拒绝启动 |
+| 账号库存 / 成品包 | Rust | `native/inventory-worker/inventory-worker` | 缺则拒绝启动 |
+
+Python 侧 `grok_register.polyglot.require_polyglot_stack()` 在 `register` 与 `dashboard` 入口再次校验。仅测试可设 `POLYGLOT_REQUIRED=0`。
+
 ## 目标
 
 运行时采用 CSP 风格的异步流水线：

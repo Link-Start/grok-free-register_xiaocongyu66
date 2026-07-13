@@ -1,0 +1,2305 @@
+"""
+Web control plane + dashboard for grok-free-register.
+
+Read-only by default; optional process start/stop when CONTROL_PLANE_ALLOW_ACTIONS=1.
+
+  python -m grok_register.dashboard
+  bash start.sh --dashboard
+  open http://127.0.0.1:8787/
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+from grok_register.runtime_status import (
+    process_alive,
+    read_pid,
+    read_status,
+    status_path,
+)
+from grok_register.config_catalog import GROUPS, catalog_public
+from grok_register.env_store import load_config_view, update_env_values
+from grok_register import account_inventory as inv
+from grok_register import account_convert as acct_convert
+from grok_register import proxy_batch_test as proxy_batch
+from grok_register import cliproxyapi as cpa_sync
+from grok_register import job_store
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_HOST = (os.environ.get("DASHBOARD_HOST") or "127.0.0.1").strip()
+DEFAULT_PORT = int(os.environ.get("DASHBOARD_PORT") or "8787")
+# Control plane: config editable + start/stop workers. Progress is always readable.
+ALLOW_ACTIONS = (os.environ.get("CONTROL_PLANE_ALLOW_ACTIONS") or "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+_action_lock = threading.Lock()
+_last_action: dict = {"action": None, "ok": None, "message": "", "at": 0}
+_last_probe: dict = {"ok": None, "at": 0, "message": "", "results": []}
+_LAST_ACTION_PATH = PROJECT_ROOT / "logs" / "dashboard-last-action.json"
+_LAST_PROBE_PATH = PROJECT_ROOT / "logs" / "dashboard-last-probe.json"
+
+
+def _load_json_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_json_file(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _record_last_action(action: str, result: dict) -> None:
+    _last_action.update(
+        {
+            "action": action,
+            "ok": result.get("ok"),
+            "message": result.get("message") or "",
+            "at": time.time(),
+            "at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+    )
+    _save_json_file(_LAST_ACTION_PATH, dict(_last_action))
+
+
+# restore durable UI state after refresh / process restart
+_loaded_action = _load_json_file(_LAST_ACTION_PATH)
+if _loaded_action:
+    _last_action.update(_loaded_action)
+_loaded_probe = _load_json_file(_LAST_PROBE_PATH)
+if _loaded_probe:
+    _last_probe.update(_loaded_probe)
+
+
+def _accounts_count() -> int:
+    try:
+        return inv.inventory_summary()["total"]
+    except Exception:
+        path = PROJECT_ROOT / "keys" / "accounts.txt"
+        try:
+            return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        except OSError:
+            return 0
+
+
+def build_accounts_payload(*, limit: int = 500, status: str = "", fmt: str = "") -> dict:
+    """Account list + summary for control plane."""
+    records = inv.scan_accounts()
+    status_f = (status or "").strip().lower()
+    fmt_f = (fmt or "").strip().lower()
+    if status_f:
+        records = [r for r in records if r.status == status_f]
+    if fmt_f:
+        records = [r for r in records if fmt_f in r.formats]
+    total = len(records)
+    limit = max(1, min(int(limit or 500), 2000))
+    items = [r.to_dict() for r in records[:limit]]
+    # strip absolute paths for UI safety (relative under KEY_EXPORT_DIR)
+    root = inv.key_export_dir()
+    for item in items:
+        paths = item.get("paths") or {}
+        rel = {}
+        for k, p in paths.items():
+            try:
+                rel[k] = str(Path(p).resolve().relative_to(root.resolve()))
+            except Exception:
+                rel[k] = Path(p).name
+        item["paths"] = rel
+    summary = inv.inventory_summary()
+    return {
+        "ok": True,
+        "summary": summary,
+        "total": total,
+        "returned": len(items),
+        "limit": limit,
+        "filter": {"status": status_f, "format": fmt_f},
+        "accounts": items,
+        "downloads": {
+            "legacy": "/api/download?format=legacy",
+            "sub2api": "/api/download?format=sub2api",
+            "cpa_zip": "/api/download?format=cpa_zip",
+        },
+    }
+
+
+def _scraper_stats() -> dict:
+    report = PROJECT_ROOT / "logs" / "proxy-scraper-report.json"
+    candidates = PROJECT_ROOT / "logs" / "proxy-scraper-candidates.txt"
+    out = {"candidates_file": str(candidates), "candidates": 0, "report": None}
+    try:
+        out["candidates"] = sum(
+            1 for line in candidates.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+    except OSError:
+        pass
+    try:
+        out["report"] = json.loads(report.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return out
+
+
+def _proxy_active_count() -> int:
+    path = PROJECT_ROOT / "logs" / "proxy-auto-active.txt"
+    try:
+        return sum(
+            1
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    except OSError:
+        return 0
+
+
+def _env_public() -> dict:
+    keys = (
+        "EMAIL_MODE",
+        "TURNSTILE_SOLVER",
+        "TURNSTILE_API_URL",
+        "PROXY_AUTO_FETCH_ENABLED",
+        "PROXY_WORKER_ENGINE",
+        "TARGET",
+        "PHYSICAL_CAP",
+        "S_WORKERS",
+    )
+    return {k: os.environ.get(k, "") for k in keys}
+
+
+def build_overview() -> dict:
+    status = read_status()
+    pid = read_pid()
+    alive = process_alive(pid)
+    metrics = status.get("metrics") if isinstance(status.get("metrics"), dict) else {}
+    try:
+        from grok_register.polyglot import stack_status
+
+        polyglot = stack_status()
+    except Exception as exc:
+        polyglot = {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "time": time.time(),
+        "polyglot": polyglot,
+        "register": {
+            "running": alive,
+            "pid": pid if alive else None,
+            "status_file": str(status_path()),
+            "status_age_sec": (
+                round(time.time() - float(status.get("updated_at") or 0), 1)
+                if status.get("updated_at")
+                else None
+            ),
+            "snapshot": status if status else None,
+        },
+        "accounts": _accounts_overview_block(),
+        "proxies": {
+            "active": _proxy_active_count(),
+            "scraper": _scraper_stats(),
+            "batch_job": proxy_batch.job_status(),
+            "use_public_default": (
+                (os.environ.get("DASHBOARD_USE_PUBLIC_PROXIES") or "0").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
+        },
+        "config": _env_public(),
+        "config_full": load_config_view(reveal_secrets=False),
+        "config_groups": [{"id": g, "label": lab} for g, lab in GROUPS],
+        "actions_enabled": ALLOW_ACTIONS,
+        "last_action": _last_action,
+        "engines": {
+            "register": (os.environ.get("REGISTER_ENGINE") or "python").strip().lower(),
+            "proxy_worker": (os.environ.get("PROXY_WORKER_ENGINE") or "go").strip().lower(),
+            "inventory": (os.environ.get("INVENTORY_ENGINE") or "rust").strip().lower(),
+            "turnstile": (os.environ.get("TURNSTILE_SOLVER") or "hybrid").strip().lower(),
+        },
+        "summary": {
+            "success": (metrics.get("success_count") if metrics else status.get("success_count")),
+            "starts": (metrics.get("registration_starts") if metrics else None),
+            "t_depth": (metrics.get("t") or {}).get("depth") if metrics else None,
+            "q_depth": (metrics.get("q") or {}).get("depth") if metrics else None,
+            "pair_ok": (metrics.get("pair") or {}).get("ok") if metrics else None,
+            "pair_fail": (metrics.get("pair") or {}).get("fail") if metrics else None,
+            "t_prod": (metrics.get("t") or {}).get("produced") if metrics else None,
+            "rate": metrics.get("rate_per_min") if metrics else None,
+        },
+        "products": {
+            "sub2api": "/api/download?format=sub2api",
+            "cpa_zip": "/api/download?format=cpa_zip",
+            "legacy": "/api/download?format=legacy",
+        },
+        "xai_probe": {
+            "last": _last_probe if _last_probe.get("at") else None,
+        },
+        "convert_job": acct_convert.job_status(),
+        "cliproxyapi": cpa_sync.job_status(),
+    }
+
+
+def _accounts_overview_block() -> dict:
+    try:
+        summary = inv.inventory_summary()
+        return {
+            "count": summary.get("total", 0),
+            "by_status": summary.get("by_status") or {},
+            "by_format": summary.get("by_format") or {},
+            "artifacts": summary.get("artifacts") or {},
+            "export_dir": summary.get("export_dir") or "",
+        }
+    except Exception as exc:
+        return {"count": _accounts_count(), "error": str(exc)}
+
+
+def _spawn_register(args: list[str] | None = None, *, engine: str | None = None) -> dict:
+    if process_alive():
+        return {"ok": False, "message": "register already running"}
+    cmd = [sys.executable, "-m", "grok_register.register"]
+    if args:
+        cmd.extend(args)
+    log_path = PROJECT_ROOT / "logs" / "register-dashboard.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    eng = (engine or env.get("REGISTER_ENGINE") or "protocol").strip().lower()
+    if eng in {"protocol", "http", "go"}:
+        env["REGISTER_ENGINE"] = eng if eng != "http" else "protocol"
+    # detach — browser only displays progress via runtime-status + register-job.json
+    with open(log_path, "ab", buffering=0) as logf:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    # proot (tmoe) may leave children in tracing-stop; poke CONT
+    try:
+        time.sleep(0.15)
+        os.kill(proc.pid, signal.SIGCONT)
+    except Exception:
+        pass
+    try:
+        from grok_register.runtime_status import write_pid
+
+        write_pid(proc.pid)
+    except Exception:
+        pass
+    target = 0
+    if args:
+        for i, a in enumerate(args):
+            if a == "--target" and i + 1 < len(args):
+                try:
+                    target = int(args[i + 1])
+                except ValueError:
+                    pass
+    job_store.write_register_job(
+        running=True,
+        engine=env.get("REGISTER_ENGINE") or "python",
+        pid=proc.pid,
+        started_at=time.time(),
+        finished_at=0,
+        message=f"注册已启动 pid={proc.pid} engine={env.get('REGISTER_ENGINE')}（浏览器只读进度）",
+        error="",
+        target=target,
+        total=target,
+        success=0,
+        ok=0,
+        fail=0,
+        log=str(log_path),
+    )
+    return {
+        "ok": True,
+        "message": (
+            f"注册已启动 pid={proc.pid} engine={env.get('REGISTER_ENGINE')} "
+            f"· 进度 logs/runtime-status.json / logs/register-dashboard.log"
+        ),
+        "pid": proc.pid,
+        "log": str(log_path),
+        "engine": env.get("REGISTER_ENGINE") or "python",
+    }
+
+
+def _stop_register() -> dict:
+    pid = read_pid()
+    # also try register-job.json pid
+    job = job_store.read_register_job()
+    job_pid = job.get("pid")
+    killed = []
+    for p in {pid, job_pid}:
+        if not p:
+            continue
+        try:
+            if job_store.pid_alive(p):
+                os.kill(int(p), signal.SIGTERM)
+                killed.append(int(p))
+        except OSError:
+            pass
+    job_store.write_register_job(
+        running=False,
+        finished_at=time.time(),
+        message="已发送停止信号" + (f" → {killed}" if killed else "（未找到运行中进程）"),
+    )
+    if not killed:
+        return {"ok": False, "message": "register not running"}
+    return {"ok": True, "message": f"sent SIGTERM to {killed}"}
+
+
+def _run_scrape(data: dict | None = None) -> dict:
+    """
+    Start public proxy scrape in background.
+    By default scrape_to_files auto-starts Go batch x.ai test after writing candidates.
+    """
+    log_path = PROJECT_ROOT / "logs" / "scrape-dashboard.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "grok_register.proxy_scraper", "scrape"]
+    data = data or {}
+    if data.get("github") or data.get("use_github"):
+        cmd.append("--github")
+    # allow panel to force/disable auto-test
+    if data.get("no_auto_test") or data.get("auto_test") is False:
+        cmd.append("--no-auto-test")
+    elif data.get("auto_test") is True:
+        cmd.append("--auto-test")
+    env = os.environ.copy()
+    # sensible defaults for auto-test after scrape
+    env.setdefault("PROXY_SCRAPER_AUTO_TEST", "1")
+    env.setdefault("PROXY_SCRAPER_AUTO_TEST_MAX", "2000")
+    env.setdefault("PROXY_SCRAPER_AUTO_TEST_WORKERS", "128")
+    env.setdefault("PROXY_SCRAPER_AUTO_TEST_TIMEOUT", "5")
+    with open(log_path, "ab", buffering=0) as logf:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    auto = env.get("PROXY_SCRAPER_AUTO_TEST", "1") != "0" and "--no-auto-test" not in cmd
+    job_store.write_scrape_job(
+        running=True,
+        engine="python",
+        pid=proc.pid,
+        started_at=time.time(),
+        finished_at=0,
+        message=f"爬取运行中 pid={proc.pid}" + (" · 完成后自动测活" if auto else ""),
+        error="",
+        auto_test=auto,
+        log=str(log_path),
+    )
+    return {
+        "ok": True,
+        "message": (
+            f"爬取已启动 pid={proc.pid} · 完成后将自动测活 x.ai "
+            f"(可用 PROXY_SCRAPER_AUTO_TEST=0 关闭)"
+        ),
+        "pid": proc.pid,
+        "log": str(log_path),
+        "auto_test": auto,
+    }
+
+
+_XAI_PROBE_URLS = (
+    "https://accounts.x.ai/sign-up?redirect=grok-com",
+    "https://x.ai/",
+)
+
+
+def _probe_proxy_candidates(limit: int = 3) -> list[str]:
+    """Pick a few proxies from active pool / 代理.txt for probe-via-proxy."""
+    paths = [
+        PROJECT_ROOT / "logs" / "proxy-auto-active.txt",
+        PROJECT_ROOT / "代理.txt",
+        PROJECT_ROOT / "proxy.txt",
+    ]
+    raw_pool = (os.environ.get("PROXY_POOL_FILE") or "").strip()
+    if raw_pool:
+        p = Path(raw_pool).expanduser()
+        paths.insert(0, p if p.is_absolute() else PROJECT_ROOT / p)
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line in seen:
+                    continue
+                seen.add(line)
+                out.append(line)
+                if len(out) >= limit:
+                    return out
+        except OSError:
+            continue
+    return out
+
+
+def _http_probe(url: str, *, timeout: float, proxies: dict | None = None) -> dict:
+    import requests
+
+    started = time.monotonic()
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            proxies=proxies,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,*/*",
+            },
+            allow_redirects=True,
+        )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        code = int(resp.status_code)
+        ok = 200 <= code < 500  # reachable even if 403/429
+        return {
+            "url": url,
+            "ok": ok,
+            "reachable": True,
+            "status_code": code,
+            "latency_ms": latency_ms,
+            "final_url": str(resp.url)[:200],
+            "error": "" if ok else f"status {code}",
+        }
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "url": url,
+            "ok": False,
+            "reachable": False,
+            "status_code": None,
+            "latency_ms": latency_ms,
+            "final_url": "",
+            "error": str(exc)[:240],
+        }
+
+
+def probe_xai_access(
+    *,
+    timeout: float | None = None,
+    via_proxy: bool = True,
+    proxy_limit: int = 3,
+) -> dict:
+    """
+    Test whether this host (and optional proxies) can reach x.ai / accounts.x.ai.
+    Always allowed from control plane (read-only network check).
+    """
+    timeout = float(timeout if timeout is not None else (os.environ.get("XAI_PROBE_TIMEOUT") or "12"))
+    timeout = max(3.0, min(timeout, 60.0))
+    urls = list(_XAI_PROBE_URLS)
+    extra = (os.environ.get("PROXY_AUTO_TEST_URLS") or "").strip()
+    if extra:
+        for u in extra.split(","):
+            u = u.strip()
+            if u and u not in urls:
+                urls.append(u)
+
+    results: list[dict] = []
+    # 1) direct
+    for url in urls:
+        r = _http_probe(url, timeout=timeout, proxies=None)
+        r["via"] = "direct"
+        r["proxy"] = ""
+        results.append(r)
+
+    # 2) via sample proxies
+    proxy_rows = []
+    if via_proxy:
+        for cand in _probe_proxy_candidates(proxy_limit):
+            # requests wants scheme:// for both http and https keys
+            proxies = {"http": cand, "https": cand}
+            # only first URL via each proxy to keep probe fast
+            r = _http_probe(urls[0], timeout=timeout, proxies=proxies)
+            r["via"] = "proxy"
+            r["proxy"] = cand[:120]
+            results.append(r)
+            proxy_rows.append(r)
+
+    direct_ok = any(r.get("ok") for r in results if r.get("via") == "direct")
+    proxy_ok = any(r.get("ok") for r in proxy_rows) if proxy_rows else None
+    any_ok = any(r.get("ok") for r in results)
+
+    if any_ok and direct_ok:
+        message = "可访问 x.ai（直连成功）"
+        if proxy_ok:
+            message += " · 部分代理也可用"
+        elif proxy_rows:
+            message += " · 采样代理未通过"
+    elif any_ok and proxy_ok:
+        message = "直连失败，但采样代理可访问 x.ai（注册请开代理池）"
+    else:
+        message = "无法访问 x.ai / accounts.x.ai，请检查网络或代理"
+
+    out = {
+        "ok": any_ok,
+        "direct_ok": direct_ok,
+        "proxy_ok": proxy_ok,
+        "message": message,
+        "timeout_sec": timeout,
+        "results": results,
+        "at": time.time(),
+        "at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    _last_probe.clear()
+    _last_probe.update(out)
+    # persist without huge result bodies if needed — keep last 20
+    disk = dict(out)
+    if isinstance(disk.get("results"), list) and len(disk["results"]) > 20:
+        disk["results"] = disk["results"][:20]
+    _save_json_file(_LAST_PROBE_PATH, disk)
+    return out
+
+
+def _spawn_go_register(data: dict) -> dict:
+    """Start Go register-worker if binary exists."""
+    if process_alive():
+        return {"ok": False, "message": "register already running"}
+    candidates = [PROJECT_ROOT / "native" / "register-worker" / "register-worker"]
+    raw = (os.environ.get("REGISTER_WORKER_BIN") or "").strip()
+    if raw:
+        candidates.insert(0, Path(raw).expanduser())
+    binary = next((p for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
+    if binary is None:
+        return {
+            "ok": False,
+            "message": "register-worker not found; run bash scripts/build-native.sh",
+        }
+    workers = str(data.get("workers") or os.environ.get("GO_REGISTER_WORKERS") or "4")
+    target = str(data.get("target") or os.environ.get("TARGET") or "0")
+    cmd = [str(binary), "run", "--workers", workers]
+    if target and target != "0":
+        cmd.extend(["--target", target])
+    cfg = data.get("config")
+    cfg_path = None
+    if isinstance(cfg, dict) and cfg:
+        import tempfile
+
+        fd, cfg_path = tempfile.mkstemp(
+            prefix="go-register-", suffix=".json", dir=str(PROJECT_ROOT / "logs")
+        )
+        os.close(fd)
+        Path(cfg_path).write_text(json.dumps(cfg), encoding="utf-8")
+        cmd.extend(["--config", cfg_path])
+    log_path = PROJECT_ROOT / "logs" / "register-go-dashboard.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "ab", buffering=0) as logf:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+    try:
+        from grok_register.runtime_status import write_pid
+
+        write_pid(proc.pid)
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "message": f"go register-worker started pid={proc.pid}",
+        "pid": proc.pid,
+        "log": str(log_path),
+        "config": cfg_path,
+    }
+
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>grok-free-register</title>
+<style>
+  :root {
+    --bg:#0b1220; --panel:#121a2b; --panel2:#182238; --text:#e8eefc; --muted:#93a4c7;
+    --ok:#3ddc97; --bad:#ff6b6b; --warn:#ffd166; --accent:#6ea8fe; --border:#243352;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:ui-sans-serif,system-ui,"PingFang SC","Microsoft YaHei",sans-serif;background:radial-gradient(1200px 600px at 10% -10%,#1a2744 0%,var(--bg) 55%);color:var(--text);min-height:100vh}
+  header{display:flex;justify-content:space-between;align-items:center;padding:16px 22px;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(11,18,32,.9);backdrop-filter:blur(8px);z-index:10;gap:12px;flex-wrap:wrap}
+  h1{margin:0;font-size:17px}
+  .meta{color:var(--muted);font-size:12px}
+  .header-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .lang-switch{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:#152038}
+  .lang-switch button{border:0;background:transparent;color:var(--muted);padding:6px 12px;cursor:pointer;font-weight:700;font-size:12px}
+  .lang-switch button.active{background:#27407a;color:var(--text)}
+  nav{display:flex;gap:8px;margin:14px 22px 0;flex-wrap:wrap}
+  nav button{border:1px solid var(--border);background:#152038;color:var(--text);border-radius:999px;padding:7px 14px;cursor:pointer;font-weight:600}
+  nav button.active{background:#27407a;border-color:#3d63b8}
+  main{padding:16px 22px 40px;max-width:1280px;margin:0 auto}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  @media(max-width:960px){.grid{grid-template-columns:repeat(2,1fr)}}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:14px;padding:14px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+  .card h3{margin:0 0 8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .value{font-size:26px;font-weight:700}
+  .sub{margin-top:5px;color:var(--muted);font-size:12px}
+  .badge{display:inline-flex;gap:6px;align-items:center;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid var(--border)}
+  .badge.ok{color:var(--ok);border-color:rgba(61,220,151,.3)}
+  .badge.bad{color:var(--bad);border-color:rgba(255,107,107,.3)}
+  .dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+  .row{display:grid;grid-template-columns:1.1fr .9fr;gap:12px;margin-top:12px}
+  @media(max-width:900px){.row{grid-template-columns:1fr}}
+  button.act{border:1px solid var(--border);background:#1b2740;color:var(--text);border-radius:10px;padding:8px 12px;font-weight:600;cursor:pointer}
+  button.act.primary{background:#27407a;border-color:#3d63b8}
+  button.act.danger{background:#4a1f2a;border-color:#8a3a4d}
+  button.act:disabled{opacity:.45;cursor:not-allowed}
+  .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  .note{color:var(--muted);font-size:12px;margin-top:8px}
+  pre{margin:0;background:#0a101c;border:1px solid var(--border);border-radius:12px;padding:12px;overflow:auto;max-height:380px;font-size:12px;color:#cfe0ff}
+  table.cfg{width:100%;border-collapse:collapse;font-size:13px}
+  table.cfg th,table.cfg td{padding:8px 6px;border-bottom:1px solid rgba(36,51,82,.55);vertical-align:top}
+  table.cfg th{color:var(--muted);font-weight:600;text-align:left;font-size:11px;text-transform:uppercase}
+  table.cfg input,table.cfg select{width:100%;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px}
+  .group-title{margin:18px 0 8px;font-size:14px;font-weight:700}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1a2740;color:var(--muted);font-size:11px;margin-left:6px}
+  .hidden{display:none}
+  .tag{display:inline-block;padding:2px 7px;border-radius:6px;font-size:11px;font-weight:600;margin-right:4px;background:#1a2740;border:1px solid var(--border)}
+  .tag.ok{color:var(--ok);border-color:rgba(61,220,151,.35)}
+  .tag.warn{color:var(--warn);border-color:rgba(255,209,102,.35)}
+  .tag.muted{color:var(--muted)}
+  table.acc{width:100%;border-collapse:collapse;font-size:12px}
+  table.acc th,table.acc td{padding:8px 6px;border-bottom:1px solid rgba(36,51,82,.55);text-align:left;vertical-align:top}
+  table.acc th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase}
+  .dl-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  a.dl{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;border:1px solid var(--border);background:#1b2740;color:var(--text);text-decoration:none;font-weight:600;font-size:13px}
+  a.dl:hover{border-color:#3d63b8;background:#27407a}
+  .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+  .filters select,.filters input{background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px}
+  .cfg-toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0 8px}
+  .cfg-toolbar input[type=search]{flex:1;min-width:180px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px}
+  .cfg-mode{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden}
+  .cfg-mode button{border:0;background:#152038;color:var(--muted);padding:7px 14px;cursor:pointer;font-weight:600}
+  .cfg-mode button.active{background:#27407a;color:var(--text)}
+  .cfg-label{font-weight:600;font-size:13px}
+  .cfg-key{font-size:11px;color:var(--muted);margin-top:2px}
+  .cfg-card{border:1px solid rgba(36,51,82,.55);border-radius:12px;padding:12px;margin:8px 0;background:rgba(10,16,28,.35)}
+  .cfg-card .row-fields{display:grid;grid-template-columns:1.2fr 1fr;gap:10px;align-items:start}
+  @media(max-width:800px){.cfg-card .row-fields{grid-template-columns:1fr}}
+  .cfg-card select,.cfg-card input{width:100%;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px}
+  .cfg-help{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.45}
+  .cfg-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .cfg-empty{color:var(--muted);padding:20px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1 data-i18n="title">Grok 免费注册 · 控制面板</h1>
+    <div class="meta" data-i18n="subtitle">运行时 · 账号 · CPA/sub2api · 配置</div>
+  </div>
+  <div class="header-right">
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" id="lang-zh" class="active" data-lang="zh">中文</button>
+      <button type="button" id="lang-en" data-lang="en">EN</button>
+    </div>
+    <div id="run-badge" class="badge bad"><span class="dot"></span><span data-i18n="offline">离线</span></div>
+  </div>
+</header>
+<nav>
+  <button class="active" data-tab="overview" data-i18n="tab_overview">总览</button>
+  <button data-tab="accounts" data-i18n="tab_accounts">账号</button>
+  <button data-tab="config" data-i18n="tab_config">全部配置</button>
+  <button data-tab="raw" data-i18n="tab_raw">原始 JSON</button>
+</nav>
+<main>
+  <section id="tab-overview">
+    <div class="grid" id="kpis"></div>
+    <div class="row">
+      <div class="card">
+        <h3 data-i18n="card_register">注册控制</h3>
+        <div id="register-body"></div>
+        <div class="filters" style="margin-top:10px">
+          <label><span data-i18n="reg_target">成功目标</span>
+            <input type="number" id="reg-target" min="0" step="1" placeholder="0=不限" style="width:100px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px"/>
+          </label>
+          <label><span data-i18n="reg_engine_pick">引擎</span>
+            <select id="reg-engine" style="background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px">
+              <option value="python">Python</option>
+              <option value="go">Go</option>
+            </select>
+          </label>
+        </div>
+        <div class="actions" id="actions"></div>
+        <div class="note" id="action-note"></div>
+      </div>
+      <div class="card">
+        <h3 data-i18n="card_xai_probe">x.ai 连通性 / 代理测活</h3>
+        <div id="xai-probe-body" class="note" data-i18n="xai_probe_hint">测试本机与代理池能否访问 accounts.x.ai / x.ai（支持高并发与自定义参数）</div>
+        <div class="filters" style="margin-top:8px;gap:10px">
+          <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="chk-use-public" />
+            <span data-i18n="chk_use_public">使用公共节点</span>
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="chk-use-manual" checked />
+            <span data-i18n="chk_use_manual">手动池</span>
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="chk-use-active" checked />
+            <span data-i18n="chk_use_active">已测活池</span>
+          </label>
+        </div>
+        <div class="filters" style="margin-top:8px">
+          <label><span data-i18n="batch_workers">并发</span>
+            <input type="number" id="batch-workers" min="1" max="2048" value="128" style="width:90px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px"/>
+          </label>
+          <label><span data-i18n="batch_timeout">超时秒</span>
+            <input type="number" id="batch-timeout" min="2" max="120" value="5" style="width:80px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px"/>
+          </label>
+          <label><span data-i18n="batch_max">最多测</span>
+            <input type="number" id="batch-max" min="1" max="40000" value="200" style="width:100px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px"/>
+          </label>
+          <label><span data-i18n="batch_max_active">保留可用</span>
+            <input type="number" id="batch-max-active" min="0" max="40000" value="0" title="0=不限制" style="width:90px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 8px"/>
+          </label>
+        </div>
+        <div style="margin-top:8px">
+          <label class="note" data-i18n="batch_urls_label">测试 URL（逗号或换行，默认 x.ai）</label>
+          <textarea id="batch-urls" rows="2" style="width:100%;margin-top:4px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px;font-size:12px;resize:vertical" placeholder="https://accounts.x.ai/sign-up?redirect=grok-com&#10;https://x.ai/"></textarea>
+        </div>
+        <div style="margin-top:8px">
+          <label class="note" data-i18n="batch_custom_label">自定义代理列表（可选，一行一个）</label>
+          <textarea id="batch-custom" rows="3" style="width:100%;margin-top:4px;background:#0d1524;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px;font-size:12px;resize:vertical" placeholder="http://user:pass@host:port&#10;socks5://host:1080"></textarea>
+        </div>
+        <div class="note" data-i18n="public_hint">公共节点来自 logs/proxy-scraper-candidates.txt；自定义列表优先。并发走 Go proxy-worker 协程池（不可用时 Python 线程池）。</div>
+        <div class="actions" style="margin-top:10px">
+          <button class="act primary" id="btn-batch-proxies" data-i18n="btn_batch_proxies">批量测代理→x.ai</button>
+          <button class="act" id="btn-probe-xai" data-i18n="btn_probe_xai">快速探测</button>
+          <button class="act" id="btn-probe-xai-direct" data-i18n="btn_probe_xai_direct">仅直连</button>
+          <button class="act" id="btn-scrape-public" data-i18n="btn_scrape_public">爬取公共节点</button>
+        </div>
+        <div class="note" id="xai-probe-note"></div>
+        <div class="note" id="batch-proxy-note"></div>
+        <pre id="xai-probe-detail" style="margin-top:10px;max-height:200px;display:none"></pre>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div class="card">
+        <h3 data-i18n="card_products">成品下载</h3>
+        <div id="products-body" class="note" data-i18n="products_hint">扫描 keys/ 中的 legacy / sub2api / cpa 成品</div>
+        <div class="dl-row" id="product-downloads"></div>
+        <div class="actions" style="margin-top:12px">
+          <button class="act primary" id="btn-rebuild-bundles" data-i18n="btn_rebuild">重建合并包</button>
+        </div>
+        <div class="note" id="product-note"></div>
+      </div>
+      <div class="card">
+        <h3 data-i18n="card_engines">引擎</h3>
+        <div id="engines"></div>
+        <div style="margin-top:14px">
+          <h3 data-i18n="card_account_status">账号状态</h3>
+          <div id="account-status-body"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+  <section id="tab-accounts" class="hidden">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <h3 style="margin:0" data-i18n="card_inventory">账号库存</h3>
+        <div class="actions" style="margin:0">
+          <button class="act" id="btn-refresh-accounts" data-i18n="btn_refresh">刷新</button>
+          <a class="dl" href="/api/download?format=sub2api">↓ sub2api</a>
+          <a class="dl" href="/api/download?format=cpa_zip">↓ xai-singles.zip</a>
+          <a class="dl" href="/api/download?format=legacy">↓ legacy</a>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:10px">
+        <button class="act primary" id="btn-convert-sub2api" data-i18n="btn_convert_sub2api">一键转 sub2api</button>
+        <button class="act primary" id="btn-convert-cpa" data-i18n="btn_convert_cpa">一键转 CPA</button>
+        <button class="act" id="btn-convert-both" data-i18n="btn_convert_both">转 sub2api + CPA</button>
+        <button class="act" id="btn-convert-pending" data-i18n="btn_convert_pending">仅转换待 OAuth</button>
+      </div>
+      <div class="note" id="convert-note" data-i18n="convert_hint">优先用已有 OAuth 互转；没有 OAuth 时用 SSO 走 enroller（可能较慢）</div>
+      <div class="actions" style="margin-top:12px">
+        <button class="act primary" id="btn-cpa-sync" data-i18n="btn_cpa_sync">同步 CLIProxyAPI</button>
+        <button class="act" id="btn-cpa-refresh" data-i18n="btn_cpa_refresh">刷新过期 Token</button>
+        <button class="act" id="btn-cpa-worker-start" data-i18n="btn_cpa_worker_start">启动自动同步</button>
+        <button class="act danger" id="btn-cpa-worker-stop" data-i18n="btn_cpa_worker_stop">停止自动同步</button>
+      </div>
+      <div class="note" id="cpa-sync-note" data-i18n="cpa_sync_hint">仅导入单账号 xai-*.json（type=xai）。不使用任何合并包。</div>
+      <div class="filters">
+        <label><span data-i18n="filter_status">状态</span>
+          <select id="flt-status">
+            <option value="" data-i18n="filter_all">全部</option>
+            <option value="oauth_ready">oauth_ready</option>
+            <option value="oauth_pending">oauth_pending</option>
+            <option value="legacy_sso">legacy_sso</option>
+            <option value="unknown">unknown</option>
+          </select>
+        </label>
+        <label><span data-i18n="filter_format">格式</span>
+          <select id="flt-format">
+            <option value="" data-i18n="filter_all">全部</option>
+            <option value="sub2api">sub2api</option>
+            <option value="cpa">cpa</option>
+            <option value="legacy">legacy</option>
+          </select>
+        </label>
+        <span class="note" id="accounts-meta"></span>
+      </div>
+      <div style="overflow:auto;max-height:520px">
+        <table class="acc" id="accounts-table">
+          <thead><tr>
+            <th data-i18n="th_email">邮箱</th>
+            <th data-i18n="th_status">状态</th>
+            <th data-i18n="th_formats">格式</th>
+            <th data-i18n="th_tokens">令牌</th>
+            <th data-i18n="th_ledger">台账</th>
+            <th data-i18n="th_fingerprint">指纹</th>
+            <th data-i18n="th_updated">更新时间</th>
+          </tr></thead>
+          <tbody id="accounts-tbody"><tr><td colspan="7" data-i18n="loading">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+  <section id="tab-config" class="hidden">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <h3 style="margin:0" data-i18n="card_config">配置</h3>
+        <div class="actions" style="margin:0">
+          <button class="act primary" id="btn-save-config" data-i18n="btn_save">保存修改</button>
+          <button class="act" id="btn-reload-config" data-i18n="btn_reload">重新加载</button>
+        </div>
+      </div>
+      <div class="note" id="config-note" data-i18n="config_hint">默认显示常用项。改完点保存；多数项需重启注册进程才生效。密钥显示为掩码，留空表示不改。</div>
+      <div class="cfg-toolbar">
+        <div class="cfg-mode">
+          <button type="button" id="cfg-mode-simple" class="active" data-mode="simple" data-i18n="cfg_mode_simple">常用配置</button>
+          <button type="button" id="cfg-mode-all" data-mode="all" data-i18n="cfg_mode_all">全部配置</button>
+        </div>
+        <input type="search" id="cfg-search" data-i18n-placeholder="cfg_search_ph" placeholder="搜索：邮箱、代理、导出…" />
+      </div>
+      <div id="config-editor"></div>
+    </div>
+  </section>
+  <section id="tab-raw" class="hidden">
+    <div class="card"><h3 data-i18n="card_raw">原始状态</h3><pre id="raw" data-i18n="loading">加载中…</pre></div>
+  </section>
+</main>
+<script>
+const I18N = {
+  zh: {
+    title: "Grok 免费注册 · 控制面板",
+    subtitle: "运行时 · 账号 · CPA/sub2api · 配置",
+    tab_overview: "总览",
+    tab_accounts: "账号",
+    tab_config: "配置",
+    tab_raw: "原始 JSON",
+    offline: "离线",
+    running: "运行中",
+    card_register: "注册控制",
+    card_products: "成品下载",
+    card_engines: "引擎",
+    card_account_status: "账号状态",
+    card_inventory: "账号库存",
+    card_config: "配置",
+    card_raw: "原始状态",
+    products_hint: "扫描 keys/ 中的 legacy / sub2api / cpa 成品",
+    products_dir: "导出目录：{dir} · 可直接导入 sub2api / CPA 面板",
+    btn_rebuild: "重建合并包",
+    btn_refresh: "刷新",
+    btn_save: "保存修改",
+    btn_reload: "重新加载",
+    btn_convert_sub2api: "一键转 sub2api",
+    btn_convert_cpa: "一键转 CPA",
+    btn_convert_both: "转 sub2api + CPA",
+    btn_convert_pending: "仅转换待 OAuth",
+    convert_hint: "优先用已有 OAuth 互转；没有 OAuth 时用 SSO 走 enroller（可能较慢）",
+    convert_starting: "正在启动转换…",
+    convert_running: "转换进行中…",
+    convert_done: "转换完成",
+    btn_cpa_sync: "同步 CLIProxyAPI",
+    btn_cpa_refresh: "刷新过期 Token",
+    btn_cpa_worker_start: "启动自动同步",
+    btn_cpa_worker_stop: "停止自动同步",
+    cpa_sync_hint: "仅导入单账号 xai-*.json（type=xai）。不使用任何合并包。",
+    cpa_sync_running: "CLIProxyAPI 同步中…",
+    cpa_sync_done: "CLIProxyAPI 同步完成",
+    btn_start: "启动注册",
+    btn_start_py: "启动 Python 注册",
+    btn_start_go: "启动 Go 注册",
+    btn_stop: "停止注册",
+    btn_scrape: "爬取代理",
+    btn_probe_xai: "快速探测",
+    btn_probe_xai_direct: "仅直连",
+    btn_batch_proxies: "批量测代理→x.ai",
+    btn_scrape_public: "爬取并自动测活",
+    chk_use_public: "使用公共节点",
+    chk_use_manual: "手动池",
+    chk_use_active: "已测活池",
+    public_hint: "测活前会把 vless/ss/带认证 SOCKS 经 sing-box 转成本地 HTTP 再交给 Go 测。优先测订阅分享链接，而不是裸 HTTP 公共代理。关页面不影响进度。",
+    batch_max: "最多测",
+    batch_workers: "并发",
+    batch_timeout: "超时秒",
+    batch_max_active: "保留可用",
+    batch_urls_label: "测试 URL（逗号或换行，默认 x.ai）",
+    batch_custom_label: "自定义代理列表（可选，一行一个）",
+    batch_starting: "正在启动批量测活…",
+    batch_running: "批量测活进行中…",
+    batch_done: "批量测活完成",
+    card_xai_probe: "x.ai 连通性 / 代理测活",
+    xai_probe_hint: "测试本机与代理池能否访问 accounts.x.ai / x.ai（支持高并发与自定义）",
+    xai_probe_running: "正在探测…",
+    xai_probe_last: "上次探测：",
+    reg_target: "成功目标",
+    reg_engine_pick: "引擎",
+    reg_target_ph: "0=不限",
+    filter_status: "状态",
+    filter_format: "格式",
+    filter_all: "全部",
+    th_email: "邮箱",
+    th_status: "状态",
+    th_formats: "格式",
+    th_tokens: "令牌",
+    th_ledger: "台账",
+    th_fingerprint: "指纹",
+    th_updated: "更新时间",
+    loading: "加载中…",
+    no_accounts: "暂无账号",
+    config_hint: "默认显示常用项。改完点保存；多数项需重启注册进程才生效。密钥显示为掩码，留空表示不改。",
+    actions_disabled: "操作已禁用。请在配置里打开「允许面板操作」，或设置 CONTROL_PLANE_ALLOW_ACTIONS=1",
+    last_action: "上次：{action} → {message}",
+    kpi_success: "成功数",
+    kpi_success_sub: "累计注册成功",
+    kpi_starts: "启动次数",
+    kpi_starts_sub: "注册流程启动",
+    kpi_token_t: "Token 队列 T",
+    kpi_token_t_sub: "已产出 {n}",
+    kpi_code_q: "验证码队列 Q",
+    kpi_code_q_sub: "成功/失败 {ok}/{fail}",
+    kpi_rate: "速率/分",
+    kpi_rate_sub: "注册速度",
+    kpi_accounts: "账号数",
+    kpi_accounts_sub: "就绪 {ready} · 待转换 {pending}",
+    kpi_proxies: "可用代理",
+    kpi_proxies_sub: "测活通过",
+    kpi_scraper: "爬取候选",
+    kpi_scraper_sub: "代理候选池",
+    reg_status_age: "状态年龄：",
+    reg_email: "邮箱",
+    reg_turnstile: "Turnstile",
+    reg_engine: "引擎",
+    reg_rate_limit: "限流：",
+    reg_rate_open: "开启",
+    reg_rate_closed: "关闭",
+    eng_register: "注册引擎：",
+    eng_proxy: "代理测活：",
+    eng_inventory: "库存引擎：",
+    eng_turnstile: "Turnstile：",
+    eng_polyglot: "多语言栈：",
+    eng_note: "硬性要求 Python+Go+Rust。Go 注册设 REGISTER_ENGINE=go；库存默认 Rust；面板为 Python。",
+    acc_total: "总计",
+    acc_formats: "格式：",
+    acc_bundle: "合并包：",
+    meta_show: "显示 {shown}/{total} · 库存 {inv}",
+    cfg_key: "配置项",
+    cfg_value: "值",
+    cfg_desc: "说明",
+    cfg_restart: "需重启",
+    cfg_yes: "是",
+    cfg_no: "否",
+    cfg_on: "开启",
+    cfg_off: "关闭",
+    cfg_default: "（默认）",
+    cfg_masked: "（已掩码 — 输入新值以替换）",
+    cfg_file: "文件：{path} · 显示 {shown} 项 / 共 {n} 项 · 额外 {e}",
+    cfg_no_changes: "没有修改",
+    cfg_mode_simple: "常用配置",
+    cfg_mode_all: "全部配置",
+    cfg_search_ph: "搜索：邮箱、代理、导出…",
+    cfg_empty: "没有匹配的配置项",
+    cfg_source_file: "已写入 .env",
+    cfg_source_process: "进程环境",
+    cfg_source_default: "使用默认值",
+    cfg_need_restart: "改后需重启注册",
+    status_oauth_ready: "OAuth 就绪",
+    status_oauth_pending: "待转 OAuth",
+    status_legacy_sso: "仅 SSO",
+    status_unknown: "未知",
+  },
+  en: {
+    title: "grok-free-register · Control",
+    subtitle: "runtime · accounts · CPA/sub2api · config",
+    tab_overview: "Overview",
+    tab_accounts: "Accounts",
+    tab_config: "Config",
+    tab_raw: "Raw JSON",
+    offline: "offline",
+    running: "running",
+    card_register: "Register control",
+    card_products: "Product downloads",
+    card_engines: "Engines",
+    card_account_status: "Account status",
+    card_inventory: "Account inventory",
+    card_config: "Configuration",
+    card_raw: "Raw status",
+    products_hint: "Scan finished products in keys/ (legacy / sub2api / cpa)",
+    products_dir: "Export dir: {dir} · import into sub2api / CPA panels",
+    btn_rebuild: "Rebuild bundles",
+    btn_refresh: "Refresh",
+    btn_save: "Save changes",
+    btn_reload: "Reload",
+    btn_convert_sub2api: "Convert → sub2api",
+    btn_convert_cpa: "Convert → CPA",
+    btn_convert_both: "Convert → sub2api + CPA",
+    btn_convert_pending: "Convert pending OAuth only",
+    convert_hint: "Prefers OAuth copy; falls back to SSO enroller (slower)",
+    convert_starting: "Starting convert…",
+    convert_running: "Convert running…",
+    convert_done: "Convert finished",
+    btn_cpa_sync: "Sync CLIProxyAPI",
+    btn_cpa_refresh: "Refresh expired tokens",
+    btn_cpa_worker_start: "Start auto-sync",
+    btn_cpa_worker_stop: "Stop auto-sync",
+    cpa_sync_hint: "Imports single xai-*.json only (type=xai). No merge bundle.",
+    cpa_sync_running: "CLIProxyAPI sync running…",
+    cpa_sync_done: "CLIProxyAPI sync done",
+    btn_start: "Start register",
+    btn_start_py: "Start Python",
+    btn_start_go: "Start Go",
+    btn_stop: "Stop register",
+    btn_scrape: "Scrape proxies",
+    btn_probe_xai: "Quick probe",
+    btn_probe_xai_direct: "Direct only",
+    btn_batch_proxies: "Batch test proxies→x.ai",
+    btn_scrape_public: "Scrape + auto-test",
+    chk_use_public: "Use public nodes",
+    chk_use_manual: "Manual pool",
+    chk_use_active: "Active pool",
+    public_hint: "Before testing, vless/ss/auth-SOCKS are converted to local HTTP via sing-box. Share links preferred over plain public HTTP. Page close does not stop Go job.",
+    batch_max: "Max test",
+    batch_workers: "Workers",
+    batch_timeout: "Timeout s",
+    batch_max_active: "Keep OK",
+    batch_urls_label: "Test URLs (comma/newline, default x.ai)",
+    batch_custom_label: "Custom proxies (optional, one per line)",
+    batch_starting: "Starting batch test…",
+    batch_running: "Batch testing…",
+    batch_done: "Batch test done",
+    card_xai_probe: "x.ai connectivity / proxy test",
+    xai_probe_hint: "Probe host and proxy pool (concurrent + customizable)",
+    xai_probe_running: "Probing…",
+    xai_probe_last: "Last probe: ",
+    reg_target: "Target",
+    reg_engine_pick: "Engine",
+    reg_target_ph: "0=unlimited",
+    filter_status: "Status",
+    filter_format: "Format",
+    filter_all: "All",
+    th_email: "Email",
+    th_status: "Status",
+    th_formats: "Formats",
+    th_tokens: "Tokens",
+    th_ledger: "Ledger",
+    th_fingerprint: "Fingerprint",
+    th_updated: "Updated",
+    loading: "loading…",
+    no_accounts: "No accounts",
+    config_hint: "Simple mode by default. Save to write .env; most keys need register restart. Secrets masked; leave blank to keep.",
+    actions_disabled: "Actions disabled. Enable “Allow panel actions” or set CONTROL_PLANE_ALLOW_ACTIONS=1",
+    last_action: "last: {action} → {message}",
+    kpi_success: "Success",
+    kpi_success_sub: "Total successes",
+    kpi_starts: "Starts",
+    kpi_starts_sub: "Registration starts",
+    kpi_token_t: "Token T",
+    kpi_token_t_sub: "produced {n}",
+    kpi_code_q: "Code Q",
+    kpi_code_q_sub: "ok/fail {ok}/{fail}",
+    kpi_rate: "Rate/min",
+    kpi_rate_sub: "Throughput",
+    kpi_accounts: "Accounts",
+    kpi_accounts_sub: "ready {ready} · pending {pending}",
+    kpi_proxies: "Active proxies",
+    kpi_proxies_sub: "Passed health checks",
+    kpi_scraper: "Scraper cands",
+    kpi_scraper_sub: "Proxy candidates",
+    reg_status_age: "status age: ",
+    reg_email: "email",
+    reg_turnstile: "turnstile",
+    reg_engine: "engine",
+    reg_rate_limit: "rate limit: ",
+    reg_rate_open: "OPEN",
+    reg_rate_closed: "closed",
+    eng_register: "Register engine: ",
+    eng_proxy: "Proxy test: ",
+    eng_inventory: "Inventory: ",
+    eng_turnstile: "Turnstile: ",
+    eng_polyglot: "Polyglot: ",
+    eng_note: "Requires Python+Go+Rust. REGISTER_ENGINE=go for Go register; inventory defaults to Rust; panel is Python.",
+    acc_total: "total",
+    acc_formats: "formats: ",
+    acc_bundle: "bundle: ",
+    meta_show: "showing {shown}/{total} · inventory {inv}",
+    cfg_key: "Setting",
+    cfg_value: "Value",
+    cfg_desc: "Description",
+    cfg_restart: "Restart",
+    cfg_yes: "yes",
+    cfg_no: "no",
+    cfg_on: "On",
+    cfg_off: "Off",
+    cfg_default: "(default)",
+    cfg_masked: "(masked — type to replace)",
+    cfg_file: "file: {path} · showing {shown}/{n} · extras {e}",
+    cfg_no_changes: "no changes",
+    cfg_mode_simple: "Simple",
+    cfg_mode_all: "All settings",
+    cfg_search_ph: "Search email, proxy, export…",
+    cfg_empty: "No matching settings",
+    cfg_source_file: "from .env",
+    cfg_source_process: "process env",
+    cfg_source_default: "default",
+    cfg_need_restart: "needs register restart",
+    status_oauth_ready: "oauth ready",
+    status_oauth_pending: "oauth pending",
+    status_legacy_sso: "legacy sso",
+    status_unknown: "unknown",
+  }
+};
+
+const LANG_KEY = "gfr_dashboard_lang";
+const CFG_MODE_KEY = "gfr_cfg_mode";
+const state = { status:null, config:null, dirty:{}, accounts:null, lang:"zh", cfgMode:"simple", cfgSearch:"" };
+
+function detectLang(){
+  // 强制默认中文；仅用户主动切到 EN 才记英文
+  try{
+    const saved = localStorage.getItem(LANG_KEY);
+    if(saved === "en") return "en";
+    if(saved === "zh") return "zh";
+  }catch(e){}
+  return "zh";
+}
+function detectCfgMode(){
+  try{
+    const m = localStorage.getItem(CFG_MODE_KEY);
+    if(m === "all" || m === "simple") return m;
+  }catch(e){}
+  return "simple";
+}
+function t(key, vars){
+  const pack = I18N[state.lang] || I18N.zh;
+  let s = pack[key] ?? I18N.zh[key] ?? key;
+  if(vars){
+    Object.keys(vars).forEach(k=>{
+      s = s.replace(new RegExp("\\{"+k+"\\}","g"), String(vars[k]));
+    });
+  }
+  return s;
+}
+function $(id){return document.getElementById(id)}
+async function api(path, opts){const r=await fetch(path,opts); return r.json()}
+function fmt(v){if(v===null||v===undefined||v==='')return '—'; if(typeof v==='number') return Number.isInteger(v)?String(v):v.toFixed(2); return String(v)}
+function shortTime(iso){
+  if(!iso) return '—';
+  try{ const d=new Date(iso); return d.toISOString().replace('T',' ').slice(0,19)+'Z'; }catch(e){ return String(iso).slice(0,19); }
+}
+function applyStaticI18n(){
+  document.documentElement.lang = state.lang === "zh" ? "zh-CN" : "en";
+  document.title = t("title");
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    const key = el.getAttribute("data-i18n");
+    if(!key) return;
+    if(el.tagName === "OPTION"){
+      if(el.value === "") el.textContent = t(key);
+      else return;
+    } else {
+      el.textContent = t(key);
+    }
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(el=>{
+    const key = el.getAttribute("data-i18n-placeholder");
+    if(key) el.placeholder = t(key);
+  });
+  document.querySelectorAll("#flt-status option[value=''], #flt-format option[value='']").forEach(o=>{
+    o.textContent = t("filter_all");
+  });
+  $("lang-zh").classList.toggle("active", state.lang === "zh");
+  $("lang-en").classList.toggle("active", state.lang === "en");
+  $("cfg-mode-simple")?.classList.toggle("active", state.cfgMode === "simple");
+  $("cfg-mode-all")?.classList.toggle("active", state.cfgMode === "all");
+}
+function setLang(lang){
+  state.lang = (lang === "en") ? "en" : "zh";
+  try{ localStorage.setItem(LANG_KEY, state.lang); }catch(e){}
+  applyStaticI18n();
+  if(state.status) refreshStatus(true);
+  if(state.config){
+    renderConfig(state.config);
+    updateConfigNote();
+  }
+  if(state.accounts && !$("tab-accounts").classList.contains("hidden")) loadAccounts();
+  else if(state.accounts){
+    const sum=state.accounts.summary||{};
+    $("accounts-meta").textContent = t("meta_show",{
+      shown:state.accounts.returned||0,
+      total:state.accounts.total||0,
+      inv:sum.total||0
+    });
+  }
+}
+function setCfgMode(mode){
+  state.cfgMode = mode === "all" ? "all" : "simple";
+  try{ localStorage.setItem(CFG_MODE_KEY, state.cfgMode); }catch(e){}
+  applyStaticI18n();
+  if(state.config) renderConfig(state.config);
+  updateConfigNote();
+}
+document.querySelectorAll(".lang-switch button").forEach(b=>{
+  b.onclick = ()=> setLang(b.dataset.lang);
+});
+document.querySelectorAll("nav button[data-tab]").forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll("nav button[data-tab]").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active");
+    ["overview","accounts","config","raw"].forEach(tab=>{
+      $(`tab-${tab}`).classList.toggle("hidden", tab !== b.dataset.tab);
+    });
+    if(b.dataset.tab === "accounts") loadAccounts();
+  };
+});
+function kpi(title,value,sub){
+  const d=document.createElement("div"); d.className="card";
+  d.innerHTML=`<h3>${title}</h3><div class="value">${fmt(value)}</div><div class="sub">${sub||""}</div>`;
+  return d;
+}
+function statusLabel(st){
+  const map = {
+    oauth_ready: "status_oauth_ready",
+    oauth_pending: "status_oauth_pending",
+    legacy_sso: "status_legacy_sso",
+    unknown: "status_unknown",
+  };
+  return t(map[st] || "status_unknown");
+}
+function statusTag(st){
+  const cls = st==="oauth_ready"?"ok":(st==="oauth_pending"?"warn":"muted");
+  const label = statusLabel(st || "unknown");
+  return `<span class="tag ${cls}" title="${st||""}">${label}</span>`;
+}
+function formatTags(fmts){
+  return (fmts||[]).map(f=>`<span class="tag">${f}</span>`).join("");
+}
+async function refreshStatus(fromCache){
+  const data = fromCache && state.status ? state.status : await api("/api/status");
+  if(!fromCache) state.status = data;
+  const reg=data.register||{}, s=data.summary||{}, acc=data.accounts||{};
+  const badge=$("run-badge");
+  badge.className="badge "+(reg.running?"ok":"bad");
+  const runText = reg.running ? t("running") : t("offline");
+  badge.innerHTML=`<span class="dot"></span><span>${runText}${reg.pid?" · pid "+reg.pid:""}</span>`;
+  const k=$("kpis"); k.innerHTML="";
+  const oauthReady = (acc.by_status||{}).oauth_ready || 0;
+  const oauthPending = (acc.by_status||{}).oauth_pending || 0;
+  [
+    [t("kpi_success"), s.success, t("kpi_success_sub")],
+    [t("kpi_starts"), s.starts, t("kpi_starts_sub")],
+    [t("kpi_token_t"), s.t_depth, t("kpi_token_t_sub",{n:fmt(s.t_prod)})],
+    [t("kpi_code_q"), s.q_depth, t("kpi_code_q_sub",{ok:fmt(s.pair_ok),fail:fmt(s.pair_fail)})],
+    [t("kpi_rate"), s.rate, t("kpi_rate_sub")],
+    [t("kpi_accounts"), acc.count, t("kpi_accounts_sub",{ready:oauthReady,pending:oauthPending})],
+    [t("kpi_proxies"), data.proxies?.active, t("kpi_proxies_sub")],
+    [t("kpi_scraper"), data.proxies?.scraper?.candidates, t("kpi_scraper_sub")],
+  ].forEach(([a,b,c])=>k.appendChild(kpi(a,b,c)));
+  const snap=reg.snapshot||{};
+  const rl = snap.rate_limit_open ? t("reg_rate_open") : t("reg_rate_closed");
+  const rlExtra = snap.rate_limit_open ? ("("+fmt(snap.rate_limit_remaining_sec)+"s)") : "";
+  const regBanner = reg.running
+    ? `<div style="margin-bottom:8px;padding:8px 10px;border-radius:10px;border:1px solid rgba(61,220,151,.35);background:rgba(61,220,151,.08);color:var(--ok);font-weight:700">▶ ${t("running")}${reg.pid?" · pid "+reg.pid:""} · success ${fmt(s.success)} · starts ${fmt(s.starts)}</div>`
+    : `<div style="margin-bottom:8px;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,107,107,.25);background:rgba(255,107,107,.06);color:var(--muted);font-weight:600">■ ${t("offline")}</div>`;
+  $("register-body").innerHTML=`
+    ${regBanner}
+    <div>${t("reg_status_age")}<b>${fmt(reg.status_age_sec)}s</b></div>
+    <div style="margin-top:6px">${t("reg_email")} <b>${fmt(snap.email_mode||data.config?.EMAIL_MODE)}</b>
+      · ${t("reg_turnstile")} <b>${fmt(snap.turnstile_solver||data.config?.TURNSTILE_SOLVER)}</b>
+      · ${t("reg_engine")} <b>${fmt(data.engines?.register)}</b></div>
+    <div style="margin-top:6px">${t("reg_rate_limit")}<b>${rl}</b> ${rlExtra}</div>`;
+  const eng=data.engines||{};
+  const pg=data.polyglot||{};
+  const pgMark = pg.ok ? "✓" : "✗";
+  $("engines").innerHTML=`
+    <div>${t("eng_polyglot")}<b>${pgMark} Python + Go + Rust</b></div>
+    <div style="margin-top:6px">${t("eng_register")}<b>${fmt(eng.register)}</b></div>
+    <div style="margin-top:6px">${t("eng_proxy")}<b>${fmt(eng.proxy_worker)}</b></div>
+    <div style="margin-top:6px">${t("eng_inventory")}<b>${fmt(eng.inventory)}</b></div>
+    <div style="margin-top:6px">${t("eng_turnstile")}<b>${fmt(eng.turnstile)}</b></div>
+    <div class="note">${t("eng_note")}</div>`;
+  const art=acc.artifacts||{};
+  $("account-status-body").innerHTML=`
+    <div>${t("acc_total")} <b>${fmt(acc.count)}</b></div>
+    <div style="margin-top:6px">oauth_ready <b>${fmt(oauthReady)}</b> · oauth_pending <b>${fmt(oauthPending)}</b></div>
+    <div style="margin-top:6px">${t("acc_formats")}sub2api <b>${fmt((acc.by_format||{}).sub2api)}</b>
+      · cpa <b>${fmt((acc.by_format||{}).cpa)}</b>
+      · legacy <b>${fmt((acc.by_format||{}).legacy)}</b></div>
+    <div style="margin-top:8px" class="note">
+      ${t("acc_bundle")}sub2api ${art.sub2api_bundle?"✓":"—"}
+      · cpa singles ${fmt(art.cpa_singles||0)}
+      · accounts.txt ${art.legacy_accounts_txt?"✓":"—"}
+    </div>`;
+  const prods=data.products||{};
+  $("product-downloads").innerHTML=`
+    <a class="dl" href="${prods.sub2api||"/api/download?format=sub2api"}">↓ accounts.sub2api.json</a>
+    <a class="dl" href="${prods.cpa_zip||"/api/download?format=cpa_zip"}">↓ xai-singles.zip</a>
+    <a class="dl" href="${prods.legacy||"/api/download?format=legacy"}">↓ accounts.txt</a>
+    <span class="note" style="margin-left:8px">CPA 仅 keys/cpa/xai-*.json 单文件</span>`;
+  $("products-body").textContent = t("products_dir",{dir: acc.export_dir||"keys"});
+  // engine select default from server
+  const engSel=$("reg-engine");
+  if(engSel && !engSel.dataset.touched){
+    engSel.value = (data.engines?.register==="go") ? "go" : "python";
+  }
+  const tgt=$("reg-target");
+  if(tgt && !tgt.dataset.touched){
+    const tv = data.config?.TARGET || data.config_full?.items?.find?.(i=>i.key==="TARGET")?.value;
+    if(tv!==undefined && tv!==null && String(tv)!=="") tgt.placeholder = String(tv);
+  }
+  const actions=$("actions"); actions.innerHTML="";
+  const enabled=!!data.actions_enabled;
+  const mk=(label,action,cls,payload,always)=>{
+    const b=document.createElement("button"); b.className="act "+(cls||""); b.textContent=label;
+    if(!enabled && !always && action!=="refresh") b.disabled=true;
+    b.onclick=async()=>{
+      if(action==="refresh"){await refreshStatus();return}
+      b.disabled=true;
+      try{
+        const body=Object.assign({action}, payload||{});
+        if(action==="start"){
+          body.engine = ($("reg-engine")?.value)||body.engine||"python";
+          const tval = ($("reg-target")?.value||"").trim();
+          if(tval!==""){
+            body.target = tval;
+            body.args = ["--target", tval];
+          }
+        }
+        const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+        $("action-note").textContent=r.message||JSON.stringify(r);
+        await refreshStatus();
+        if(action==="rebuild_bundles") loadAccounts();
+      }catch(e){$("action-note").textContent=String(e)}
+      finally{b.disabled=(!enabled && !always && action!=="refresh")}
+    };
+    return b;
+  };
+  actions.append(mk(t("btn_start"),"start","primary",{engine:"python"}));
+  actions.append(mk(t("btn_start_go"),"start","",{engine:"go"}));
+  actions.append(mk(t("btn_stop"),"stop","danger"));
+  actions.append(mk(t("btn_refresh"),"refresh","","",true));
+  actions.append(mk(t("btn_scrape"),"scrape"));
+  // last x.ai probe summary
+  const lastProbe = data.xai_probe?.last;
+  if(lastProbe && lastProbe.message){
+    const mark = lastProbe.ok ? "✓" : "✗";
+    $("xai-probe-body").innerHTML = `<b>${mark}</b> ${lastProbe.message}<div class="note" style="margin-top:6px">${t("xai_probe_last")}${lastProbe.at_iso||""} · direct=${lastProbe.direct_ok?"✓":"✗"} · proxy=${lastProbe.proxy_ok===null?"—":(lastProbe.proxy_ok?"✓":"✗")}</div>`;
+  }
+  // public checkbox default once
+  const chk=$("chk-use-public");
+  if(chk && !chk.dataset.touched){
+    chk.checked = !!data.proxies?.use_public_default;
+  }
+  // batch job status — always restore from server (survives refresh)
+  const bj = data.proxies?.batch_job || {};
+  renderBatchJob(bj);
+  // resume poller after refresh if still running
+  if(bj.running) ensureBatchPoller();
+  // convert job restore
+  const cj = data.convert_job || {};
+  const cnote=$("convert-note");
+  if(cnote && (cj.running || cj.finished_at || cj.message)){
+    if(cj.running){
+      cnote.textContent = `${t("convert_running")} ${cj.ok||0}✓ / ${cj.fail||0}✗ · ${cj.message||""}`;
+      ensureConvertPoller();
+    } else if(cj.message){
+      cnote.textContent = `${t("convert_done")} · ${cj.message}`;
+    }
+  }
+  // CLIProxyAPI sync status (display-only; survives refresh)
+  const cpa = data.cliproxyapi || {};
+  const cpaNote=$("cpa-sync-note");
+  if(cpaNote){
+    const bits=[
+      (cpa.worker_alive||cpa.running) ? "worker✓" : "worker—",
+      `files=${cpa.files||0}`,
+      `refreshed=${cpa.refreshed||0}`,
+      `import=${cpa.imported||0}`,
+      cpa.revoked?`revoked=${cpa.revoked}`:"",
+      cpa.message||""
+    ].filter(Boolean);
+    cpaNote.textContent = bits.join(" · ") || t("cpa_sync_hint");
+  }
+  if(!enabled) $("action-note").textContent=t("actions_disabled");
+  else if(data.last_action?.message) $("action-note").textContent=t("last_action",{action:data.last_action.action,message:data.last_action.message});
+  $("raw").textContent=JSON.stringify(data,null,2);
+}
+function renderBatchJob(bj){
+  const bnote=$("batch-proxy-note");
+  const detail=$("xai-probe-detail");
+  if(!bnote || !bj) return;
+  if(bj.running){
+    const tested = bj.tested||0, total=bj.total||0;
+    const shard = bj.shard ? ` · 分片 ${bj.shard}/${bj.shards||"?"}` : "";
+    bnote.textContent = `${t("batch_running")} ${tested}/${total} · ${bj.ok||0}✓ / ${bj.fail||0}✗ · 并发${bj.workers||"?"}${shard} · ${bj.message||""}`;
+    if(detail){
+      if((bj.top||[]).length){
+        detail.style.display="block";
+        detail.textContent=(bj.top||[]).slice(0,15).map(x=>
+          `OK ${x.latency_ms??"?"}ms [${x.source||"?"}] ${(x.proxy||"").slice(0,80)}`
+        ).join("\n");
+      } else {
+        // clear stale "本轮 8" from previous small runs while current job is large
+        detail.style.display="block";
+        detail.textContent=`进行中：已完成 ${tested}/${total}，本分片结束后数字会跳变。\n并发 ${bj.workers||"?"} · 超时 ${bj.timeout_sec||"?"}s · 死节点会占满超时，属正常。`;
+      }
+    }
+  } else if(bj.finished_at && bj.message){
+    bnote.textContent = `${t("batch_done")} · ${bj.message}`;
+    if(detail && (bj.top||[]).length){
+      detail.style.display="block";
+      detail.textContent=(bj.top||[]).slice(0,15).map(x=>
+        `OK ${x.latency_ms??"?"}ms [${x.source||"?"}] ${(x.proxy||"").slice(0,80)}`
+      ).join("\n");
+    } else if(detail && (bj.fail||0)>0 && !(bj.top||[]).length){
+      detail.style.display="block";
+      detail.textContent=`本轮 ${bj.fail||0}/${bj.total||0} 失败，无可用节点。\n公共免费代理多数已死属正常，可增大「最多测」或换手动代理。`;
+    }
+  } else if(bj.error){
+    bnote.textContent = `✗ ${bj.error}`;
+  } else if(bj.message){
+    bnote.textContent = bj.message;
+  }
+}
+// single shared pollers so refresh doesn't lose progress UI
+let _batchPollTimer=null;
+let _convertPollTimer=null;
+function ensureBatchPoller(){
+  if(_batchPollTimer) return;
+  let n=0;
+  _batchPollTimer=setInterval(async()=>{
+    n+=1;
+    try{
+      const st=await api("/api/status");
+      const job=st.proxies?.batch_job||{};
+      renderBatchJob(job);
+      if(state.status) state.status.proxies = st.proxies;
+      if(!job.running){
+        clearInterval(_batchPollTimer);
+        _batchPollTimer=null;
+        await refreshStatus();
+      }
+    }catch(e){}
+    if(n>600){ clearInterval(_batchPollTimer); _batchPollTimer=null; }
+  }, 1000);
+}
+function ensureConvertPoller(){
+  if(_convertPollTimer) return;
+  let n=0;
+  _convertPollTimer=setInterval(async()=>{
+    n+=1;
+    try{
+      const st=await api("/api/status");
+      const job=st.convert_job||{};
+      const note=$("convert-note");
+      if(note){
+        if(job.running) note.textContent=`${t("convert_running")} ${job.ok||0}✓ / ${job.fail||0}✗ · ${job.message||""}`;
+        else if(job.message) note.textContent=`${t("convert_done")} · ${job.message}`;
+      }
+      if(!job.running){
+        clearInterval(_convertPollTimer);
+        _convertPollTimer=null;
+        await loadAccounts();
+        await refreshStatus();
+      }
+    }catch(e){}
+    if(n>300){ clearInterval(_convertPollTimer); _convertPollTimer=null; }
+  }, 2000);
+}
+async function runXaiProbe(viaProxy){
+  const note=$("xai-probe-note");
+  const detail=$("xai-probe-detail");
+  const btn=$("btn-probe-xai");
+  const btn2=$("btn-probe-xai-direct");
+  note.textContent=t("xai_probe_running");
+  detail.style.display="none";
+  btn.disabled=true; btn2.disabled=true;
+  try{
+    const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"probe_xai",via_proxy:!!viaProxy})});
+    note.textContent=(r.ok?"✓ ":"✗ ")+(r.message||JSON.stringify(r));
+    const lines=(r.results||[]).map(x=>{
+      const via=x.via==="proxy"?("proxy "+(x.proxy||"").slice(0,40)):"direct";
+      return `${x.ok?"OK":"FAIL"} [${via}] ${x.status_code??"-"} ${x.latency_ms}ms ${x.url} ${x.error||""}`;
+    });
+    if(lines.length){
+      detail.style.display="block";
+      detail.textContent=lines.join("\n");
+    }
+    await refreshStatus();
+  }catch(e){
+    note.textContent=String(e);
+  }finally{
+    btn.disabled=false; btn2.disabled=false;
+  }
+}
+async function loadAccounts(){
+  const st=$("flt-status").value||"";
+  const fm=$("flt-format").value||"";
+  const q=new URLSearchParams();
+  if(st) q.set("status", st);
+  if(fm) q.set("format", fm);
+  q.set("limit","500");
+  const data = await api("/api/accounts?"+q.toString());
+  state.accounts=data;
+  const sum=data.summary||{};
+  $("accounts-meta").textContent = t("meta_show",{shown:data.returned||0,total:data.total||0,inv:sum.total||0});
+  const tb=$("accounts-tbody"); tb.innerHTML="";
+  (data.accounts||[]).forEach(a=>{
+    const tr=document.createElement("tr");
+    const tokens=[a.has_sso?"sso":"", a.has_access_token?"at":"", a.has_refresh_token?"rt":""].filter(Boolean).join(" · ")||"—";
+    tr.innerHTML=`
+      <td><code>${a.email||""}</code></td>
+      <td>${statusTag(a.status)}</td>
+      <td>${formatTags(a.formats)}</td>
+      <td>${tokens}</td>
+      <td>${a.ledger_state||"—"}</td>
+      <td><code style="font-size:11px">${a.fingerprint||"—"}</code></td>
+      <td>${shortTime(a.updated_at)}</td>`;
+    tb.appendChild(tr);
+  });
+  if(!(data.accounts||[]).length){
+    tb.innerHTML=`<tr><td colspan="7">${t("no_accounts")}</td></tr>`;
+  }
+}
+$("btn-refresh-accounts").onclick=()=>loadAccounts();
+$("flt-status").onchange=$("flt-format").onchange=()=>loadAccounts();
+$("btn-rebuild-bundles").onclick=async()=>{
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"rebuild_bundles"})});
+  $("product-note").textContent=r.message||JSON.stringify(r);
+  await refreshStatus();
+  await loadAccounts();
+};
+function sourceLabel(src){
+  if(src==="file") return t("cfg_source_file");
+  if(src==="process") return t("cfg_source_process");
+  return t("cfg_source_default");
+}
+function matchConfigItem(it, q){
+  if(!q) return true;
+  const blob = [it.key, it.label, it.desc, it.group, ...(it.options||[]).map(o=>o.label||o.value||"")].join(" ").toLowerCase();
+  return blob.includes(q);
+}
+function makeConfigInput(it){
+  let input;
+  const cur = it.value ?? "";
+  const curStr = String(cur);
+  const isBoolOn = ["1","true","yes","on"].includes(curStr.toLowerCase());
+  const isBoolOff = ["0","false","no","off"].includes(curStr.toLowerCase());
+  if(it.type==="bool"){
+    input=document.createElement("select");
+    [[ "", t("cfg_default") ],[ "1", t("cfg_on") ],[ "0", t("cfg_off") ]].forEach(([v,l])=>{
+      const o=document.createElement("option"); o.value=v; o.textContent=l;
+      if(v==="1" && isBoolOn) o.selected=true;
+      else if(v==="0" && isBoolOff) o.selected=true;
+      else if(v==="" && !isBoolOn && !isBoolOff) o.selected=true;
+      input.appendChild(o);
+    });
+  } else if(it.type==="choice" && Array.isArray(it.options) && it.options.length){
+    input=document.createElement("select");
+    const hasExact = it.options.some(op => String(op.value) === curStr);
+    if(!hasExact && curStr){
+      const o=document.createElement("option"); o.value=curStr; o.textContent=curStr+" *"; o.selected=true; input.appendChild(o);
+    }
+    it.options.forEach(op=>{
+      const o=document.createElement("option");
+      o.value = op.value;
+      o.textContent = op.label || op.value;
+      if(String(op.value) === curStr || (!hasExact && !curStr && String(op.value)===String(it.default||""))) o.selected=true;
+      if(String(op.value) === curStr) o.selected=true;
+      input.appendChild(o);
+    });
+  } else {
+    input=document.createElement("input");
+    input.type = it.type==="secret" ? "password" : (it.type==="int" ? "number" : "text");
+    if(it.type==="int") input.step="1";
+    input.value = curStr;
+    input.placeholder = it.type==="secret" ? t("cfg_masked") : (it.placeholder || it.default || "");
+    if(it.type==="secret") input.autocomplete="new-password";
+  }
+  input.dataset.key=it.key;
+  input.onchange=input.oninput=()=>{ state.dirty[it.key]=input.value; };
+  // restore dirty edit if any
+  if(Object.prototype.hasOwnProperty.call(state.dirty, it.key)){
+    input.value = state.dirty[it.key];
+  }
+  return input;
+}
+function renderConfig(view){
+  state.config=view;
+  const root=$("config-editor"); root.innerHTML="";
+  const q = (state.cfgSearch||"").trim().toLowerCase();
+  let items = (view.items||[]).slice();
+  if(state.cfgMode === "simple" && !q){
+    items = items.filter(it => it.simple);
+  }
+  items = items.filter(it => matchConfigItem(it, q));
+  const extras = (view.extras||[]).filter(it => matchConfigItem(it, q) && state.cfgMode === "all");
+  const groups={};
+  items.forEach(it=>{ (groups[it.group]=groups[it.group]||[]).push(it); });
+  if(extras.length) groups.extra = extras;
+  const labels=Object.fromEntries((state.status?.config_groups||[]).map(g=>[g.id,g.label]));
+  labels.extra = state.lang==="zh" ? "额外 .env 项" : "Extra .env keys";
+  // preserve group order from GROUPS
+  const order = (state.status?.config_groups||[]).map(g=>g.id).concat(["extra"]);
+  const gids = order.filter(g => groups[g] && groups[g].length);
+  Object.keys(groups).forEach(g => { if(!gids.includes(g)) gids.push(g); });
+  let shown = 0;
+  gids.forEach(gid=>{
+    const list = groups[gid]||[];
+    if(!list.length) return;
+    const title=document.createElement("div"); title.className="group-title";
+    title.innerHTML=`${labels[gid]||gid}<span class="pill">${list.length}</span>`;
+    root.appendChild(title);
+    list.forEach(it=>{
+      shown += 1;
+      const card=document.createElement("div"); card.className="cfg-card";
+      const head=document.createElement("div");
+      head.innerHTML=`<div class="cfg-label">${it.label||it.key}</div><div class="cfg-key"><code>${it.key}</code></div>`;
+      const fields=document.createElement("div"); fields.className="row-fields";
+      const left=document.createElement("div");
+      left.appendChild(makeConfigInput(it));
+      const help=document.createElement("div"); help.className="cfg-help"; help.textContent=it.desc||"";
+      left.appendChild(help);
+      const right=document.createElement("div");
+      right.className="cfg-meta";
+      right.innerHTML = `
+        <span class="tag muted">${sourceLabel(it.source)}</span>
+        ${it.restart?`<span class="tag warn">${t("cfg_need_restart")}</span>`:""}
+        ${it.simple?`<span class="tag ok">${state.lang==="zh"?"常用":"simple"}</span>`:""}
+      `;
+      fields.append(left, right);
+      card.append(head, fields);
+      root.appendChild(card);
+    });
+  });
+  if(!shown){
+    root.innerHTML=`<div class="cfg-empty">${t("cfg_empty")}</div>`;
+  }
+  state._cfgShown = shown;
+  updateConfigNote();
+}
+function updateConfigNote(){
+  if(!state.config) return;
+  const view=state.config;
+  $("config-note").textContent=t("cfg_file",{
+    path:view.path,
+    shown:state._cfgShown||0,
+    n:view.items?.length||0,
+    e:view.extras?.length||0
+  });
+}
+async function loadConfig(){
+  const view=await api("/api/config");
+  renderConfig(view);
+}
+$("btn-reload-config").onclick=()=>{state.dirty={}; loadConfig()};
+$("btn-save-config").onclick=async()=>{
+  if(!Object.keys(state.dirty).length){ $("config-note").textContent=t("cfg_no_changes"); return; }
+  const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"save_config",updates:state.dirty})});
+  $("config-note").textContent=r.message||JSON.stringify(r);
+  state.dirty={};
+  await loadConfig();
+  await refreshStatus();
+};
+$("cfg-mode-simple").onclick=()=>setCfgMode("simple");
+$("cfg-mode-all").onclick=()=>setCfgMode("all");
+$("cfg-search").oninput=(e)=>{ state.cfgSearch=e.target.value||""; if(state.config) renderConfig(state.config); };
+$("btn-probe-xai").onclick=()=>runXaiProbe(true);
+$("btn-probe-xai-direct").onclick=()=>runXaiProbe(false);
+$("reg-engine")?.addEventListener("change",()=>{ $("reg-engine").dataset.touched="1"; });
+$("reg-target")?.addEventListener("input",()=>{ $("reg-target").dataset.touched="1"; });
+$("chk-use-public")?.addEventListener("change",()=>{ $("chk-use-public").dataset.touched="1"; });
+
+function clampInt(v, lo, hi, def){
+  let n=parseInt(v,10);
+  if(!Number.isFinite(n)) n=def;
+  if(n<lo) n=lo;
+  if(n>hi) n=hi;
+  return n;
+}
+function readBatchOptions(){
+  const usePublic = !!$("chk-use-public")?.checked;
+  const useManual = $("chk-use-manual") ? !!$("chk-use-manual").checked : true;
+  const useActive = $("chk-use-active") ? !!$("chk-use-active").checked : true;
+  const workers = clampInt($("batch-workers")?.value, 1, 2048, 128);
+  const timeout = clampInt($("batch-timeout")?.value, 2, 120, 5);
+  const maxC = clampInt($("batch-max")?.value, 1, 40000, 200);
+  const maxActive = clampInt($("batch-max-active")?.value, 0, 40000, 0);
+  const urls = ($("batch-urls")?.value||"").trim();
+  const custom = ($("batch-custom")?.value||"").trim();
+  // persist last settings
+  try{
+    localStorage.setItem("gfr_batch_opts", JSON.stringify({
+      usePublic, useManual, useActive, workers, timeout, maxC, maxActive, urls, custom
+    }));
+  }catch(e){}
+  return {usePublic, useManual, useActive, workers, timeout, maxC, maxActive, urls, custom};
+}
+function restoreBatchOptions(){
+  try{
+    const raw=localStorage.getItem("gfr_batch_opts");
+    if(!raw) return;
+    const o=JSON.parse(raw);
+    if($("chk-use-public") && typeof o.usePublic==="boolean"){ $("chk-use-public").checked=o.usePublic; $("chk-use-public").dataset.touched="1"; }
+    if($("chk-use-manual") && typeof o.useManual==="boolean") $("chk-use-manual").checked=o.useManual;
+    if($("chk-use-active") && typeof o.useActive==="boolean") $("chk-use-active").checked=o.useActive;
+    if($("batch-workers") && o.workers) $("batch-workers").value=o.workers;
+    if($("batch-timeout") && o.timeout) $("batch-timeout").value=o.timeout;
+    if($("batch-max") && o.maxC) $("batch-max").value=o.maxC;
+    if($("batch-max-active") && o.maxActive!==undefined) $("batch-max-active").value=o.maxActive;
+    if($("batch-urls") && o.urls) $("batch-urls").value=o.urls;
+    if($("batch-custom") && o.custom) $("batch-custom").value=o.custom;
+  }catch(e){}
+}
+async function runBatchProxyTest(){
+  const note=$("batch-proxy-note");
+  const o=readBatchOptions();
+  if(!o.usePublic && !o.useManual && !o.useActive && !o.custom){
+    if(note) note.textContent="请至少勾选：使用公共节点 / 手动池 / 已测活池，或填写自定义代理";
+    return;
+  }
+  if(note) note.textContent=`${t("batch_starting")} · workers=${o.workers} · timeout=${o.timeout}s · max=${o.maxC}`;
+  try{
+    const body={
+      action:"batch_test_proxies",
+      use_public: o.usePublic,
+      use_manual: o.useManual,
+      use_active: o.useActive,
+      max_candidates: o.maxC,
+      workers: o.workers,
+      timeout: o.timeout,
+      max_active: o.maxActive,
+      background: true,
+    };
+    if(o.urls) body.test_urls = o.urls;
+    if(o.custom) body.custom_proxies = o.custom;
+    const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(note) note.textContent=r.message||JSON.stringify(r);
+    if(r.job) renderBatchJob(r.job);
+    if(r.ok===false && !r.job?.running) return;
+    // shared poller survives page refresh via server-side job file
+    ensureBatchPoller();
+  }catch(e){
+    if(note) note.textContent=String(e);
+  }
+}
+$("btn-batch-proxies")?.addEventListener("click",()=>runBatchProxyTest());
+$("btn-scrape-public")?.addEventListener("click",async()=>{
+  const note=$("batch-proxy-note");
+  if(note) note.textContent="正在爬取公共节点，完成后将自动启动 Go 测活…";
+  try{
+    const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"scrape",auto_test:true})});
+    if(note) note.textContent=r.message||JSON.stringify(r);
+    // auto-enable public after scrape intent
+    const chk=$("chk-use-public");
+    if(chk){ chk.checked=true; chk.dataset.touched="1"; }
+    // poll batch job — scrape finishes later then auto-test starts
+    ensureBatchPoller();
+  }catch(e){ if(note) note.textContent=String(e); }
+});
+
+async function startConvert(formats, onlyPending){
+  const note=$("convert-note");
+  if(!note) return;
+  note.textContent=t("convert_starting");
+  try{
+    const body={
+      action:"convert",
+      formats: formats,
+      only_pending: !!onlyPending,
+      allow_enroll: true,
+      background: true,
+      limit: 50,
+    };
+    const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    note.textContent=r.message||JSON.stringify(r);
+    // shared poller + disk job file → survives page refresh
+    ensureConvertPoller();
+  }catch(e){
+    note.textContent=String(e);
+  }
+}
+$("btn-convert-sub2api")?.addEventListener("click",()=>startConvert(["sub2api"], false));
+$("btn-convert-cpa")?.addEventListener("click",()=>startConvert(["cpa"], false));
+$("btn-convert-both")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], false));
+$("btn-convert-pending")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], true));
+
+async function runCpaAction(action){
+  const note=$("cpa-sync-note");
+  if(note) note.textContent=t("cpa_sync_running");
+  try{
+    const r=await api("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action})});
+    if(note) note.textContent=`${t("cpa_sync_done")} · ${r.message||JSON.stringify(r)}`;
+    await refreshStatus();
+  }catch(e){
+    if(note) note.textContent=String(e);
+  }
+}
+$("btn-cpa-sync")?.addEventListener("click",()=>runCpaAction("cliproxy_sync"));
+$("btn-cpa-refresh")?.addEventListener("click",()=>runCpaAction("cliproxy_refresh"));
+$("btn-cpa-worker-start")?.addEventListener("click",()=>runCpaAction("cliproxy_worker_start"));
+$("btn-cpa-worker-stop")?.addEventListener("click",()=>runCpaAction("cliproxy_worker_stop"));
+
+state.lang = detectLang();
+state.cfgMode = detectCfgMode();
+applyStaticI18n();
+restoreBatchOptions();
+refreshStatus();
+loadConfig();
+setInterval(()=>refreshStatus(), 2000);
+</script>
+</body>
+</html>
+"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "grok-dashboard/0.1"
+
+    def log_message(self, fmt, *args):
+        # quieter default
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, code: int, body: bytes, content_type: str = "application/json; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, code: int, obj: dict):
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _send_file(self, file_path: Path, media_type: str, download_name: str):
+        if not file_path.is_file():
+            self._json(404, {"ok": False, "error": f"file not found: {download_name}"})
+            return
+        try:
+            data = file_path.read_bytes()
+        except OSError as exc:
+            self._json(500, {"ok": False, "error": str(exc)})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{download_name}"',
+        )
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+        if path in {"/", "/index.html"}:
+            self._send(200, DASHBOARD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/api/status":
+            self._json(200, build_overview())
+            return
+        if path == "/api/health":
+            self._json(200, {"ok": True})
+            return
+        if path in {"/api/probe/xai", "/api/xai/probe"}:
+            qs = parse_qs(urlparse(self.path).query)
+            via = (qs.get("via_proxy") or ["1"])[0].lower() not in {"0", "false", "no"}
+            try:
+                timeout = float((qs.get("timeout") or ["12"])[0])
+            except ValueError:
+                timeout = 12.0
+            self._json(200, probe_xai_access(timeout=timeout, via_proxy=via))
+            return
+        if path == "/api/status/raw":
+            self._json(200, read_status() or {"empty": True})
+            return
+        if path == "/api/accounts":
+            try:
+                limit = int((qs.get("limit") or ["500"])[0])
+            except ValueError:
+                limit = 500
+            status = (qs.get("status") or [""])[0]
+            fmt = (qs.get("format") or [""])[0]
+            self._json(200, build_accounts_payload(limit=limit, status=status, fmt=fmt))
+            return
+        if path == "/api/accounts/summary":
+            try:
+                self._json(200, {"ok": True, **inv.inventory_summary()})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+        if path == "/api/download":
+            fmt = (qs.get("format") or qs.get("fmt") or ["sub2api"])[0]
+            rebuild = (qs.get("rebuild") or ["0"])[0].lower() in {"1", "true", "yes"}
+            try:
+                if rebuild:
+                    inv.ensure_bundles(rebuild=True)
+                file_path, media, name = inv.download_spec(fmt)
+            except ValueError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+                return
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+                return
+            self._send_file(file_path, media, name)
+            return
+        if path == "/api/config":
+            reveal = (qs.get("reveal") or ["0"])[0] in {"1", "true", "yes"}
+            # secrets reveal only when actions enabled
+            if reveal and not ALLOW_ACTIONS:
+                reveal = False
+            self._json(200, {"ok": True, **load_config_view(reveal_secrets=reveal), "catalog": catalog_public()})
+            return
+        self._json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/api/action":
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            self._json(400, {"ok": False, "error": "invalid json"})
+            return
+        action = str((data or {}).get("action") or "").strip().lower()
+        # Safe/read-side actions: no CONTROL_PLANE_ALLOW_ACTIONS required
+        if action == "rebuild_bundles":
+            try:
+                paths = inv.ensure_bundles(rebuild=True)
+                result = {
+                    "ok": True,
+                    "message": f"rebuilt {len(paths)} artifacts",
+                    "paths": paths,
+                }
+            except Exception as exc:
+                result = {"ok": False, "message": str(exc)}
+            _record_last_action(action, result)
+            self._json(200, result)
+            return
+        if action in {"probe_xai", "probe", "test_xai"}:
+            via_proxy = (data or {}).get("via_proxy", True)
+            if isinstance(via_proxy, str):
+                via_proxy = via_proxy.strip().lower() not in {"0", "false", "no", "off"}
+            try:
+                timeout = (data or {}).get("timeout")
+                result = probe_xai_access(
+                    timeout=float(timeout) if timeout not in (None, "") else None,
+                    via_proxy=bool(via_proxy),
+                    proxy_limit=int((data or {}).get("proxy_limit") or 3),
+                )
+            except Exception as exc:
+                result = {"ok": False, "message": str(exc), "results": []}
+            _record_last_action("probe_xai", result)
+            self._json(200, result)
+            return
+        if action in {"convert", "convert_accounts", "to_cpa", "to_sub2api"}:
+            # format aliases
+            raw_fmt = (data or {}).get("formats") or (data or {}).get("format") or []
+            if isinstance(raw_fmt, str):
+                formats = [x.strip() for x in raw_fmt.split(",") if x.strip()]
+            else:
+                formats = list(raw_fmt or [])
+            if action == "to_cpa" and not formats:
+                formats = ["cpa"]
+            if action == "to_sub2api" and not formats:
+                formats = ["sub2api"]
+            emails = (data or {}).get("emails")
+            if isinstance(emails, str):
+                emails = [e.strip() for e in emails.split(",") if e.strip()]
+            only_pending = bool((data or {}).get("only_pending"))
+            allow_enroll = (data or {}).get("allow_enroll", True)
+            if isinstance(allow_enroll, str):
+                allow_enroll = allow_enroll.strip().lower() not in {"0", "false", "no", "off"}
+            try:
+                limit = int((data or {}).get("limit") or 50)
+            except (TypeError, ValueError):
+                limit = 50
+            background = (data or {}).get("background", True)
+            if isinstance(background, str):
+                background = background.strip().lower() not in {"0", "false", "no", "off"}
+            try:
+                if background:
+                    result = acct_convert.start_convert_job(
+                        emails,
+                        formats,
+                        only_pending=only_pending,
+                        allow_enroll=allow_enroll,
+                        limit=limit,
+                    )
+                else:
+                    result = acct_convert.convert_accounts(
+                        emails,
+                        formats,
+                        only_pending=only_pending,
+                        allow_enroll=allow_enroll,
+                        rebuild=True,
+                        limit=limit,
+                    )
+            except Exception as exc:
+                result = {"ok": False, "message": str(exc)}
+            _record_last_action("convert", result)
+            self._json(200, result)
+            return
+        if action in {"convert_status", "convert_job"}:
+            self._json(200, {"ok": True, "job": acct_convert.job_status()})
+            return
+        if action in {
+            "cliproxy_sync",
+            "cliproxyapi_sync",
+            "cpa_sync",
+            "sync_cliproxy",
+            "cliproxy_refresh",
+            "cliproxyapi_refresh",
+            "refresh_tokens",
+            "cliproxy_worker_start",
+            "cliproxy_worker_stop",
+            "cliproxy_status",
+        }:
+            try:
+                if action in {"cliproxy_status"}:
+                    result = {"ok": True, "job": cpa_sync.job_status()}
+                elif action in {"cliproxy_worker_start"}:
+                    result = cpa_sync.start_worker()
+                elif action in {"cliproxy_worker_stop"}:
+                    result = cpa_sync.stop_worker()
+                elif action in {"cliproxy_refresh", "cliproxyapi_refresh", "refresh_tokens"}:
+                    # panel button forces refresh of every account that has refresh_token
+                    force_raw = (data or {}).get("force")
+                    if force_raw is None:
+                        force = True
+                    elif isinstance(force_raw, str):
+                        force = force_raw.strip().lower() not in {"0", "false", "no", "off"}
+                    else:
+                        force = bool(force_raw)
+                    limit = (data or {}).get("limit")
+                    try:
+                        limit_i = int(limit) if limit not in (None, "") else None
+                    except (TypeError, ValueError):
+                        limit_i = None
+                    import_raw = (data or {}).get("import", True)
+                    if isinstance(import_raw, str):
+                        do_import = import_raw.strip().lower() not in {"0", "false", "no", "off"}
+                    else:
+                        do_import = bool(import_raw)
+                    result = cpa_sync.run_once(
+                        refresh=True,
+                        import_files=do_import,
+                        force_refresh=force,
+                        limit=limit_i,
+                        proxy=str((data or {}).get("proxy") or ""),
+                    )
+                    result["message"] = result.get("message") or "refresh done"
+                else:
+                    # full sync: refresh due + import singles
+                    force = bool((data or {}).get("force"))
+                    limit = (data or {}).get("limit")
+                    try:
+                        limit_i = int(limit) if limit not in (None, "") else None
+                    except (TypeError, ValueError):
+                        limit_i = None
+                    result = cpa_sync.run_once(
+                        refresh=True,
+                        import_files=True,
+                        force_refresh=force,
+                        limit=limit_i,
+                        proxy=str((data or {}).get("proxy") or ""),
+                    )
+            except Exception as exc:
+                result = {"ok": False, "message": str(exc)}
+            _record_last_action(action, result)
+            self._json(200, result)
+            return
+        if action in {"batch_test_proxies", "batch_proxy_test", "test_proxies_xai"}:
+            def _b(key, default=False):
+                v = (data or {}).get(key, default)
+                if isinstance(v, str):
+                    return v.strip().lower() not in {"0", "false", "no", "off"}
+                return bool(v)
+
+            def _i(key, default=None):
+                v = (data or {}).get(key, default)
+                if v in (None, ""):
+                    return default
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return default
+
+            use_public = _b("use_public", False)
+            use_manual = _b("use_manual", True)
+            use_active = _b("use_active", True)
+            background = _b("background", True)
+            max_candidates = _i("max_candidates", 200) or 200
+            max_candidates = max(1, min(int(max_candidates), 40000))
+            workers = _i("workers", None)
+            timeout = _i("timeout", None)
+            max_active = _i("max_active", None)
+            if max_active is not None:
+                max_active = max(0, min(int(max_active), 40000))
+            test_urls = (data or {}).get("test_urls") or (data or {}).get("urls")
+            custom_proxies = (
+                (data or {}).get("custom_proxies")
+                or (data or {}).get("proxies")
+                or (data or {}).get("custom")
+            )
+            custom_file = (data or {}).get("custom_file") or (data or {}).get("proxy_file")
+            try:
+                if background:
+                    result = proxy_batch.start_batch_job(
+                        use_public=use_public,
+                        use_manual=use_manual,
+                        use_active=use_active,
+                        max_candidates=max_candidates,
+                        workers=workers,
+                        timeout=timeout,
+                        test_urls=test_urls,
+                        custom_proxies=custom_proxies,
+                        custom_file=custom_file,
+                        max_active=max_active,
+                    )
+                else:
+                    result = proxy_batch.run_batch_xai_test(
+                        use_public=use_public,
+                        use_manual=use_manual,
+                        use_active=use_active,
+                        max_candidates=max_candidates,
+                        workers=workers,
+                        timeout=timeout,
+                        test_urls=test_urls,
+                        custom_proxies=custom_proxies,
+                        custom_file=custom_file,
+                        max_active=max_active,
+                        write_active=True,
+                    )
+            except Exception as exc:
+                result = {"ok": False, "message": str(exc)}
+            _record_last_action("batch_test_proxies", result)
+            self._json(200, result)
+            return
+        if action in {"batch_test_status", "proxy_batch_status"}:
+            self._json(200, {"ok": True, "job": proxy_batch.job_status()})
+            return
+        if not ALLOW_ACTIONS:
+            self._json(403, {"ok": False, "error": "actions disabled (CONTROL_PLANE_ALLOW_ACTIONS=0)"})
+            return
+        with _action_lock:
+            if action == "start":
+                engine = str(
+                    (data or {}).get("engine")
+                    or os.environ.get("REGISTER_ENGINE")
+                    or "protocol"
+                ).lower()
+                args = list((data or {}).get("args") or [])
+                target = (data or {}).get("target")
+                if target not in (None, "") and "--target" not in args:
+                    args = ["--target", str(target), *args]
+                if engine == "go":
+                    payload = dict(data or {})
+                    if target not in (None, ""):
+                        payload["target"] = target
+                    result = _spawn_go_register(payload)
+                else:
+                    # protocol / python / http all use Python entry; protocol skips browser path
+                    result = _spawn_register(args, engine=engine)
+            elif action == "stop":
+                result = _stop_register()
+            elif action == "scrape":
+                result = _run_scrape(data or {})
+            elif action == "save_config":
+                updates = (data or {}).get("updates") or {}
+                result = update_env_values(updates, allow_unknown=True)
+                result["message"] = (
+                    f"updated {len(result.get('changed') or [])} keys"
+                    + ("; restart register to apply" if result.get("needs_restart") else "")
+                )
+            else:
+                result = {"ok": False, "message": f"unknown action: {action}"}
+            _record_last_action(action, result)
+        self._json(200, result)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    from grok_register.polyglot import PolyglotError, print_stack_banner, require_polyglot_stack
+
+    p = argparse.ArgumentParser(description="Web control plane for grok-free-register")
+    p.add_argument("--host", default=DEFAULT_HOST)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    args = p.parse_args(argv)
+    # auto-start CLIProxyAPI import/refresh worker when enabled
+    try:
+        cpa_sync.ensure_worker_if_enabled()
+    except Exception:
+        pass
+    try:
+        require_polyglot_stack()
+    except PolyglotError as exc:
+        print(f"[✗] {exc}", file=sys.stderr)
+        return 2
+    print_stack_banner()
+    server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
+    print(f"[*] dashboard http://{args.host}:{args.port}/")
+    print(f"[*] status file: {status_path()}")
+    print(f"[*] actions: {'ENABLED' if ALLOW_ACTIONS else 'disabled (CONTROL_PLANE_ALLOW_ACTIONS=0)'}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[*] dashboard stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

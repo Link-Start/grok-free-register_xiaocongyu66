@@ -13,6 +13,8 @@ def _entrypoint_workspace(tmp_path):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     shutil.copy2(ROOT / "scripts" / "ensure_runtime.sh", scripts / "ensure_runtime.sh")
+    shutil.copy2(ROOT / "scripts" / "polyglot_gate.sh", scripts / "polyglot_gate.sh")
+    shutil.copy2(ROOT / "scripts" / "build-native.sh", scripts / "build-native.sh")
     python = tmp_path / ".venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
     python.write_text(
@@ -25,7 +27,12 @@ def _entrypoint_workspace(tmp_path):
 
 def _run_entry(workspace, script, *args):
     capture = workspace / "capture.txt"
-    environment = {**os.environ, "ENTRY_CAPTURE": str(capture)}
+    # Unit tests only exercise shell dispatch; skip hard polyglot binary gate.
+    environment = {
+        **os.environ,
+        "ENTRY_CAPTURE": str(capture),
+        "POLYGLOT_REQUIRED": "0",
+    }
     completed = subprocess.run(
         ["bash", script, *args],
         cwd=workspace,
@@ -33,7 +40,7 @@ def _run_entry(workspace, script, *args):
         capture_output=True,
         text=True,
     )
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode == 0, completed.stderr + completed.stdout
     return capture.read_text(encoding="utf-8").splitlines()
 
 
@@ -52,6 +59,27 @@ def test_start_dispatches_registration_and_email_as_independent_modules(tmp_path
         "grok_register.email_server",
         "--port",
         "9090",
+    ]
+    assert _run_entry(workspace, "start.sh", "--turnstile-solver", "status") == [
+        "-m",
+        "grok_register.turnstile_solver",
+        "status",
+    ]
+    assert _run_entry(workspace, "start.sh", "--turnstile-solver", "install") == [
+        "-m",
+        "grok_register.turnstile_solver",
+        "install",
+    ]
+    assert _run_entry(workspace, "start.sh", "--scrape-proxies") == [
+        "-m",
+        "grok_register.proxy_scraper",
+        "scrape",
+    ]
+    assert _run_entry(workspace, "start.sh", "--scrape-proxies", "--github") == [
+        "-m",
+        "grok_register.proxy_scraper",
+        "scrape",
+        "--github",
     ]
 
 

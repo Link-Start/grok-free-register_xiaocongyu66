@@ -21,8 +21,8 @@ class CredentialSink(Protocol):
     async def store(self, credential: OAuthCredential) -> SinkReceipt: ...
 
 
-def cpa_document(credential: OAuthCredential):
-    return {
+def cpa_document(credential: OAuthCredential, *, email: str | None = None):
+    document = {
         "type": "xai",
         "access_token": credential.access_token,
         "refresh_token": credential.refresh_token,
@@ -36,6 +36,9 @@ def cpa_document(credential: OAuthCredential):
         "token_endpoint": credential.token_endpoint,
         "auth_kind": "oauth",
     }
+    if email:
+        document["email"] = email
+    return document
 
 
 def credential_filename(credential: OAuthCredential, name_secret: bytes):
@@ -69,11 +72,12 @@ class CPAAuthFileSink:
 
 
 class LocalAuthFileSink:
-    """Atomically persist canonical CPA-compatible documents locally."""
+    """Atomically persist single-account CPA-compatible documents (xai-*.json only)."""
 
-    def __init__(self, directory, *, name_secret: bytes):
+    def __init__(self, directory, *, name_secret: bytes, email: str | None = None):
         self.directory = Path(directory).expanduser()
         self.name_secret = name_secret
+        self.email = email
 
     async def store(self, credential: OAuthCredential):
         return await asyncio.to_thread(self._store_sync, credential)
@@ -81,9 +85,11 @@ class LocalAuthFileSink:
     def _store_sync(self, credential: OAuthCredential):
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.directory, 0o700)
+        # Never leave legacy merge bundles around
+        purge_cpa_bundles(self.directory)
         filename = credential_filename(credential, self.name_secret)
         destination = self.directory / filename
-        payload = json.dumps(cpa_document(credential), ensure_ascii=False, indent=2) + "\n"
+        payload = json.dumps(cpa_document(credential, email=self.email), ensure_ascii=False, indent=2) + "\n"
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{filename}.", suffix=".tmp", dir=self.directory, text=True
         )
@@ -104,3 +110,41 @@ class LocalAuthFileSink:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
         return SinkReceipt(filename.removesuffix(".json"))
+
+
+def purge_cpa_bundles(directory) -> list[str]:
+    """Delete any leftover accounts.cpa.json / accounts.cpa.zip (unsupported by CLIProxyAPI)."""
+    directory = Path(directory).expanduser()
+    removed: list[str] = []
+    if not directory.is_dir():
+        return removed
+    for name in ("accounts.cpa.json", "accounts.cpa.zip"):
+        path = directory / name
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(path.name)
+        except OSError:
+            pass
+    return removed
+
+
+# Back-compat no-ops so old imports do not create bundles
+def write_cpa_import_bundle(directory, *, bundle_name: str = "accounts.cpa.zip"):
+    purge_cpa_bundles(directory)
+    return None
+
+
+def write_cpa_json_bundle(directory, *, bundle_name: str = "accounts.cpa.json"):
+    purge_cpa_bundles(directory)
+    return None
+
+
+def cpa_json_bundle_document(directory):
+    """Deprecated — never produce merge documents."""
+    return {
+        "type": "removed",
+        "version": 0,
+        "accounts": [],
+        "note": "accounts.cpa.json is permanently removed; use xai-*.json singles",
+    }

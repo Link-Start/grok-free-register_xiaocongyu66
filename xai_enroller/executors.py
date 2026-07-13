@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from .fingerprints import browser_context_options
 from .models import AuthorizationResult, AuthorizationStatus, DeviceFlow, SourceRecord
 
 
@@ -268,7 +269,10 @@ class PlaywrightExecutor:
             consent_submitted = False
             challenge_clicks = 0
             try:
-                context_kwargs = {"proxy": self.proxy} if self.proxy else {}
+                context_kwargs = browser_context_options(
+                    source.browser_fingerprint_id,
+                    proxy=self.proxy,
+                )
                 context = await self._browser.new_context(**context_kwargs)
                 page = await context.new_page()
                 await context.add_cookies(self._expanded_cookies(source))

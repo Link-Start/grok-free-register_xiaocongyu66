@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
 .env
+.env.bak*
 proxy.txt
 代理.txt
 proxy-sources.txt
+proxy-scraper-sources.txt
+turnstile-proxies.txt
 keys/
 *.log
 logs/
@@ -14,3 +17,18 @@ logs/
 .pytest_cache/
 xai-enroller-ledger.db*
 tmp_*.py
+ZhangMi/
+Grok_Ouath/
+output/
+
+# native build artifacts (source only in git)
+native/**/target/
+native/**/Cargo.lock
+native/proxy-worker/proxy-worker
+native/register-worker/register-worker
+native/inventory-worker/inventory-worker
+native/solver-gateway/solver-gateway
+native/solver-watchdog/solver-watchdog
+native/solver-util/solver-util
+native/solver-util/*.o
+native/solver-util/solver-util.o

@@ -1,18 +1,49 @@
 # grok-free-register
 
-`grok-free-register` 是一个命令行注册工具。程序会启动本机浏览器，完成页面操作、邮箱验证码处理和结果保存。
+`grok-free-register` 是 **Python + Go + Rust** 多语言一体化注册工具：浏览器编排与控制面用 Python，高并发代理测活 / HTTP 注册用 Go，账号库存与 CPA·sub2api 成品用 Rust。
 
-运行结果写入 `keys/` 目录。
+> **硬性条件**：三者必须同时可用，否则 `start.sh` / `setup.sh` / 控制面板 **拒绝启动**。  
+> 自检：`bash scripts/polyglot_gate.sh check`
+
+运行结果写入 `keys/`（legacy / sub2api / CPA）。
+
+## 架构分工
+
+| 语言 | 组件 | 职责 |
+|------|------|------|
+| **Python** | `grok_register/*` · 面板 · Turnstile · enroller | 编排、浏览器 CSP、配置、控制面 |
+| **Go** | `native/proxy-worker` · `native/register-worker` | 代理测活、实验性 HTTP 并发注册 |
+| **Rust** | `native/inventory-worker` | 账号扫描、合并 `accounts.sub2api.json` + `keys/cpa/xai-*.json` |
+
+```text
+start.sh ──► ensure_runtime ──► polyglot_gate (Python+Go+Rust)
+                 │
+                 ├─ Python register / dashboard
+                 ├─ Go     proxy-worker (测活) / register-worker (可选)
+                 └─ Rust   inventory-worker (库存 & 成品包)
+```
 
 ## 快速开始
+
+**前置工具链（缺一不可）：**
+
+- Python 3.10+（`python3` + `venv`）
+- Go 1.21+（`go`）
+- Rust（`rustc` + `cargo`，推荐 [rustup](https://rustup.rs/)）
 
 ```bash
 git clone https://github.com/hechuyi/grok-free-register.git
 cd grok-free-register
+bash setup.sh                 # 安装 Python 依赖并编译 Go + Rust
+bash scripts/polyglot_gate.sh check
 bash start.sh
 ```
 
-首次运行会自动创建 `.venv`、安装依赖，并引导生成 `.env`。
+首次运行会创建 `.venv`、编译原生二进制，并引导生成 `.env`。原生组件也可单独构建：
+
+```bash
+bash scripts/build-native.sh  # Go proxy/register + Rust inventory
+```
 
 需要完整说明时，按用途查看：
 
@@ -24,10 +55,12 @@ bash start.sh
 常用命令：
 
 ```bash
-bash start.sh               # 按当前 .env 前台运行
+bash start.sh               # 按当前 .env 前台运行（先过 polyglot 门禁）
+bash start.sh --dashboard   # Web 控制面板（中英切换 · 成品下载）
 bash start.sh --target 100  # 成功 100 个后停止
 bash start.sh --max-mem 6G  # 自动估算并发时最多使用 6G 内存
 bash start.sh --reconfig    # 重新选择邮箱模式
+bash scripts/polyglot_gate.sh check   # 栈自检
 ```
 
 `start.sh` 直接在当前终端显示状态。按 `Ctrl-C` 停止，再次执行同一命令即可重启；不需要额外的会话管理或守护进程依赖。
@@ -67,15 +100,130 @@ vless://...
 trojan://...
 ```
 
-`代理.txt` 也支持 `vmess`、`vless`、`trojan`、`ss`、`hy2`、`hysteria2`、`tuic`、`anytls` 分享链接。使用分享链接时需先启动本机 proxy-relay 服务，默认调用 `http://127.0.0.1:18080` 的 `/api/state` 和 `/api/nodes/import`，导入后会自动使用对应本地端口。
+`代理.txt` 也支持 `vmess`、`vless`、`trojan`、`ss`、`hy2`、`hysteria2`、`tuic`、`anytls` 分享链接。程序内置了 sing-box relay，会把分享链接转换成本地 `http://127.0.0.1:端口` 后再测试 Grok/xAI 连通性；如果本机已有外部 proxy-relay，也兼容 `http://127.0.0.1:18080` 的 `/api/state` 和 `/api/nodes/import`。
 
 需要自动节点池时开启本地开关：
 
 ```env
 PROXY_AUTO_FETCH_ENABLED=1
+PROXY_POOL_STRATEGY=random
+PROXY_AUTO_FETCH_WORKERS=16
+PROXY_AUTO_TEST_WORKERS=32
+PROXY_AUTO_REQUIRE_ACTIVE=1
+PROXY_POOL_USE_TESTED_ONLY=1
 ```
 
-开启后程序会多线程拉取订阅、多线程测试节点，每 20 分钟刷新一次，只保留能访问 `PROXY_AUTO_TEST_URLS` 的代理；上一轮可用的自动代理会在下一轮继续复测，避免源站临时失败时直接清空。自动代理会和 `代理.txt` 里的手动代理混合轮换使用。拉取订阅时会用当前已有代理做轮换请求，避免所有源站请求都走同一个出口。可在 `proxy-sources.txt` 里追加订阅源，一行一个 URL；带 `*` 前缀表示这个 URL 返回的是“订阅源列表”。自动导出文件在 `logs/` 下，支持 raw、base64、sub2api/cpa 导入 JSON。
+开启后程序会在跑账号前先多线程拉取订阅、多线程测试节点，只保留能访问 `PROXY_AUTO_TEST_URLS` 的代理并按延迟优先写入 `logs/proxy-auto-active.txt`；没有可用代理且 `PROXY_AUTO_REQUIRE_ACTIVE=1` 时会直接停止，不会悄悄直连。上一轮可用的自动代理和 `代理.txt` 里的手动代理会一起复测，开启 `PROXY_POOL_USE_TESTED_ONLY=1` 后注册阶段只使用通过 Grok/xAI 连通性测试的代理。后台每 20 分钟刷新一次，拉取订阅时会用当前已有代理做轮换请求，避免所有源站请求都走同一个出口。可在 `proxy-sources.txt` 里追加订阅源，一行一个 URL；带 `*` 前缀表示这个 URL 返回的是“订阅源列表”。自动导出文件在 `logs/` 下，支持 raw、base64、sub2api/cpa 导入 JSON。
+
+### 公共订阅 / 免费代理爬取（可选）
+
+内置 `proxy_scraper` 会从公开目录抓取候选节点（含 [proxifly/free-proxy-list](https://github.com/proxifly/free-proxy-list)、[snakem982/proxypool](https://github.com/snakem982/proxypool)、TheSpeedX、ProxyScrape 等），输出到 `logs/proxy-scraper-candidates.txt`。`proxy_auto` 刷新时会自动读入该文件并做 Grok/xAI 连通性测试。
+
+```bash
+bash start.sh --scrape-proxies              # 抓取内置目录 + proxy-scraper-sources.txt
+bash start.sh --scrape-proxies --github     # 额外用 GitHub code search 发现 raw 列表（建议 GITHUB_TOKEN）
+.venv/bin/python -m grok_register.proxy_scraper sources
+```
+
+说明：
+
+- 以 **HTTP 拉取 raw/API/文本** 为主，不跑浏览器 JS；页面若只有前端渲染，应改用其 raw/API 源。
+- 抓到的是**候选**，必须经 `PROXY_AUTO_FETCH_ENABLED=1` 测活后才会进入注册池。
+- 可在 `proxy-scraper-sources.txt` 追加源；裸 `ip:port` 列表可用 `#scheme=socks5` 标注协议。
+
+### Go 代理测活 + Rust 库存（硬性原生组件）
+
+项目 **必须** 编译并启用下列二进制（`setup.sh` / `start.sh` 会自动构建并门禁校验）：
+
+| 二进制 | 语言 | 作用 |
+|--------|------|------|
+| `native/proxy-worker/proxy-worker` | Go | 大批量代理测活（goroutine 池） |
+| `native/register-worker/register-worker` | Go | 实验性 HTTP 并发注册 |
+| `native/inventory-worker/inventory-worker` | Rust | 账号扫描 / CPA·sub2api 合并包 |
+
+```bash
+bash scripts/build-native.sh
+bash scripts/polyglot_gate.sh check
+```
+
+```env
+PROXY_WORKER_ENGINE=go
+# PROXY_WORKER_BIN=native/proxy-worker/proxy-worker
+# PROXY_WORKER_URL=http://127.0.0.1:18765
+INVENTORY_ENGINE=rust
+# INVENTORY_WORKER_BIN=native/inventory-worker/inventory-worker
+```
+
+```bash
+./native/proxy-worker/proxy-worker serve --port 18765
+./native/inventory-worker/inventory-worker scan --keys-dir keys --json
+./native/inventory-worker/inventory-worker rebuild --keys-dir keys
+```
+
+### Web 控制面板
+
+注册进程会周期性写入 `logs/runtime-status.json`。控制面板读取该快照，并提供 **全部 .env 配置编辑**、账号状态、**CPA / sub2api 成品下载**、启停与 Go/Python 引擎切换。
+
+```bash
+bash start.sh --dashboard
+# 打开 http://127.0.0.1:8787/
+```
+
+```env
+DASHBOARD_HOST=127.0.0.1
+DASHBOARD_PORT=8787
+# 允许从面板 start/stop/scrape/save_config（默认关闭；重建合并包与下载不需要）
+CONTROL_PLANE_ALLOW_ACTIONS=1
+```
+
+面板页：
+
+- **Overview** — KPI、限流、引擎、启停（Python / Go）、成品下载入口
+- **Accounts** — 账号库存状态（oauth_ready / oauth_pending）、格式过滤、下载 sub2api / CPA / legacy
+- **All Config** — 全量配置目录编辑并写回 `.env`
+- **Raw JSON** — 运行时快照
+
+成品下载（可直接导入对应面板）：
+
+| 格式 | 文件 | 下载 |
+|------|------|------|
+| sub2api | `keys/sub2api/accounts.sub2api.json` | `/api/download?format=sub2api` |
+| CPA singles ZIP | `keys/cpa/xai-*.json` → zip | `/api/download?format=cpa_zip` |
+| legacy | `keys/accounts.txt` | `/api/download?format=legacy` |
+
+面板上的「重建合并包」会从单账号 `xai-*.json` / `*.sub2api.json` 重新生成上述合并文件。
+
+API：
+
+- `GET /api/status` — 总览（含账号 by_status / products 链接）
+- `GET /api/accounts` — 账号列表与状态（`?status=&format=&limit=`）
+- `GET /api/accounts/summary` — 库存汇总
+- `GET /api/download?format=sub2api|cpa|cpa_zip|legacy` — 成品附件下载
+- `GET /api/config` — 全量配置（密钥默认掩码）
+- `GET /api/status/raw` — 原始 runtime snapshot
+- `POST /api/action` — `start` / `stop` / `scrape` / `save_config` / `rebuild_bundles`
+
+**Web 用 Go 还是 Python？** 控制面板保持 **Python**（stdlib `ThreadingHTTPServer`）：配置/库存/enroller 都是 Python 生态，改动快、与 `register.py` 同进程模型。高并发 I/O（代理测活、实验性 HTTP 注册）继续用 **Go worker**。不建议为面板单独上 Go Web 框架——收益小、双端配置同步成本高。
+
+### Go 并发注册（实验）
+
+HTTP 路径注册可交给 Go worker（Turnstile API + MoeMail/custom + grpc-web + signup）。浏览器路径仍用 Python。
+
+```bash
+bash scripts/build-native.sh
+# 先确保 Turnstile API 可用（d3vin），并 export 配置：
+export REGISTER_ENGINE=go
+export GO_REGISTER_WORKERS=4
+export TURNSTILE_SOLVER=d3vin
+export EMAIL_MODE=moemail
+export MOEMAIL_API_KEY=...
+bash start.sh --target 10
+```
+
+Python 会 `fetch_config` 拿到 `SITE_KEY/ACTION_ID/STATE_TREE` 后拉起 `native/register-worker`。  
+也可在面板 Overview 点 **Start Go**（需 `CONTROL_PLANE_ALLOW_ACTIONS=1`，并已准备好 SITE_KEY 等配置 JSON）。
+
+注意：Go 路径不跑 Playwright，风控/页面变更时需继续完善；成功账号写入 `keys/accounts.go.txt`。
 
 注册成功后默认会把 SSO 会话交给本项目内置的 `xai_enroller` 自动换成 Grok OAuth 凭据，并写入 `keys/sub2api/`。需要 CPA 文件时设置：
 
@@ -85,11 +233,59 @@ KEY_EXPORT_FORMATS=legacy,sub2api,cpa
 
 只想保留某一种最终格式也可以设置为 `sub2api`、`cpa` 或 `legacy`。`sub` 会作为 `sub2api` 的别名处理。
 
-外部邮箱接口如果偶发 Cloudflare 拦截，可开启 CF-Ares 兜底。`cf-ares` 已随默认依赖安装：
+外部邮箱接口如果偶发 Cloudflare 拦截，可开启 CF-Ares 兜底。项目已内置 `vendor/CF-Ares`，默认会从本地源码安装和优先导入，不依赖 PyPI wheel：
 
 ```env
 CF_ARES_EMAIL=fallback
+CF_ARES_XAI=fallback
 ```
+
+### 内置 Turnstile Solver（可选）
+
+| 引擎 | 栈 / 上游 | 默认端口 |
+|---|---|---:|
+| **`hybrid`（推荐）** | Go 网关 + Rust 看门狗 + C++ 工具 + Python 浏览器 worker，**自动释放内存** | **5080** |
+| `d3vin` | [D3-vin/Turnstile-Solver-NEW](https://github.com/D3-vin/Turnstile-Solver-NEW)（`vendor/turnstile-solver/d3vin`） | 5072 |
+| `theyka` | [Theyka/Turnstile-Solver](https://github.com/Theyka/Turnstile-Solver)（`vendor/turnstile-solver/theyka`） | 5000 |
+
+API 兼容：`GET /turnstile` → `task_id`，`GET /result` → token。Hybrid 说明见 `native/solver-hybrid/README.md`（构建：`bash scripts/build-native.sh`）。
+
+推荐直接在 `.env` 启用 hybrid（注册进程会自动拉起网关；超 RSS 自动回收 Chromium）：
+
+```env
+TURNSTILE_SOLVER=hybrid
+SOLVER_GATEWAY_WORKERS=1
+SOLVER_WATCHDOG_SOFT_MB=700
+SOLVER_WATCHDOG_HARD_MB=1100
+SOLVER_WORKER_MAX_SOLVES=8
+# 兼容旧引擎：
+# TURNSTILE_SOLVER=d3vin
+# TURNSTILE_SOLVER=theyka
+TURNSTILE_SOLVER_THREADS=1
+TURNSTILE_SOLVER_BROWSER=chromium
+TURNSTILE_SOLVER_HEADLESS=1
+```
+
+也可单独管理：
+
+```bash
+bash start.sh --turnstile-solver install   # 安装依赖 + patchright chromium
+bash start.sh --turnstile-solver start     # 前台运行 solver
+bash start.sh --turnstile-solver status
+bash start.sh --turnstile-solver stop
+```
+
+运行状态与日志在 `logs/turnstile-solver/<engine>/`。需要给 solver 单独代理时，创建项目根目录 `turnstile-proxies.txt`（一行一个），并设置 `TURNSTILE_SOLVER_PROXY=1`。
+
+仍可用外部已启动的服务：
+
+```env
+TURNSTILE_SOLVER=api
+TURNSTILE_SOLVER_ENGINE=external
+TURNSTILE_API_URL=http://127.0.0.1:5072
+```
+
+`d3vin` / `theyka` / `api` 模式下 S_Worker 不占用本机注册浏览器物理并发槽；P/C 阶段仍用本机浏览器。
 
 `custom` 是自建域名邮箱模式，适合长时间运行。需要一个已接入 Cloudflare Email Routing 的域名，并在运行机器上启动本项目的收信服务。
 
@@ -130,8 +326,12 @@ EMAIL_API=http://127.0.0.1:8080
 | `KEY_EXPORT_ENROLLER` | `1` | 是否自动调用 `xai_enroller` 把 SSO 转 OAuth 后导出 |
 | `PROXY_POOL_FILE` | `代理.txt` | 可选 Grok/xAI 代理池文件，一行一个 `http`/`socks5` 代理或节点分享链接 |
 | `PROXY_POOL_STRATEGY` | `round_robin` | 代理选择方式，支持 `round_robin` 和 `random` |
-| `PROXY_RELAY_ENABLED` | `1` | 是否把节点分享链接交给本机 proxy-relay 转成本地代理 |
-| `PROXY_RELAY_URL` | `http://127.0.0.1:18080` | proxy-relay 管理 API 地址 |
+| `PROXY_RELAY_ENABLED` | `1` | 是否把节点分享链接转成本地代理 |
+| `PROXY_RELAY_BUILTIN_ENABLED` | `1` | 是否启用内置 sing-box relay |
+| `PROXY_RELAY_AUTO_INSTALL` | `1` | 本机没有 `sing-box` 时是否自动下载到 `PROXY_RELAY_WORK_DIR/bin` |
+| `PROXY_RELAY_WORK_DIR` | `logs/proxy-relay` | 内置 relay 的运行目录 |
+| `PROXY_RELAY_MAX_NODES` | `48` | 单轮最多同时启动的内置 relay 节点数 |
+| `PROXY_RELAY_URL` | `http://127.0.0.1:18080` | 可选外部 proxy-relay 管理 API 地址 |
 | `PROXY_RELAY_KERNEL` | `auto` | 分享链接导入内核，支持 `auto`、`sing-box`、`xray` |
 | `PROXY_RELAY_PROXY_SCHEME` | `auto` | 导入后给 Grok/xAI 链路使用的代理协议，`auto` 下 sing-box 为 `http`、xray 为 `socks5` |
 | `PROXY_RELAY_TIMEOUT` | `8` | 调用 proxy-relay 管理 API 的超时秒数 |
@@ -153,11 +353,16 @@ EMAIL_API=http://127.0.0.1:8080
 | `PROXY_AUTO_SOURCE_LIST_DEPTH` | `1` | `*URL` 订阅源列表最多展开层数 |
 | `PROXY_AUTO_MAX_CANDIDATES` | `0` | 单轮最多测试候选数，`0` 表示不限 |
 | `PROXY_AUTO_MAX_ACTIVE` | `0` | 自动池最多保留可用代理数，`0` 表示不限 |
+| `PROXY_AUTO_REQUIRE_ACTIVE` | 跟随 `PROXY_AUTO_FETCH_ENABLED` | 启动前必须筛出至少一个可访问 Grok/xAI 的代理，否则停止 |
+| `PROXY_AUTO_INCLUDE_BOOTSTRAP_CANDIDATES` | `1` | 是否把上一轮可用代理和 `代理.txt` 手动代理也纳入本轮连通性测试 |
+| `PROXY_POOL_USE_TESTED_ONLY` | 自动代理必需时为 `1` | 启动前测试完成后，注册阶段只使用通过测试的自动池代理 |
 | `CF_ARES_EMAIL` | `0` | 可选邮箱 HTTP 兜底，`fallback` 遇到 Cloudflare 拦截时重试，`always` 始终使用 |
+| `CF_ARES_XAI` | 跟随 `CF_ARES_EMAIL` | 可选 xAI/Grok HTTP 兜底，用于发码、验码、注册提交和 set-cookie |
+| `CF_ARES_IMPERSONATE` | `chrome120` | `cf-ares` wheel 不完整时使用的 `curl_cffi` 浏览器指纹 |
 | `CF_ARES_BROWSER_ENGINE` | `auto` | CF-Ares 浏览器引擎，支持 `auto`、`undetected`、`seleniumbase` |
 | `CF_ARES_HEADLESS` | `1` | CF-Ares 浏览器是否无头运行 |
 | `CF_ARES_PROXY` | 空 | CF-Ares 代理，留空沿用 `HTTPS_PROXY`/`HTTP_PROXY` |
-| `CF_ARES_PATH` | 空 | 可选本地 CF-Ares 源码目录，不设置则只使用 pip 包 |
+| `CF_ARES_PATH` | 空 | 可选覆盖为其他 CF-Ares 源码目录，不设置则使用项目内置 `vendor/CF-Ares` |
 | `EMAIL_DOMAIN` | 空 | `custom` 模式使用的域名 |
 | `EMAIL_API` | `http://127.0.0.1:8080` | 本地收信服务地址 |
 | `TARGET` | `0` | 成功数量目标，`0` 表示不限 |
@@ -171,8 +376,24 @@ EMAIL_API=http://127.0.0.1:8080
 | `EMAIL_CODE_RESEND_ATTEMPTS` | `2` | 邮箱验证码未收到时重新发送的最大次数 |
 | `EMAIL_CODE_RESEND_AFTER_SEC` | `35` | 等待多久仍未收到验证码后重发 |
 | `SOLVER_MOUSE_CLICK_RETRIES` | `3` | token 验证框中心点击次数，`0` 表示关闭 |
+| `TURNSTILE_SOLVER` | `hybrid` | `hybrid` / `d3vin` / `theyka` / `local` / `api` |
+| `SOLVER_GATEWAY_WORKERS` | `1` | hybrid 浏览器 worker 数（内存紧时保持 1） |
+| `SOLVER_WATCHDOG_SOFT_MB` / `HARD_MB` | `700` / `1100` | worker RSS 软/硬上限，超限自动回收 |
+| `SOLVER_WORKER_MAX_SOLVES` | `8` | 每浏览器最多求解次数后重启 |
+| `TURNSTILE_SOLVER_ENGINE` | `d3vin` | `api` 模式下内置引擎：`hybrid` / `d3vin` / `theyka` / `external` |
+| `TURNSTILE_API_URL` | 按引擎默认 | hybrid=`:5080`，d3vin=`:5072`，theyka=`:5000` |
+| `TURNSTILE_API_MANAGED` | `1` | 是否自动管理内置 solver 子进程 |
+| `TURNSTILE_API_TIMEOUT` | `90` | API 单次求解超时（秒） |
+| `TURNSTILE_API_POLL_INTERVAL_MS` | `500` | 轮询 `/result` 的间隔（毫秒） |
+| `TURNSTILE_API_ACTION` | 空 | 可选，传给 solver 的 `action` |
+| `TURNSTILE_API_CDATA` | 空 | 可选，传给 solver 的 `cdata` |
+| `TURNSTILE_SOLVER_THREADS` | `2` | 内置 solver 浏览器线程数 |
+| `TURNSTILE_SOLVER_BROWSER` | `chromium` | `chromium` / `chrome` / `msedge` / `camoufox` |
+| `TURNSTILE_SOLVER_HEADLESS` | `1` | 内置 solver 是否无头 |
+| `REGISTER_HEARTBEAT_INTERVAL` | `60` | 普通日志模式下的运行心跳间隔，`0` 表示关闭 |
 | `PAGE_BLOCK_STATIC_ASSETS` | `0` | 可选：阻断部分静态资源，降低页面准备成本 |
 | `C_HOT_PAGE_POOL` | `0` | 可选：复用消费阶段页面，减少页面重建开销 |
+| `C_SET_COOKIE_VIA_REQUEST` | `1` | 优先用浏览器 request 写入登录 cookie，失败再回退页面导航 |
 
 不确定怎么设置时，先保持默认值。性能压测时优先观察 `PHYSICAL_CAP` 和内存，不建议先改 Worker 数量。
 
@@ -183,6 +404,7 @@ EMAIL_API=http://127.0.0.1:8080
 ```text
 [→] 开始注册 #38
 [✓] 注册成功 #38 | 运行平均 9.9/分 | 累计 38
+[*] 运行中 | T:0 Q:0 发码:0 回码:0 开始:0 成功:0
 [⏸] 触发限流 | 60秒后恢复探测
 [▶] 限流解除 | 实际等待 61秒
 ```
@@ -253,7 +475,34 @@ email:password:sso_token
 
 ```text
 keys/cpa/xai-*.json
+keys/cpa/xai-*.json
 ```
+
+`xai-*.json` 是 **CLIProxyAPI 唯一可识别** 的单账号认证文件（`type: xai`）。  
+CPA 仅支持单账号 `keys/cpa/xai-*.json`（已永久移除合并包 `accounts.cpa.json`）。
+
+### CLIProxyAPI 自动导入与过期刷新
+
+```bash
+# 一次性：刷新到期 token + 导入 keys/cpa/xai-*.json → CLIPROXYAPI_AUTH_DIR
+python3 -m grok_register.cliproxyapi --once
+
+# 仅导入（不打 auth.x.ai）
+python3 -m grok_register.cliproxyapi --once --import-only
+
+# 后台 worker（默认 300s 周期）
+python3 -m grok_register.cliproxyapi --worker
+# 或 bash scripts/sync_cpa_to_cliproxy.sh
+```
+
+主要环境变量：`CLIPROXYAPI_ENABLED`、`CLIPROXYAPI_AUTH_DIR`（默认 `/root/CLIProxyAPI/auths`）、`CLIPROXYAPI_AUTO_REFRESH`、`CLIPROXYAPI_INTERVAL_SEC`。  
+面板「账号」页可点：同步 CLIProxyAPI / 刷新过期 Token / 启停自动同步。
+
+### xAI 协议注册（逆向参考）
+
+- **主参考**：[grok-build-auth](https://github.com/dongguatanglinux/grok-build-auth) — OAuth PKCE + CreateSession gRPC-web + CLIProxyAPI 导出  
+- **模式参考**：KiroX / aBaiAutoplus 是其它产品的协议注册机（并发、邮箱池、导出），**不是** xAI 线格式  
+- 本仓库：`grok_register/xai_protocol_oauth.py`（PKCE / 换 token / 导出单文件）；完整无浏览器登录可挂载 `GROK_BUILD_AUTH_ROOT=/tmp/grok-build-auth`
 
 ## 项目结构
 

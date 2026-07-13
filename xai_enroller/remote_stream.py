@@ -208,6 +208,7 @@ class LocalSnapshotSynchronizer(SSHSnapshotSynchronizer):
         ))
         self.sessions_path = self.register_root / "keys" / "auth-sessions.jsonl"
         self.accounts_path = self.register_root / "keys" / "accounts.txt"
+        self.fingerprints_path = self.register_root / "keys" / "browser-fingerprints.json"
 
     @staticmethod
     def _path_generation(path):
@@ -226,6 +227,7 @@ class LocalSnapshotSynchronizer(SSHSnapshotSynchronizer):
         return (
             self._path_generation(self.sessions_path),
             self._path_generation(self.accounts_path),
+            self._path_generation(self.fingerprints_path),
         )
 
     def _input_generation_unchanged(self, generation):
@@ -438,7 +440,15 @@ def parse_session_document(raw: bytes | str) -> SourceRecord:
     sso_token = sso_token or fallback_sso_token
     if not sso_token:
         raise ValueError("invalid remote session record")
-    return SourceRecord(source_id, sso_token, tuple(cookies))
+    browser_fingerprint_id = document.get("browser_fingerprint_id")
+    if browser_fingerprint_id is not None:
+        if not isinstance(browser_fingerprint_id, str) or not browser_fingerprint_id:
+            raise ValueError("invalid remote session record")
+        try:
+            browser_fingerprint_id.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("invalid remote session record") from exc
+    return SourceRecord(source_id, sso_token, tuple(cookies), browser_fingerprint_id)
 
 
 class RemoteSessionStream:
