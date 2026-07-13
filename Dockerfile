@@ -16,9 +16,8 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY vendor /build/vendor
-COPY requirements.txt /build/requirements.txt
-# Install without -e for reproducible image (copy CF-Ares as package)
+# Core deps are pinned inline so HF Space builds work even if requirements.txt
+# is missing from a partial Space git tree.
 RUN pip install --upgrade pip wheel \
     && pip install \
         'cloakbrowser>=0.3.0' \
@@ -27,13 +26,15 @@ RUN pip install --upgrade pip wheel \
         'python-dotenv>=1.0.0' \
         'httpx>=0.28' \
         'playwright>=1.55' \
-        'curl_cffi>=0.6' \
-    && if [ -f vendor/CF-Ares/pyproject.toml ] || [ -f vendor/CF-Ares/setup.py ]; then \
-         pip install ./vendor/CF-Ares || true; \
-       fi \
-    && if [ -f vendor/turnstile-solver/requirements.txt ]; then \
-         pip install -r vendor/turnstile-solver/requirements.txt || true; \
-       fi
+        'curl_cffi>=0.6'
+# Optional: vendor tree (CF-Ares / turnstile extras) when present in build context
+COPY vendor /build/vendor
+RUN if [ -f /build/vendor/CF-Ares/pyproject.toml ] || [ -f /build/vendor/CF-Ares/setup.py ]; then \
+      pip install /build/vendor/CF-Ares || true; \
+    fi \
+    && if [ -f /build/vendor/turnstile-solver/requirements.txt ]; then \
+      pip install -r /build/vendor/turnstile-solver/requirements.txt || true; \
+    fi
 
 # ========== Stage 2a: Go natives ==========
 FROM golang:1.22-bookworm AS gobuild
@@ -102,9 +103,17 @@ COPY xai_enroller /app/xai_enroller
 COPY native/solver-hybrid /app/native/solver-hybrid
 COPY scripts /app/scripts
 COPY vendor /app/vendor
-COPY .env.example /app/.env.example
-COPY requirements.txt /app/requirements.txt
 COPY docker/entrypoint.sh /entrypoint.sh
+# Keep a minimal requirements.txt in the image for tooling / docs (deps already installed)
+RUN printf '%s\n' \
+      'cloakbrowser>=0.3.0' \
+      'requests>=2.31.0' \
+      'PySocks>=1.7.1' \
+      'python-dotenv>=1.0.0' \
+      'httpx>=0.28' \
+      'playwright>=1.55' \
+      'curl_cffi>=0.6' \
+      > /app/requirements.txt
 
 RUN mkdir -p \
       /app/native/proxy-worker \
