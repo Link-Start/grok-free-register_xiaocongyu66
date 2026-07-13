@@ -1769,7 +1769,7 @@ def _get_turnstile_api_inflight():
     if _turnstile_api_inflight is None:
         # hybrid: align with effective slots (workers × concurrency), else threads
         if TURNSTILE_SOLVER == "hybrid":
-            workers_raw = (os.environ.get("SOLVER_GATEWAY_WORKERS") or "8").strip().lower()
+            workers_raw = (os.environ.get("SOLVER_GATEWAY_WORKERS") or "auto").strip().lower()
             try:
                 import os as _os
 
@@ -1782,13 +1782,15 @@ def _get_turnstile_api_inflight():
                 try:
                     workers = max(1, int(workers_raw))
                 except ValueError:
-                    workers = max(1, _env_int("TURNSTILE_SOLVER_THREADS", 8))
+                    workers = max(1, min(cores, _env_int("SOLVER_GATEWAY_WORKERS_MAX", 8)))
             conc = _env_int("SOLVER_WORKER_CONCURRENCY", 0)
             if conc <= 0:
-                conc = 1
-            default_inflight = max(1, workers * conc)
+                conc = 2 if workers <= 2 and cores >= 3 else 1
+            # allow request burst slightly above slots; queue absorbs the rest
+            default_inflight = max(1, workers * conc * 2)
         else:
-            default_inflight = max(1, _env_int("TURNSTILE_SOLVER_THREADS", 8))
+            thr = _env_int("TURNSTILE_SOLVER_THREADS", 0)
+            default_inflight = max(1, thr if thr > 0 else 2)
         inflight = max(1, _env_int("TURNSTILE_API_INFLIGHT", default_inflight))
         _turnstile_api_inflight = asyncio.Semaphore(inflight)
         debug_log(

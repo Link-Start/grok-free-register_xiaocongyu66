@@ -1043,10 +1043,11 @@ func main() {
 	host := flag.String("host", env("SOLVER_GATEWAY_HOST", "127.0.0.1"), "bind host")
 	port := flag.Int("port", envInt("SOLVER_GATEWAY_PORT", 5080), "bind port")
 	// workers: "auto" or integer; default auto uses multi-core + free RAM
-	workersRaw := flag.String("workers", env("SOLVER_GATEWAY_WORKERS", "8"), "browser workers (N|auto, default 8)")
+	// auto: size workers by CPU+free RAM; request bursts go into queue
+	workersRaw := flag.String("workers", env("SOLVER_GATEWAY_WORKERS", "auto"), "browser workers (auto|N)")
 	concurrency := flag.Int("concurrency", envInt("SOLVER_WORKER_CONCURRENCY", 0), "async pages per worker (0=auto)")
 	timeout := flag.Int("timeout", envInt("SOLVER_GATEWAY_TIMEOUT", 90), "solve timeout sec")
-	queueSize := flag.Int("queue", envInt("SOLVER_GATEWAY_QUEUE", 0), "job queue size (0=auto)")
+	queueSize := flag.Int("queue", envInt("SOLVER_GATEWAY_QUEUE", 0), "job queue size (0=auto by request load)")
 	soft := flag.Int("soft-mb", envInt("SOLVER_WATCHDOG_SOFT_MB", 700), "worker soft RSS MB")
 	hard := flag.Int("hard-mb", envInt("SOLVER_WATCHDOG_HARD_MB", 1100), "worker hard RSS MB")
 	maxSolves := flag.Int("max-solves", envInt("SOLVER_WORKER_MAX_SOLVES", 8), "recycle after N solves")

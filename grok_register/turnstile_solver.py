@@ -376,11 +376,11 @@ def build_command(
         hard = _env_int("SOLVER_WATCHDOG_HARD_MB", 1100)
         max_solves = _env_int("SOLVER_WORKER_MAX_SOLVES", 8)
         timeout = _env_int("SOLVER_GATEWAY_TIMEOUT", _env_int("TURNSTILE_API_TIMEOUT", 90))
-        # multi-core: SOLVER_GATEWAY_WORKERS=N|auto (default 8 for hybrid)
+        # multi-core: SOLVER_GATEWAY_WORKERS=auto|N (default auto = CPU+RAM)
         workers_raw = (os.environ.get("SOLVER_GATEWAY_WORKERS") or "").strip()
         if not workers_raw:
-            # fall back to TURNSTILE_SOLVER_THREADS, then 8
-            workers_raw = str(thread) if thread > 0 else "8"
+            # fixed threads only when explicitly set; else auto
+            workers_raw = str(thread) if thread > 0 else "auto"
         conc = _env_int("SOLVER_WORKER_CONCURRENCY", 0)
         queue = _env_int("SOLVER_GATEWAY_QUEUE", 0)
         cmd = [
@@ -678,7 +678,8 @@ def start_managed_solver(
     port = parsed.port or default_port_for_engine(engine)
     bind_host = (os.environ.get("TURNSTILE_SOLVER_HOST") or "127.0.0.1").strip()
     browser_type = (os.environ.get("TURNSTILE_SOLVER_BROWSER") or "chromium").strip().lower()
-    thread = max(1, _env_int("TURNSTILE_SOLVER_THREADS", 8))
+    # 0 → hybrid uses SOLVER_GATEWAY_WORKERS=auto; d3vin/theyka still need ≥1
+    thread = max(0, _env_int("TURNSTILE_SOLVER_THREADS", 0))
     headless = _env_bool("TURNSTILE_SOLVER_HEADLESS", True)
     debug = _env_bool("TURNSTILE_SOLVER_DEBUG", False)
     proxy = _env_bool("TURNSTILE_SOLVER_PROXY", False)
@@ -702,10 +703,10 @@ def start_managed_solver(
         cwd = _sync_work_tree(engine)
     # hybrid: prefer multi-core auto workers; only pin if SOLVER_GATEWAY_WORKERS is numeric
     if engine == "hybrid":
-        wenv = (os.environ.get("SOLVER_GATEWAY_WORKERS") or "8").strip().lower()
+        wenv = (os.environ.get("SOLVER_GATEWAY_WORKERS") or "auto").strip().lower()
         if wenv not in ("", "auto", "0") and wenv.isdigit():
             thread = max(1, int(wenv))
-        # else keep TURNSTILE_SOLVER_THREADS / default 8
+        # else gateway gets "auto"
     cmd = build_command(
         engine,
         host=bind_host,
