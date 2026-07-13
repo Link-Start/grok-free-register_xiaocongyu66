@@ -42,10 +42,25 @@ grep -q '^TURNSTILE_API_URL=' /app/.env 2>/dev/null || echo "TURNSTILE_API_URL=$
 grep -q '^KEY_EXPORT_DIR=' /app/.env 2>/dev/null || echo "KEY_EXPORT_DIR=${KEY_EXPORT_DIR}" >> /app/.env
 grep -q '^CONTROL_PLANE_ALLOW_ACTIONS=' /app/.env 2>/dev/null || echo "CONTROL_PLANE_ALLOW_ACTIONS=${CONTROL_PLANE_ALLOW_ACTIONS}" >> /app/.env
 
-# Optional Space URL hint
-if [ -n "${SPACE_ID:-}" ]; then
+# Public URL: SPACE_ID=owner/name → https://owner-name.hf.space
+# Prefer explicit SPACE_HOST / DASHBOARD_PUBLIC_URL when set by the platform.
+# Export SPACE_HOST so Python dashboard logs the same clickable URL.
+if [ -z "${SPACE_HOST:-}" ] && [ -n "${SPACE_ID:-}" ]; then
+  # Murasame52/open-webui → Murasame52-open-webui
   SPACE_HOST=$(echo "${SPACE_ID}" | tr '/' '-')
-  echo "✅ HF Space: https://${SPACE_HOST}.hf.space  (dashboard :${PORT})"
+  export SPACE_HOST
+fi
+if [ -n "${DASHBOARD_PUBLIC_URL:-}${PUBLIC_URL:-}${SPACE_URL:-}" ]; then
+  _pub="${DASHBOARD_PUBLIC_URL:-${PUBLIC_URL:-${SPACE_URL}}}"
+  case "$_pub" in
+    http://*|https://*) echo "✅ Public dashboard: ${_pub%/}/  (bind ${HOST}:${PORT})" ;;
+    *) echo "✅ Public dashboard: https://${_pub%/}/  (bind ${HOST}:${PORT})" ;;
+  esac
+elif [ -n "${SPACE_HOST:-}" ]; then
+  case "${SPACE_HOST}" in
+    *.hf.space) echo "✅ HF Space: https://${SPACE_HOST}/  (bind ${HOST}:${PORT})" ;;
+    *) echo "✅ HF Space: https://${SPACE_HOST}.hf.space/  (bind ${HOST}:${PORT})" ;;
+  esac
 else
   echo "✅ Dashboard will bind ${HOST}:${PORT}"
 fi

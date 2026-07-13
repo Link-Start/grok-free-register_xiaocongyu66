@@ -104,6 +104,42 @@ def auth_required() -> bool:
     return bool(DASHBOARD_PASSWORD or CONTROL_PLANE_TOKEN)
 
 
+def public_dashboard_url(bind_host: str | None = None, bind_port: int | None = None) -> str:
+    """Human-facing URL for logs / status.
+
+    HF Space sets SPACE_ID=owner/name → https://owner-name.hf.space
+    (optional SPACE_HOST / DASHBOARD_PUBLIC_URL override).
+    Local binds on 0.0.0.0 are shown as 127.0.0.1 for clickability.
+    """
+    for key in ("DASHBOARD_PUBLIC_URL", "PUBLIC_URL", "SPACE_URL"):
+        raw = (os.environ.get(key) or "").strip().rstrip("/")
+        if raw:
+            return raw if "://" in raw else f"https://{raw}"
+
+    space_host = (os.environ.get("SPACE_HOST") or "").strip()
+    if not space_host:
+        space_id = (os.environ.get("SPACE_ID") or "").strip()
+        if space_id:
+            # Murasame52/open-webui → Murasame52-open-webui.hf.space
+            space_host = space_id.replace("/", "-")
+    if space_host:
+        host = space_host
+        if host.startswith("https://"):
+            host = host[len("https://") :]
+        elif host.startswith("http://"):
+            host = host[len("http://") :]
+        host = host.strip("/").split("/")[0]
+        if not host.endswith(".hf.space"):
+            host = f"{host}.hf.space"
+        return f"https://{host}/"
+
+    host = (bind_host if bind_host is not None else DEFAULT_HOST) or "127.0.0.1"
+    port = int(bind_port if bind_port is not None else DEFAULT_PORT)
+    if host in {"0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+    return f"http://{host}:{port}/"
+
+
 def _test_moemail() -> dict:
     """Probe MoeMail config endpoint with current env (no file access needed)."""
     import urllib.error
@@ -348,6 +384,8 @@ def build_overview() -> dict:
     return {
         "ok": True,
         "time": time.time(),
+        "public_url": public_dashboard_url(),
+        "space_id": (os.environ.get("SPACE_ID") or "").strip() or None,
         "polyglot": polyglot,
         "register": {
             "running": alive,
@@ -2811,7 +2849,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print_stack_banner()
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
-    print(f"[*] dashboard http://{args.host}:{args.port}/")
+    public_url = public_dashboard_url(args.host, args.port)
+    print(f"[*] dashboard {public_url}")
+    if args.host in {"0.0.0.0", "::", "[::]"} or public_url.startswith("https://"):
+        print(f"[*] listen {args.host}:{args.port}")
     print(f"[*] status file: {status_path()}")
     print(f"[*] actions: {'ENABLED' if ALLOW_ACTIONS else 'disabled (CONTROL_PLANE_ALLOW_ACTIONS=0)'}")
     if auth_required():
@@ -2824,7 +2865,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             "[*] auth: OFF — set DASHBOARD_PASSWORD or CONTROL_PLANE_TOKEN "
-            "to protect the panel (recommended on 0.0.0.0 / HF Space)"
+            "to protect the panel (recommended on public / HF Space)"
         )
     try:
         server.serve_forever()
