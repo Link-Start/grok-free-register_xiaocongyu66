@@ -125,6 +125,17 @@ os.makedirs(KEY_EXPORT_DIR, exist_ok=True)
 _PROXY_POOL_FILE_ENV = os.environ.get("PROXY_POOL_FILE")
 PROXY_POOL_FILE = (_PROXY_POOL_FILE_ENV if _PROXY_POOL_FILE_ENV is not None else "代理.txt").strip()
 PROXY_POOL_STRATEGY = (os.environ.get("PROXY_POOL_STRATEGY") or "round_robin").strip().lower()
+
+
+def _env_proxy_pool_text() -> str:
+    """Live-read multi-proxy env (HF Secrets / panel). Mix formats freely."""
+    return (
+        os.environ.get("PROXY_POOL")
+        or os.environ.get("PROXY_POOL_LIST")
+        or os.environ.get("PROXIES")
+        or os.environ.get("PROXY_LIST")
+        or ""
+    ).strip()
 PROXY_RELAY_ENABLED = (
     os.environ.get("PROXY_RELAY_ENABLED", "1").strip().lower()
     in ("1", "true", "yes", "on")
@@ -2481,23 +2492,70 @@ def _proxy_pool_paths():
         paths.append(Path("proxy.txt"))
     return paths
 
+
+def _split_proxy_pool_text(text: str) -> list[str]:
+    """Split env/file proxy text into raw lines.
+
+    Supports mixed separators so HF Secrets can hold many formats:
+      - real newlines
+      - escaped \\n / \\r\\n (common when pasting into one-line secrets)
+      - commas, semicolons, pipes
+    """
+    if not text:
+        return []
+    raw = text.replace("\r\n", "\n").replace("\r", "\n")
+    # literal backslash-n from single-line env paste
+    raw = raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    # also split common list separators (keep share-link query strings intact:
+    # only split on separators that are outside typical URL usage at line level)
+    chunks: list[str] = []
+    for part in re.split(r"[\n,;|]+", raw):
+        line = (part or "").strip()
+        if line:
+            chunks.append(line)
+    return chunks
+
+
+def _load_env_proxy_list_items() -> tuple[list[str], bool]:
+    """Parse PROXY_POOL / PROXY_POOL_LIST / PROXIES env into normalized proxies."""
+    text = _env_proxy_pool_text()
+    if not text:
+        return [], False
+    items: list[str] = []
+    relay_pending = False
+    for raw in _split_proxy_pool_text(text):
+        is_share_link = bool(_share_link_scheme(raw))
+        proxy = _normalize_proxy_line(raw)
+        if proxy:
+            items.append(proxy)
+        elif is_share_link and PROXY_RELAY_ENABLED:
+            relay_pending = True
+    return items, relay_pending
+
+
+def _load_file_proxy_items(path: Path) -> tuple[list[str], bool]:
+    items: list[str] = []
+    relay_pending = False
+    try:
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            is_share_link = bool(_share_link_scheme(raw))
+            proxy = _normalize_proxy_line(raw)
+            if proxy:
+                items.append(proxy)
+            elif is_share_link and PROXY_RELAY_ENABLED:
+                relay_pending = True
+    except OSError:
+        return [], False
+    return items, relay_pending
+
+
 def _load_proxy_pool_locked():
     auto_mtime_ns = _auto_proxy_mtime_ns()
     tested_only = _use_tested_proxy_pool_only()
-    if not PROXY_POOL_FILE:
-        items = tuple(_unique_proxies(_load_auto_proxy_items()))
-        _proxy_pool_cache.update(
-            {
-                "path": None,
-                "mtime_ns": None,
-                "auto_mtime_ns": auto_mtime_ns,
-                "items": items,
-                "index": 0,
-                "relay_pending": False,
-                "retry_at": None,
-            }
-        )
-        return items
+    env_text = _env_proxy_pool_text()
+    env_items, env_relay = _load_env_proxy_list_items()
+    env_sig = hash(env_text) if env_text else 0
+
     path = None
     stat = None
     for candidate in _proxy_pool_paths():
@@ -2507,53 +2565,38 @@ def _load_proxy_pool_locked():
             continue
         path = candidate
         break
-    if path is None or stat is None:
-        first = _proxy_pool_paths()[0] if _proxy_pool_paths() else None
-        items = tuple(_unique_proxies(_load_auto_proxy_items()))
-        _proxy_pool_cache.update(
-            {
-                "path": str(first) if first else None,
-                "mtime_ns": None,
-                "auto_mtime_ns": auto_mtime_ns,
-                "items": items,
-                "index": 0,
-                "relay_pending": False,
-                "retry_at": None,
-            }
-        )
-        return items
+
     now = time.time()
+    cache_path = f"env:{env_sig}|file:{path}" if path else f"env:{env_sig}"
     if (
-        _proxy_pool_cache.get("path") == str(path)
-        and _proxy_pool_cache.get("mtime_ns") == stat.st_mtime_ns
+        _proxy_pool_cache.get("path") == cache_path
+        and _proxy_pool_cache.get("mtime_ns") == (stat.st_mtime_ns if stat else None)
         and _proxy_pool_cache.get("auto_mtime_ns") == auto_mtime_ns
+        and _proxy_pool_cache.get("env_sig") == env_sig
     ):
         retry_at = _proxy_pool_cache.get("retry_at")
         if not _proxy_pool_cache.get("relay_pending") or (retry_at and retry_at > now):
             return _proxy_pool_cache.get("items", ())
-    items = []
-    relay_pending = False
-    try:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            is_share_link = bool(_share_link_scheme(raw))
-            proxy = _normalize_proxy_line(raw)
-            if proxy:
-                items.append(proxy)
-            elif is_share_link and PROXY_RELAY_ENABLED:
-                relay_pending = True
-    except OSError:
-        items = []
-        relay_pending = False
+
+    file_items: list[str] = []
+    file_relay = False
+    if path is not None:
+        file_items, file_relay = _load_file_proxy_items(path)
+
     auto_items = _load_auto_proxy_items()
+    relay_pending = env_relay or file_relay
     if tested_only:
         items = _unique_proxies(auto_items)
     else:
-        items = _unique_proxies(items + auto_items)
+        # priority: env list → file → auto-tested
+        items = _unique_proxies(list(env_items) + list(file_items) + list(auto_items))
+
     _proxy_pool_cache.update(
         {
-            "path": str(path),
-            "mtime_ns": stat.st_mtime_ns,
+            "path": cache_path,
+            "mtime_ns": stat.st_mtime_ns if stat else None,
             "auto_mtime_ns": auto_mtime_ns,
+            "env_sig": env_sig,
             "items": tuple(items),
             "index": 0,
             "relay_pending": relay_pending,

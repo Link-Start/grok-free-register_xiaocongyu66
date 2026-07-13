@@ -612,16 +612,38 @@ def run_protocol_register(
 ) -> int:
     workers = workers or _env_int("GO_REGISTER_WORKERS", 8)
     target = target if target is not None else _env_int("TARGET", 0)
-    proxy = proxy or _env("REGISTER_PROXY") or _env("HTTPS_PROXY") or _env("HTTP_PROXY")
+    # fixed proxy (optional) — otherwise rotate from PROXY_POOL / 代理.txt
+    fixed_proxy = (
+        proxy
+        or _env("REGISTER_PROXY")
+        or _env("HTTPS_PROXY")
+        or _env("HTTP_PROXY")
+    )
     output_file = _env("GO_REGISTER_OUTPUT") or output_file
     stats = Stats()
     stop = threading.Event()
+
+    def _pick_proxy() -> str:
+        if fixed_proxy:
+            return fixed_proxy
+        try:
+            from grok_register.register import _pick_grok_proxy
+
+            return _pick_grok_proxy() or ""
+        except Exception:
+            return ""
 
     print(
         f"[*] 协议注册 curl_cffi+V2 workers={workers} target={target or '∞'} "
         f"email={_env('EMAIL_MODE', 'moemail')} (无 accounts.cpa.json)",
         flush=True,
     )
+    if fixed_proxy:
+        print(f"[*] proxy: fixed {fixed_proxy[:48]}…", flush=True)
+    elif _env("PROXY_POOL") or _env("PROXY_POOL_LIST") or _env("PROXIES") or _env("PROXY_LIST"):
+        print("[*] proxy: rotating from PROXY_POOL / PROXY_POOL_LIST env", flush=True)
+    else:
+        print("[*] proxy: pool file / auto (or direct)", flush=True)
     if not (_env("CAPSOLVER_API_KEY") or _env("CAPSOLVER_KEY") or _env("TWOCAPTCHA_API_KEY")):
         print(
             "[*] Turnstile: 无 CapSolver/2captcha key → 按需 hybrid browser solver "
@@ -639,7 +661,7 @@ def run_protocol_register(
                     site_key=site_key or TURNSTILE_SITEKEY,
                     action_id=action_id,
                     state_tree=state_tree,
-                    proxy=proxy,
+                    proxy=_pick_proxy(),
                     output_file=output_file,
                     wid=wid,
                 )
