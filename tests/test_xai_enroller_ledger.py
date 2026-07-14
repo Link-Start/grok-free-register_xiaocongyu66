@@ -36,6 +36,30 @@ def test_ledger_recovers_pending_jobs(tmp_path):
     assert ledger.get(job_id)["status"] == JobStatus.CANCELLED.value
 
 
+def test_ledger_closes_every_connection(monkeypatch, tmp_path):
+    real_connect = sqlite3.connect
+    connections = []
+
+    class TrackingConnection(sqlite3.Connection):
+        pass
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, factory=TrackingConnection, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    ledger = Ledger(tmp_path / "ledger.db", b"salt")
+    ledger.aggregate_counts()
+    ledger.inventory_counts()
+    ledger.imported_fingerprints()
+
+    assert connections
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+
+
 def test_ledger_backfills_imported_receipts_into_available_inventory(tmp_path):
     path = tmp_path / "ledger.db"
     with sqlite3.connect(path) as connection:

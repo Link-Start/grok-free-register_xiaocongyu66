@@ -6,6 +6,7 @@ from xai_enroller.models import SourceRecord
 from xai_enroller.remote_stream import (
     DiskSnapshotSource,
     LocalSnapshotSynchronizer,
+    RemoteSessionStream,
     SSHSnapshotSynchronizer,
 )
 
@@ -44,15 +45,19 @@ class FakeProcess:
         self.stderr = FakeStream([])
         self.returncode = None
         self._final_returncode = returncode
+        self.terminated = False
+        self.killed = False
 
     async def wait(self):
         self.returncode = self._final_returncode
         return self.returncode
 
     def terminate(self):
+        self.terminated = True
         self.returncode = -15
 
     def kill(self):
+        self.killed = True
         self.returncode = -9
 
 
@@ -112,6 +117,75 @@ def test_snapshot_sync_atomically_replaces_only_valid_complete_export(tmp_path):
         assert synchronizer.snapshot_fingerprints == frozenset(
             {"key:new-a", "key:new-b"}
         )
+
+    asyncio.run(scenario())
+
+
+def test_ssh_sources_never_inherit_interactive_stdin(tmp_path):
+    async def scenario():
+        captured = []
+
+        async def factory(*_args, **kwargs):
+            captured.append(kwargs)
+            return FakeProcess([_document("source") + b"\n"])
+
+        synchronizer = SSHSnapshotSynchronizer(
+            "host",
+            tmp_path / "source-snapshot.jsonl",
+            process_factory=factory,
+        )
+        assert await synchronizer.sync_once()
+
+        stream = RemoteSessionStream(
+            "host",
+            process_factory=factory,
+            sleep=lambda _delay: asyncio.sleep(0),
+        )
+        records = stream.records()
+        assert (await anext(records)).source_id == "source"
+        await stream.close()
+        await records.aclose()
+
+        assert len(captured) == 2
+        assert all(
+            options.get("stdin") is asyncio.subprocess.DEVNULL
+            for options in captured
+        )
+
+    asyncio.run(scenario())
+
+
+def test_snapshot_sync_times_out_when_export_makes_no_progress(tmp_path):
+    class StalledStream(FakeStream):
+        def __init__(self):
+            self._first = True
+
+        async def readline(self):
+            if self._first:
+                self._first = False
+                return _document("partial") + b"\n"
+            await asyncio.Event().wait()
+
+    async def scenario():
+        destination = tmp_path / "source-snapshot.jsonl"
+        destination.write_bytes(_document("stable") + b"\n")
+        process = FakeProcess([])
+        process.stdout = StalledStream()
+
+        async def factory(*_args, **_kwargs):
+            return process
+
+        synchronizer = SSHSnapshotSynchronizer(
+            "host",
+            destination,
+            process_factory=factory,
+            progress_timeout_seconds=0.01,
+        )
+
+        assert not await asyncio.wait_for(synchronizer.sync_once(), timeout=0.2)
+        assert process.terminated
+        assert destination.read_bytes() == _document("stable") + b"\n"
+        assert not list(tmp_path.glob(".source-snapshot.jsonl.*.tmp"))
 
     asyncio.run(scenario())
 

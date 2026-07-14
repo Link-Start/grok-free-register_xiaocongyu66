@@ -32,6 +32,7 @@ class SSHSnapshotSynchronizer:
         identity_file=None,
         process_factory=asyncio.create_subprocess_exec,
         fingerprint=None,
+        progress_timeout_seconds=120.0,
     ):
         self.host = host
         self.destination = Path(destination)
@@ -39,6 +40,9 @@ class SSHSnapshotSynchronizer:
         self.identity_file = identity_file
         self.process_factory = process_factory
         self.fingerprint = fingerprint or (lambda source_id: source_id)
+        self.progress_timeout_seconds = float(progress_timeout_seconds)
+        if self.progress_timeout_seconds <= 0:
+            raise ValueError("progress timeout must be positive")
         self.snapshot_fingerprints = None
         self._process = None
 
@@ -115,6 +119,7 @@ class SSHSnapshotSynchronizer:
             input_generation = self._input_generation()
             process = await self.process_factory(
                 *self._args(),
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=MAX_SESSION_RECORD_BYTES + 1,
@@ -127,7 +132,10 @@ class SSHSnapshotSynchronizer:
                 snapshot_fingerprints = set()
                 while True:
                     try:
-                        raw = await process.stdout.readline()
+                        raw = await asyncio.wait_for(
+                            process.stdout.readline(),
+                            timeout=self.progress_timeout_seconds,
+                        )
                     except (ValueError, asyncio.LimitOverrunError) as exc:
                         raise ValueError("invalid remote session snapshot") from exc
                     if not raw:
@@ -558,6 +566,7 @@ class RemoteSessionStream:
             try:
                 process = await self.process_factory(
                     *self._args(),
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     limit=self.MAX_RECORD_BYTES + 1,
