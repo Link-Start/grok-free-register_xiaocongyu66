@@ -1,7 +1,7 @@
 import base64
 import json
 
-from grok_register.proxy_relay import share_link_to_sing_box_outbound
+from grok_register.proxy.relay import share_link_to_sing_box_outbound
 
 
 def test_vless_share_link_converts_to_sing_box_outbound():

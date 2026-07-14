@@ -393,9 +393,9 @@ func (g *Gateway) startWorker(id int) (*workerProc, error) {
 	if g.proxyFile != "" {
 		cmd.Args = append(cmd.Args, "--proxy-file", g.proxyFile)
 	}
-	// Do not pass CLI --prefetch: if the worker ever writes unsolicited stdout
-	// before the IPC loop, the line protocol desyncs (solve reads leftover JSON).
-	// Prefer IPC-only prefetch under the same mutex as solve.
+	if g.prefetch {
+		cmd.Args = append(cmd.Args, "--prefetch")
+	}
 	cmd.Dir = g.workDir
 	// Own process group so gateway stop kills chromium grandchildren
 	if runtime.GOOS != "windows" {
@@ -443,7 +443,7 @@ func (g *Gateway) startWorker(id int) (*workerProc, error) {
 	fmt.Fprintf(os.Stderr, "[gateway] worker %d started pid=%d concurrency=%d\n",
 		id, cmd.Process.Pid, g.concurrency)
 
-	// async IPC-only prefetch: warm browser under the same mutex as solve
+	// async prefetch: warm browser + turnstile script in background
 	if g.prefetch {
 		go func(w *workerProc) {
 			w.mu.Lock()
@@ -453,19 +453,15 @@ func (g *Gateway) startWorker(id int) (*workerProc, error) {
 			}
 			req := workerReq{Cmd: "prefetch"}
 			if err := json.NewEncoder(w.stdin).Encode(req); err != nil {
-				fmt.Fprintf(os.Stderr, "[gateway] worker %d prefetch write: %v\n", w.id, err)
 				return
 			}
 			var resp workerResp
 			if err := w.stdout.Decode(&resp); err != nil {
-				fmt.Fprintf(os.Stderr, "[gateway] worker %d prefetch read: %v\n", w.id, err)
 				return
 			}
 			if resp.OK {
 				g.prefetchOK.Add(1)
 				fmt.Fprintf(os.Stderr, "[gateway] worker %d prefetch ok rss=%.1fMB\n", w.id, resp.RSSMB)
-			} else {
-				fmt.Fprintf(os.Stderr, "[gateway] worker %d prefetch fail: %s\n", w.id, resp.Error)
 			}
 		}(wp)
 	}

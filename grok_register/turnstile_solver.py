@@ -160,6 +160,7 @@ def vendor_dir(engine: str) -> Path:
 
 
 def hybrid_gateway_bin() -> Path:
+    """Old hybrid stack: Go solver-gateway (not C++ control plane)."""
     raw = (os.environ.get("SOLVER_GATEWAY_BIN") or "").strip()
     if raw:
         p = Path(raw).expanduser()
@@ -371,6 +372,7 @@ def build_command(
     python: Optional[str] = None,
 ) -> list[str]:
     if engine == "hybrid":
+        # Old hybrid: Go gateway CLI + Rust watchdog + C++ util + Python browser workers.
         bin_path = hybrid_gateway_bin()
         soft = _env_int("SOLVER_WATCHDOG_SOFT_MB", 700)
         hard = _env_int("SOLVER_WATCHDOG_HARD_MB", 1100)
@@ -447,13 +449,30 @@ def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
+def _solver_auth_headers() -> dict:
+    token = (
+        os.environ.get("TURNSTILE_API_TOKEN")
+        or os.environ.get("SOLVER_API_TOKEN")
+        or os.environ.get("TURNSTILE_SOLVER_TOKEN")
+        or ""
+    ).strip()
+    if not token:
+        return {}
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-API-Key": token,
+    }
+
+
 def health_check(api_url: str, timeout: float = 2.0) -> bool:
     """True if solver HTTP is accepting connections (index or any response)."""
+    headers = _solver_auth_headers() or None
     if requests is not None:
         try:
             resp = requests.get(
                 api_url.rstrip("/") + "/",
                 timeout=timeout,
+                headers=headers,
                 proxies={"http": None, "https": None},
             )
             return resp.status_code < 500
@@ -462,6 +481,7 @@ def health_check(api_url: str, timeout: float = 2.0) -> bool:
                 resp = requests.get(
                     api_url.rstrip("/") + "/result?id=healthcheck-missing",
                     timeout=timeout,
+                    headers=headers,
                     proxies={"http": None, "https": None},
                 )
                 return resp.status_code in (200, 400, 404, 422)
@@ -472,6 +492,8 @@ def health_check(api_url: str, timeout: float = 2.0) -> bool:
         from urllib.request import urlopen, Request
 
         req = Request(api_url.rstrip("/") + "/", method="GET")
+        for k, v in (_solver_auth_headers() or {}).items():
+            req.add_header(k, v)
         with urlopen(req, timeout=timeout) as resp:
             return 100 <= getattr(resp, "status", 200) < 500
     except Exception:
@@ -723,6 +745,7 @@ def start_managed_solver(
     pid_file = cwd / "solver.pid"
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONMALLOC"] = "malloc"
     env["PROJECT_ROOT"] = str(PROJECT_ROOT)
     env["SOLVER_WORKER_SCRIPT"] = str(hybrid_worker_script())
     # Browser worker MUST use project venv (patchright), not system python3
@@ -752,6 +775,8 @@ def start_managed_solver(
         env.setdefault("SOLVER_BROWSER_AUTO_PROXY", "0")
         env.setdefault("SOLVER_SOLVE_MODE", "inject")
         env.setdefault("SOLVER_PLAYWRIGHT_MOD", "playwright,patchright")
+        # Prevent worker from re-entering hybrid API path
+        env["TURNSTILE_SOLVER"] = "local"
     # Isolate from project proxies for local control plane unless user wants them
     if not proxy:
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
@@ -761,7 +786,7 @@ def start_managed_solver(
     if engine == "hybrid":
         log(
             f"[*] hybrid stack: Go gateway + Rust watchdog + C++ util + Python browser "
-            f"(workers={thread}, auto memory release)"
+            f"(workers={thread or 'auto'}, auto memory release)"
         )
     log_file = open(log_path, "ab", buffering=0)
     popen_kwargs = {

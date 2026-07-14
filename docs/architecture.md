@@ -1,8 +1,32 @@
-# CSP 架构说明
+# 架构说明
 
-本文档记录当前运行时架构。README 面向使用者；本文面向维护者，重点是并发边界、资源生命周期和测试不变量。
+本文档记录当前运行时架构。README 面向使用者；本文面向维护者。
 
-## 多语言硬性栈 (Python + Go + Rust)
+## 产品流水线（SSO-first）
+
+```text
+注册 (start.sh / protocol_register)
+  → keys/accounts.txt + grok.txt + auth-sessions   （仅 SSO）
+认证 (auth-service.sh / sso.export convert)
+  → Go inventory-worker 多并发 sso_build
+  → keys/cpa/xai-*.json  (access + refresh_token)
+CLIProxy (cliproxyapi)
+  → refresh_token 续 access
+```
+
+Python 包边界：
+
+| 子包 | 职责 |
+|------|------|
+| `grok_register.sso` | SSO 落盘、协议 convert、auth-service |
+| `grok_register.inventory` | 扫描 keys、CPA/sub2api 文件互转 |
+| `grok_register.proxy` | 代理池 / relay / 抓取 / 测活任务 |
+| `grok_register.core` | CSP 库存、背压、envelope |
+| 根模块 `register` / `dashboard` / `protocol_register` | 编排入口 |
+
+遗留：`xai_enroller/`（Playwright Device Flow 测试与部分 sinks；**非** auth 默认入口）。
+
+## 多语言硬性栈 (Python + Go)
 
 启动路径 `start.sh` / `auth-service.sh` / `setup.sh` 经 `scripts/ensure_runtime.sh` 调用 `scripts/polyglot_gate.sh`：
 
@@ -10,8 +34,10 @@
 |------|------|------|----------|
 | 编排 / 浏览器 / 面板 | Python | `.venv/bin/python` | 缺则安装失败 |
 | 代理测活 | Go | `native/proxy-worker/proxy-worker` | 缺则拒绝启动 |
-| HTTP 注册 worker | Go | `native/register-worker/register-worker` | 缺则拒绝启动 |
-| 账号库存 / 成品包 | Rust | `native/inventory-worker/inventory-worker` | 缺则拒绝启动 |
+| HTTP / 协议注册 worker | Go | `native/register-worker/register-worker` | 缺则拒绝启动 |
+| 账号库存 / 协议转换 / 成品包 | Go | `native/inventory-worker/inventory-worker` | 缺则拒绝启动 |
+| Hybrid Turnstile 看门狗 | Rust | `native/solver-watchdog/solver-watchdog` | hybrid 缺则拒绝 |
+| Hybrid 内存压力 | C++ | `native/solver-util/solver-util` | hybrid 缺则拒绝 |
 
 Python 侧 `grok_register.polyglot.require_polyglot_stack()` 在 `register` 与 `dashboard` 入口再次校验。仅测试可设 `POLYGLOT_REQUIRED=0`。
 

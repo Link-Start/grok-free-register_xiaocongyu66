@@ -35,8 +35,8 @@ from grok_register.core.admission import AdmissionGate
 from grok_register.core.envelope import ResourceEnvelope
 from grok_register.core.inventory import Inventory
 from grok_register.core.observer import Metrics
-from grok_register.proxy_auto import ProxyAutoConfig, ProxyAutoManager, load_active_proxies
-from grok_register.proxy_relay import BuiltinProxyRelay, BuiltinProxyRelayConfig
+from grok_register.proxy.auto import ProxyAutoConfig, ProxyAutoManager, load_active_proxies
+from grok_register.proxy.relay import BuiltinProxyRelay, BuiltinProxyRelayConfig
 from xai_enroller.fingerprints import (
     BROWSER_FINGERPRINT_FILENAME,
     browser_context_options,
@@ -109,18 +109,12 @@ MOEMAIL_API_KEY = (
 MOEMAIL_DOMAIN  = (os.environ.get("MOEMAIL_DOMAIN") or "").strip()
 MOEMAIL_EXPIRY_MS = _env_int("MOEMAIL_EXPIRY_MS", 3600000)
 KEY_EXPORT_DIR = str(Path((os.environ.get("KEY_EXPORT_DIR") or "keys").strip() or "keys").expanduser())
-KEY_EXPORT_FORMATS = _normalize_key_export_formats(
-    _env_list("KEY_EXPORT_FORMATS", "legacy,sub2api")
-) or ("legacy",)
-KEY_EXPORT_ENROLLER = _env_bool("KEY_EXPORT_ENROLLER", True)
-KEY_EXPORT_ENROLLER_TIMEOUT = max(30, _env_int("KEY_EXPORT_ENROLLER_TIMEOUT", 1800))
-KEY_EXPORT_ENROLLER_POLL_SEC = max(1, _env_int("KEY_EXPORT_ENROLLER_POLL_SEC", 5))
-KEY_EXPORT_ENROLLER_RETRY_ATTEMPTS = min(
-    3, max(0, _env_int("KEY_EXPORT_ENROLLER_RETRY_ATTEMPTS", 0))
-)
-KEY_EXPORT_ENROLLER_DRAIN_TIMEOUT = max(
-    0, _env_int("KEY_EXPORT_ENROLLER_DRAIN_TIMEOUT", 10)
-)
+# Final product pipeline is SSO-first only:
+#   register → accounts.txt / grok.txt / auth-sessions.jsonl
+#   convert  → Go inventory-worker protocol (grok2api device_code+verify+approve) → keys/cpa/xai-*.json
+# Live browser OAuth enroller during register is permanently disabled.
+KEY_EXPORT_FORMATS = ("legacy",)  # register always writes SSO pack only
+KEY_EXPORT_ENROLLER = False  # hard off — use sso_export.convert / dashboard SSO→CPA
 os.makedirs(KEY_EXPORT_DIR, exist_ok=True)
 _PROXY_POOL_FILE_ENV = os.environ.get("PROXY_POOL_FILE")
 PROXY_POOL_FILE = (_PROXY_POOL_FILE_ENV if _PROXY_POOL_FILE_ENV is not None else "代理.txt").strip()
@@ -3904,10 +3898,6 @@ def _append_registration_line(path, line, mode=None, *, durable=False):
         os.chmod(path, mode)
 
 
-_key_export_file_lock = threading.Lock()
-_key_export_tasks = set()
-
-
 def _key_export_path(*parts):
     return Path(KEY_EXPORT_DIR).joinpath(*parts)
 
@@ -3924,319 +3914,64 @@ def _remember_account_browser_fingerprint(email, browser_fingerprint_id=None):
     )
 
 
-def _key_export_oauth_formats():
-    if not KEY_EXPORT_ENROLLER:
-        return ()
-    return tuple(fmt for fmt in KEY_EXPORT_FORMATS if fmt in {"cpa", "sub2api"})
-
-
-def _atomic_write_private_json(path, document):
-    path = Path(path)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    payload = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
-        os.chmod(path, 0o600)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
-
-
-def _load_or_create_key_export_salt():
-    configured = os.environ.get("XAI_ENROLLER_SOURCE_SALT")
-    if configured:
-        return configured.encode()
-    path = _key_export_path(".xai-enroller-salt")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-        if value:
-            return value.encode()
-    except OSError:
-        pass
-    value = secrets.token_urlsafe(32)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=".xai-enroller-salt.", suffix=".tmp", dir=path.parent, text=True
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(value + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
-        os.chmod(path, 0o600)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
-    return value.encode()
-
-
-def _sub2api_account_from_credential(email, credential):
-    from xai_enroller.protocol import XAIProfile
-
-    profile = XAIProfile.default()
-    credentials = {
-        "access_token": credential.access_token,
-        "refresh_token": credential.refresh_token,
-        "expires_at": credential.expires_at,
-        "client_id": profile.client_id,
-        "scope": profile.scope,
-        "email": email,
-        "base_url": "https://api.x.ai/v1",
-    }
-    if credential.id_token:
-        credentials["id_token"] = credential.id_token
-    if credential.token_type:
-        credentials["token_type"] = credential.token_type
-    return {
-        "name": email or credential.subject or "grok-account",
-        "platform": "grok",
-        "type": "oauth",
-        "concurrency": 10,
-        "priority": 1,
-        "credentials": credentials,
-        "extra": {
-            "email": email,
-            "subject": credential.subject,
-            "last_refresh": credential.last_refresh,
-        },
-    }
-
-
-def _sub2api_document(accounts):
-    return {
-        "exported_at": datetime.now(timezone.utc).isoformat(),
-        "proxies": [],
-        "accounts": list(accounts),
-    }
-
-
-def _store_sub2api_credential_sync(email, credential, name_secret):
-    from xai_enroller.sinks import credential_filename
-
-    directory = _key_export_path("sub2api")
-    filename = credential_filename(credential, name_secret).removesuffix(".json")
-    account = _sub2api_account_from_credential(email, credential)
-    with _key_export_file_lock:
-        account_path = directory / f"{filename}.sub2api.json"
-        _atomic_write_private_json(account_path, _sub2api_document([account]))
-
-        accounts = []
-        seen = set()
-        for path in sorted(directory.glob("*.sub2api.json")):
-            if path.name == "accounts.sub2api.json":
-                continue
-            try:
-                document = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            for item in document.get("accounts", []):
-                if not isinstance(item, dict):
-                    continue
-                credentials = item.get("credentials") or {}
-                key = (
-                    item.get("platform"),
-                    credentials.get("refresh_token"),
-                    credentials.get("access_token"),
-                    item.get("name"),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                accounts.append(item)
-        _atomic_write_private_json(
-            directory / "accounts.sub2api.json",
-            _sub2api_document(accounts),
-        )
-    return filename
-
-
-class _LocalKeyExportSink:
-    def __init__(self, email, formats, name_secret):
-        self.email = email
-        self.formats = set(formats)
-        self.name_secret = name_secret
-
-    async def store(self, credential):
-        from xai_enroller.models import SinkReceipt
-        from xai_enroller.sinks import LocalAuthFileSink
-
-        fingerprints = []
-        if "cpa" in self.formats:
-            receipt = await LocalAuthFileSink(
-                _key_export_path("cpa"),
-                name_secret=self.name_secret,
-                email=self.email,
-            ).store(credential)
-            fingerprints.append(receipt.fingerprint)
-        if "sub2api" in self.formats:
-            fingerprint = await asyncio.to_thread(
-                _store_sub2api_credential_sync,
-                self.email,
-                credential,
-                self.name_secret,
-            )
-            fingerprints.append(fingerprint)
-        return SinkReceipt(",".join(fingerprints) or "no-output")
-
-
-class _SingleRegistrationSource:
-    def __init__(self, record):
-        self.record = record
-
-    def records(self):
-        yield self.record
-
-
-async def _run_key_export_enrollment(email, sso, session_cookies, browser_fingerprint_id=None):
-    formats = _key_export_oauth_formats()
-    if not formats:
-        return None
-
-    import httpx
-    from xai_enroller.coordinator import EnrollmentCoordinator
-    from xai_enroller.executors import PlaywrightExecutor
-    from xai_enroller.models import SourceRecord
-    from xai_enroller.protocol import XAIProfile, XAIProtocol
-
-    name_secret = _load_or_create_key_export_salt()
-    browser_fingerprint_id = _remember_account_browser_fingerprint(
-        email,
-        browser_fingerprint_id,
-    )
-    record = SourceRecord(
-        email,
-        sso,
-        tuple(session_cookies or ()),
-        browser_fingerprint_id,
-    )
-    proxy = _pick_grok_proxy()
-    client_kwargs = {}
-    if proxy and urlparse(proxy).scheme.lower() in {"http", "https"}:
-        client_kwargs["proxy"] = proxy
-    client = httpx.AsyncClient(**client_kwargs)
-    try:
-        coordinator = EnrollmentCoordinator(
-            source=_SingleRegistrationSource(record),
-            protocol=XAIProtocol(
-                client,
-                XAIProfile.default(),
-                default_poll_interval=KEY_EXPORT_ENROLLER_POLL_SEC,
-            ),
-            executor=PlaywrightExecutor(
-                concurrency=1,
-                executable_path=find_chrome(),
-                proxy=_playwright_proxy(proxy),
-            ),
-            sink=_LocalKeyExportSink(email, formats, name_secret),
-            ledger_path=_key_export_path("xai-enroller-ledger.db"),
-            ledger_salt=name_secret,
-            concurrency=1,
-            timeout=KEY_EXPORT_ENROLLER_TIMEOUT,
-            retry_attempts=KEY_EXPORT_ENROLLER_RETRY_ATTEMPTS,
-        )
-        results = await coordinator.run(target=1)
-        result = results[0] if results else None
-        if result is not None and result.status.value == "imported":
-            debug_log(f"[keys] exported OAuth credential formats={','.join(formats)}")
-        elif result is not None:
-            debug_log(f"[keys] OAuth export skipped status={result.status.value} reason={result.reason_code}")
-        return result
-    finally:
-        await client.aclose()
-
-
-def _schedule_key_export_enrollment(email, sso, session_cookies, browser_fingerprint_id=None):
-    if not _key_export_oauth_formats():
-        return None
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-    task = loop.create_task(
-        _run_key_export_enrollment(
-            email,
-            sso,
-            session_cookies,
-            browser_fingerprint_id,
-        )
-    )
-    _key_export_tasks.add(task)
-
-    def done(completed):
-        _key_export_tasks.discard(completed)
-        try:
-            completed.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            debug_log(f"[keys] OAuth export failed: {sanitize_terminal_error(exc)}")
-
-    task.add_done_callback(done)
-    return task
-
-
 async def _drain_key_export_tasks(timeout=None):
-    tasks = [task for task in list(_key_export_tasks) if not task.done()]
-    if not tasks:
-        return
-    timeout = KEY_EXPORT_ENROLLER_DRAIN_TIMEOUT if timeout is None else timeout
-    if timeout <= 0:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        return
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-    except asyncio.TimeoutError:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    """No-op: live OAuth enroller removed (SSO→CPA is batch protocol convert)."""
+    return
 
 
 def _persist_registration(email, password, sso, session_cookies, browser_fingerprint_id=None):
+    """Register success → SSO pack only (accounts.txt / grok.txt / auth-sessions).
+
+    Final CPA is produced later by Go inventory-worker protocol enroll
+    (grok2api device_code+verify+approve), via:
+      python -m grok_register.sso_export convert
+      dashboard 「SSO→CPA」
+    """
     browser_fingerprint_id = _remember_account_browser_fingerprint(
         email,
         browser_fingerprint_id,
     )
-    if session_cookies:
-        document = json.dumps(
-            {
-                "email": email,
-                "cookies": session_cookies,
-                "browser_fingerprint_id": browser_fingerprint_id,
-            },
-            separators=(",", ":"),
+    try:
+        from grok_register.sso.export import append_sso_artifacts
+
+        append_sso_artifacts(
+            email,
+            password,
+            sso,
+            cookies=session_cookies,
+            browser_fingerprint_id=browser_fingerprint_id,
+            root=Path(KEY_EXPORT_DIR),
         )
-        _append_registration_line(
-            str(_key_export_path("auth-sessions.jsonl")),
-            document + "\n",
-            mode=0o600,
-            durable=True,
-        )
-    if "legacy" in KEY_EXPORT_FORMATS:
+    except Exception:
+        # Fallback: still write legacy SSO lines if helper import fails
+        if session_cookies:
+            document = json.dumps(
+                {
+                    "email": email,
+                    "cookies": session_cookies,
+                    "browser_fingerprint_id": browser_fingerprint_id,
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "register_fallback",
+                },
+                separators=(",", ":"),
+            )
+            _append_registration_line(
+                str(_key_export_path("auth-sessions.jsonl")),
+                document + "\n",
+                mode=0o600,
+                durable=True,
+            )
         _append_registration_line(
             str(_key_export_path("accounts.txt")),
             f"{email}:{password}:{sso}\n",
         )
         _append_registration_line(str(_key_export_path("grok.txt")), sso + "\n")
+    try:
+        from grok_register.memory_hygiene import note_op_and_maybe_trim
+
+        note_op_and_maybe_trim()
+    except Exception:
+        pass
     return browser_fingerprint_id
 
 
@@ -4346,12 +4081,6 @@ async def _consume_pair(
                 browser_fingerprint_id = _persist_registration(
                     email,
                     password,
-                    sso,
-                    session_cookies,
-                    browser_fingerprint_id,
-                )
-                _schedule_key_export_enrollment(
-                    email,
                     sso,
                     session_cookies,
                     browser_fingerprint_id,

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Grok Free Register — 一键安装 (硬性要求: Python + Go + Rust)
+# Grok Free Register — 一键安装 (硬性要求: Python + Go inventory [+ hybrid Rust/C++])
 # 用法: bash setup.sh
 
 set -e
@@ -25,7 +25,7 @@ if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; the
 fi
 if [ "$missing_tc" -ne 0 ]; then
     echo "" >&2
-    echo "本项目强制启用 Python + Go + Rust，缺少工具链时拒绝安装。" >&2
+    echo "本项目强制启用 Python + Go inventory（hybrid 另需 rustc/g++），缺少工具链时拒绝安装。" >&2
     exit 1
 fi
 echo "[0/6] 工具链 OK · python3=$(python3 -c 'import sys;print(sys.version.split()[0])') · go=$(go version | awk "{print \$3}") · rustc=$(rustc --version | awk "{print \$2}")"
@@ -74,7 +74,7 @@ echo "[4/6] 准备内置 Turnstile Solver 浏览器(patchright)..."
   || echo "    [!] patchright chromium 安装失败,可稍后执行: .venv/bin/python -m grok_register.turnstile_solver install"
 
 # Go + Rust native (mandatory)
-echo "[5/6] 编译原生组件 (Go proxy/register + Rust inventory)..."
+echo "[5/6] 编译原生组件 (Go proxy/register/inventory + hybrid)..."
 bash scripts/build-native.sh
 
 # 创建输出目录

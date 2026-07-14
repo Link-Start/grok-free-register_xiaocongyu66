@@ -27,7 +27,7 @@ ensure_runtime() {
     trap 'rmdir .setup.lock 2>/dev/null || true' EXIT INT TERM
 
     if [ ! -d .venv ]; then
-        echo "[*] 首次运行，安装依赖 (Python + Go + Rust)..."
+        echo "[*] 首次运行，安装依赖 (Python + Go [+ hybrid])..."
         if ! bash setup.sh; then
             rmdir "$lock_dir" 2>/dev/null || true
             trap - EXIT INT TERM

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Hard requirement: Python + Go + Rust native stack must all be present.
+# Hard requirement: Python + Go native stack (inventory + hybrid gateway)
+# + Rust watchdog + C++ util for old hybrid Turnstile.
 # Sourced by ensure_runtime / start / setup. Exit non-zero blocks startup.
 
 polyglot_root() {
@@ -17,14 +18,18 @@ polyglot_paths() {
     POLYGLOT_PY="${POLYGLOT_PY:-$root/.venv/bin/python}"
     POLYGLOT_GO_PROXY="${POLYGLOT_GO_PROXY:-$root/native/proxy-worker/proxy-worker}"
     POLYGLOT_GO_REGISTER="${POLYGLOT_GO_REGISTER:-$root/native/register-worker/register-worker}"
+    # Old hybrid: Go gateway is primary
     POLYGLOT_GO_SOLVER="${POLYGLOT_GO_SOLVER:-$root/native/solver-gateway/solver-gateway}"
-    POLYGLOT_RUST_INVENTORY="${POLYGLOT_RUST_INVENTORY:-$root/native/inventory-worker/target/release/inventory-worker}"
+    POLYGLOT_GO_INVENTORY="${POLYGLOT_GO_INVENTORY:-$root/native/inventory-worker/inventory-worker}"
+    # back-compat alias
+    POLYGLOT_RUST_INVENTORY="${POLYGLOT_RUST_INVENTORY:-$POLYGLOT_GO_INVENTORY}"
     POLYGLOT_RUST_WATCHDOG="${POLYGLOT_RUST_WATCHDOG:-$root/native/solver-watchdog/solver-watchdog}"
     POLYGLOT_CPP_UTIL="${POLYGLOT_CPP_UTIL:-$root/native/solver-util/solver-util}"
     POLYGLOT_PY_SOLVER_WORKER="${POLYGLOT_PY_SOLVER_WORKER:-$root/native/solver-hybrid/browser_worker.py}"
-    # also accept copied binary next to crate
-    if [ ! -x "$POLYGLOT_RUST_INVENTORY" ] && [ -x "$root/native/inventory-worker/inventory-worker" ]; then
-        POLYGLOT_RUST_INVENTORY="$root/native/inventory-worker/inventory-worker"
+    if [ ! -x "$POLYGLOT_GO_INVENTORY" ] && [ -x "$root/native/inventory-worker/target/release/inventory-worker" ]; then
+        # legacy rust binary still accepted if present
+        POLYGLOT_GO_INVENTORY="$root/native/inventory-worker/target/release/inventory-worker"
+        POLYGLOT_RUST_INVENTORY="$POLYGLOT_GO_INVENTORY"
     fi
     if [ ! -x "$POLYGLOT_RUST_WATCHDOG" ] && [ -x "$root/native/solver-watchdog/target/release/solver-watchdog" ]; then
         POLYGLOT_RUST_WATCHDOG="$root/native/solver-watchdog/target/release/solver-watchdog"
@@ -43,10 +48,10 @@ polyglot_missing() {
     if [ ! -x "$POLYGLOT_GO_REGISTER" ]; then
         miss+=("go:native/register-worker/register-worker")
     fi
-    if [ ! -x "$POLYGLOT_RUST_INVENTORY" ]; then
-        miss+=("rust:native/inventory-worker/inventory-worker")
+    if [ ! -x "$POLYGLOT_GO_INVENTORY" ]; then
+        miss+=("go:native/inventory-worker/inventory-worker")
     fi
-    # Hybrid Turnstile stack (soft-required when POLYGLOT_REQUIRE_HYBRID=1, else warn-only via check)
+    # Hybrid Turnstile: Go gateway + Rust watchdog + C++ util + Python browser
     if [ "${POLYGLOT_REQUIRE_HYBRID:-1}" = "1" ]; then
         if [ ! -x "$POLYGLOT_GO_SOLVER" ]; then
             miss+=("go:native/solver-gateway/solver-gateway")
@@ -76,24 +81,24 @@ require_polyglot_stack() {
 
     if miss="$(polyglot_missing)"; then
         if [ "${POLYGLOT_QUIET:-0}" != "1" ]; then
-            echo "[✓] 多语言栈就绪 · Python + Go + Rust + C++"
+            echo "[✓] 多语言栈就绪 · Python + Go hybrid + Rust + C++"
             echo "    Python  $($POLYGLOT_PY -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo ok)"
-            echo "    Go      proxy-worker + register-worker + solver-gateway"
-            echo "    Rust    inventory-worker + solver-watchdog"
-            echo "    C++     solver-util (memory pressure)"
-            echo "    Hybrid  browser_worker.py (Turnstile + auto free)"
+            echo "    Go      proxy + register + inventory + solver-gateway"
+            echo "    Rust    solver-watchdog"
+            echo "    C++     solver-util"
+            echo "    Hybrid  browser_worker.py (Python Chromium)"
         fi
         return 0
     fi
 
-    echo "[✗] 硬性条件未满足：本项目必须同时启用 Python + Go + Rust + C++ hybrid。" >&2
+    echo "[✗] 硬性条件未满足：本项目必须启用 Python + Go inventory + 旧版 hybrid。" >&2
     echo "    缺少组件：" >&2
     while IFS= read -r line; do
         [ -n "$line" ] && echo "      - $line" >&2
     done <<< "$miss"
     echo "" >&2
     echo "    修复：" >&2
-    echo "      1) 安装工具链: python3 + go + rustc/cargo + g++" >&2
+    echo "      1) 安装: python3 + go + cargo/rustc + g++" >&2
     echo "      2) bash setup.sh          # 或 bash scripts/build-native.sh" >&2
     echo "      3) 确认二进制可执行后重试 bash start.sh" >&2
     echo "" >&2
@@ -101,8 +106,8 @@ require_polyglot_stack() {
     echo "      .venv/bin/python" >&2
     echo "      native/proxy-worker/proxy-worker" >&2
     echo "      native/register-worker/register-worker" >&2
+    echo "      native/inventory-worker/inventory-worker" >&2
     echo "      native/solver-gateway/solver-gateway" >&2
-    echo "      native/inventory-worker/target/release/inventory-worker" >&2
     echo "      native/solver-watchdog/solver-watchdog" >&2
     echo "      native/solver-util/solver-util" >&2
     echo "      native/solver-hybrid/browser_worker.py" >&2
@@ -112,19 +117,22 @@ require_polyglot_stack() {
 # For Python import-time gate
 polyglot_status_json() {
     polyglot_paths
-    local py_ok=false go_proxy_ok=false go_reg_ok=false rust_ok=false
+    local py_ok=false go_proxy_ok=false go_reg_ok=false inv_ok=false
     local go_solver_ok=false rust_wd_ok=false cpp_ok=false py_worker_ok=false
     [ -x "$POLYGLOT_PY" ] && py_ok=true
     [ -x "$POLYGLOT_GO_PROXY" ] && go_proxy_ok=true
     [ -x "$POLYGLOT_GO_REGISTER" ] && go_reg_ok=true
-    [ -x "$POLYGLOT_RUST_INVENTORY" ] && rust_ok=true
+    [ -x "$POLYGLOT_GO_INVENTORY" ] && inv_ok=true
     [ -x "$POLYGLOT_GO_SOLVER" ] && go_solver_ok=true
     [ -x "$POLYGLOT_RUST_WATCHDOG" ] && rust_wd_ok=true
     [ -x "$POLYGLOT_CPP_UTIL" ] && cpp_ok=true
     [ -f "$POLYGLOT_PY_SOLVER_WORKER" ] && py_worker_ok=true
     local core_ok=false hybrid_ok=false
-    [ "$py_ok" = true ] && [ "$go_proxy_ok" = true ] && [ "$go_reg_ok" = true ] && [ "$rust_ok" = true ] && core_ok=true
-    [ "$go_solver_ok" = true ] && [ "$rust_wd_ok" = true ] && [ "$cpp_ok" = true ] && [ "$py_worker_ok" = true ] && hybrid_ok=true
+    [ "$py_ok" = true ] && [ "$go_proxy_ok" = true ] && [ "$go_reg_ok" = true ] && [ "$inv_ok" = true ] && core_ok=true
+    # hybrid: Go gateway + Rust watchdog + C++ util + Python browser worker
+    if [ "$go_solver_ok" = true ] && [ "$rust_wd_ok" = true ] && [ "$cpp_ok" = true ] && [ "$py_worker_ok" = true ]; then
+        hybrid_ok=true
+    fi
     local ok=false
     if [ "$core_ok" = true ]; then
         if [ "${POLYGLOT_REQUIRE_HYBRID:-1}" = "1" ]; then
@@ -133,8 +141,8 @@ polyglot_status_json() {
             ok=true
         fi
     fi
-    printf '{"python":%s,"go_proxy_worker":%s,"go_register_worker":%s,"rust_inventory_worker":%s,"go_solver_gateway":%s,"rust_solver_watchdog":%s,"cpp_solver_util":%s,"py_browser_worker":%s,"hybrid_ok":%s,"ok":%s}\n' \
-        "$py_ok" "$go_proxy_ok" "$go_reg_ok" "$rust_ok" \
+    printf '{"python":%s,"go_proxy_worker":%s,"go_register_worker":%s,"go_inventory_worker":%s,"rust_inventory_worker":%s,"go_solver_gateway":%s,"rust_solver_watchdog":%s,"cpp_solver_util":%s,"py_browser_worker":%s,"hybrid_ok":%s,"ok":%s}\n' \
+        "$py_ok" "$go_proxy_ok" "$go_reg_ok" "$inv_ok" "$inv_ok" \
         "$go_solver_ok" "$rust_wd_ok" "$cpp_ok" "$py_worker_ok" "$hybrid_ok" "$ok"
 }
 
@@ -151,7 +159,10 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             echo "PY=$POLYGLOT_PY"
             echo "GO_PROXY=$POLYGLOT_GO_PROXY"
             echo "GO_REGISTER=$POLYGLOT_GO_REGISTER"
-            echo "RUST_INVENTORY=$POLYGLOT_RUST_INVENTORY"
+            echo "GO_INVENTORY=$POLYGLOT_GO_INVENTORY"
+            echo "GO_SOLVER=$POLYGLOT_GO_SOLVER"
+            echo "RUST_WATCHDOG=$POLYGLOT_RUST_WATCHDOG"
+            echo "CPP_UTIL=$POLYGLOT_CPP_UTIL"
             ;;
         *)
             echo "usage: polyglot_gate.sh [check|json|paths]" >&2

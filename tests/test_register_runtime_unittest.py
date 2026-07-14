@@ -38,19 +38,12 @@ class Response:
         return self._data
 
 
-def test_registration_persists_exact_session_before_legacy_outputs(monkeypatch):
-    writes = []
+def test_registration_persists_sso_pack_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(register, "KEY_EXPORT_DIR", str(tmp_path))
     monkeypatch.setattr(
         register,
         "_remember_account_browser_fingerprint",
         lambda email, browser_fingerprint_id=None: browser_fingerprint_id or "bf-test-1",
-    )
-    monkeypatch.setattr(
-        register,
-        "_append_registration_line",
-        lambda path, line, mode=None, durable=False: writes.append(
-            (path, line, mode, durable)
-        ),
     )
 
     register._persist_registration(
@@ -61,32 +54,28 @@ def test_registration_persists_exact_session_before_legacy_outputs(monkeypatch):
         "bf-test-1",
     )
 
-    assert [item[0] for item in writes] == [
-        "keys/auth-sessions.jsonl",
-        "keys/accounts.txt",
-        "keys/grok.txt",
-    ]
-    assert writes[0][2] == 0o600
-    assert [item[3] for item in writes] == [True, False, False]
-    session = json.loads(writes[0][1])
+    accounts = (tmp_path / "accounts.txt").read_text(encoding="utf-8")
+    grok = (tmp_path / "grok.txt").read_text(encoding="utf-8")
+    sessions = (tmp_path / "auth-sessions.jsonl").read_text(encoding="utf-8").strip()
+    assert "user@example.test:password:sso-token" in accounts
+    assert "sso-token" in grok
+    session = json.loads(sessions)
     assert session["browser_fingerprint_id"] == "bf-test-1"
+    assert session["email"] == "user@example.test"
+    # No live CPA/sub2api at register time
+    assert not (tmp_path / "cpa").exists()
+    assert not (tmp_path / "sub2api").exists()
 
 
-def test_registration_can_disable_legacy_account_exports(monkeypatch):
-    writes = []
+def test_registration_always_writes_sso_even_if_formats_were_oauth_only(monkeypatch, tmp_path):
+    """KEY_EXPORT_FORMATS no longer gates SSO pack; register is always SSO-first."""
+    monkeypatch.setattr(register, "KEY_EXPORT_DIR", str(tmp_path))
     monkeypatch.setattr(register, "KEY_EXPORT_FORMATS", ("sub2api",))
     monkeypatch.setattr(
         register,
         "_remember_account_browser_fingerprint",
         lambda email, browser_fingerprint_id=None: browser_fingerprint_id or "bf-test-1",
     )
-    monkeypatch.setattr(
-        register,
-        "_append_registration_line",
-        lambda path, line, mode=None, durable=False: writes.append(
-            (path, line, mode, durable)
-        ),
-    )
 
     register._persist_registration(
         "user@example.test",
@@ -96,7 +85,9 @@ def test_registration_can_disable_legacy_account_exports(monkeypatch):
         "bf-test-1",
     )
 
-    assert [item[0] for item in writes] == ["keys/auth-sessions.jsonl"]
+    assert (tmp_path / "accounts.txt").exists()
+    assert (tmp_path / "auth-sessions.jsonl").exists()
+    assert not list((tmp_path / "cpa").glob("*.json")) if (tmp_path / "cpa").exists() else True
 
 
 def test_registration_browser_fingerprint_is_stable_per_email(monkeypatch, tmp_path):
@@ -112,94 +103,11 @@ def test_registration_browser_fingerprint_is_stable_per_email(monkeypatch, tmp_p
     assert document["accounts"]["user@example.test"]["browser_fingerprint_id"] == first
 
 
-def test_local_key_export_sink_writes_cpa_and_sub2api_folders(monkeypatch, tmp_path):
-    monkeypatch.setattr(register, "KEY_EXPORT_DIR", str(tmp_path))
-    credential = OAuthCredential(
-        access_token="access-token",
-        refresh_token="refresh-token",
-        id_token="id-token",
-        token_type="Bearer",
-        expires_in=3600,
-        expires_at="2026-07-11T00:00:00Z",
-        last_refresh="2026-07-11T00:00:00Z",
-        subject="subject-1",
-        token_endpoint="https://auth.x.ai/oauth2/token",
-    )
-
-    asyncio.run(
-        register._LocalKeyExportSink(
-            "user@example.test",
-            ("cpa", "sub2api"),
-            b"name-secret",
-        ).store(credential)
-    )
-
-    cpa_files = list((tmp_path / "cpa").glob("xai-*.json"))
-    assert len(cpa_files) == 1
-    cpa_document = json.loads(cpa_files[0].read_text(encoding="utf-8"))
-    assert cpa_document["refresh_token"] == "refresh-token"
-    assert cpa_document["email"] == "user@example.test"
-    # merge bundles must not be created
-    assert not (tmp_path / "cpa" / "accounts.cpa.zip").exists()
-    assert not (tmp_path / "cpa" / "accounts.cpa.json").exists()
-
-    sub2api_files = list((tmp_path / "sub2api").glob("xai-*.sub2api.json"))
-    assert len(sub2api_files) == 1
-    merged = json.loads((tmp_path / "sub2api" / "accounts.sub2api.json").read_text(encoding="utf-8"))
-    assert merged["accounts"][0]["platform"] == "grok"
-    assert merged["accounts"][0]["credentials"]["refresh_token"] == "refresh-token"
-    assert merged["accounts"][0]["credentials"]["email"] == "user@example.test"
-
-
-def test_key_export_enrollment_uses_xai_enroller_and_writes_selected_format(monkeypatch, tmp_path):
-    monkeypatch.setattr(register, "KEY_EXPORT_DIR", str(tmp_path))
-    monkeypatch.setattr(register, "KEY_EXPORT_FORMATS", ("sub2api",))
-    monkeypatch.setattr(register, "KEY_EXPORT_ENROLLER", True)
-    monkeypatch.setattr(register, "_pick_grok_proxy", lambda: None)
-    coordinators = []
-
-    class FakeCoordinator:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            coordinators.append(self)
-
-        async def run(self, target):
-            credential = OAuthCredential(
-                access_token="access-token",
-                refresh_token="refresh-token",
-                id_token="id-token",
-                token_type="Bearer",
-                expires_in=3600,
-                expires_at="2026-07-11T00:00:00Z",
-                last_refresh="2026-07-11T00:00:00Z",
-                subject="subject-1",
-                token_endpoint="https://auth.x.ai/oauth2/token",
-            )
-            await self.kwargs["sink"].store(credential)
-            return [
-                types.SimpleNamespace(
-                    status=types.SimpleNamespace(value="imported"),
-                    reason_code="imported",
-                )
-            ]
-
-    import xai_enroller.coordinator
-
-    monkeypatch.setattr(xai_enroller.coordinator, "EnrollmentCoordinator", FakeCoordinator)
-
-    asyncio.run(
-        register._run_key_export_enrollment(
-            "user@example.test",
-            "sso-token",
-            [{"name": "sso", "value": "sso-token", "domain": "accounts.x.ai"}],
-            "bf-test-1",
-        )
-    )
-
-    merged = json.loads((tmp_path / "sub2api" / "accounts.sub2api.json").read_text(encoding="utf-8"))
-    assert merged["accounts"][0]["platform"] == "grok"
-    source_record = next(coordinators[0].kwargs["source"].records())
-    assert source_record.browser_fingerprint_id == "bf-test-1"
+def test_live_key_export_enroller_removed():
+    assert register.KEY_EXPORT_ENROLLER is False
+    assert not hasattr(register, "_run_key_export_enrollment")
+    assert not hasattr(register, "_LocalKeyExportSink")
+    assert not hasattr(register, "_schedule_key_export_enrollment")
 
 
 def test_moemail_url_normalizes_ui_path():

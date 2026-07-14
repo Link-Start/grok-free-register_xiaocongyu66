@@ -1,6 +1,6 @@
 #!/bin/bash
 # 一键启动:自动装依赖 → 校验 Python+Go+Rust → 引导配置 → 运行
-# 硬性条件: 必须同时具备 Python venv、Go workers、Rust inventory-worker
+# 硬性条件: 必须同时具备 Python venv、Go workers（含 inventory-worker）
 # 用法:
 #   bash start.sh              # 首次会引导选模式,之后直接启动
 #   bash start.sh --dashboard  # Web 控制面板

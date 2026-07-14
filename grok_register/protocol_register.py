@@ -360,8 +360,23 @@ def solve_turnstile_sync(site_key: str = TURNSTILE_SITEKEY) -> str:
     q = urllib.parse.urlencode({"url": SIGNUP_URL, "sitekey": site_key})
     create_url = f"{api}/turnstile?{q}"
     timeout_sec = _env_int("TURNSTILE_API_TIMEOUT", 100)
-    req = urllib.request.Request(create_url, method="GET")
-    req.add_header("User-Agent", USER_AGENT)
+    # Remote HF / standalone solver may require Bearer / X-API-Key
+    api_token = (
+        _env("TURNSTILE_API_TOKEN")
+        or _env("SOLVER_API_TOKEN")
+        or _env("TURNSTILE_SOLVER_TOKEN")
+        or ""
+    ).strip()
+
+    def _auth_req(url: str, method: str = "GET") -> urllib.request.Request:
+        r = urllib.request.Request(url, method=method)
+        r.add_header("User-Agent", USER_AGENT)
+        if api_token:
+            r.add_header("Authorization", f"Bearer {api_token}")
+            r.add_header("X-API-Key", api_token)
+        return r
+
+    req = _auth_req(create_url)
     with urllib.request.urlopen(req, timeout=30) as resp:
         import json
 
@@ -372,9 +387,8 @@ def solve_turnstile_sync(site_key: str = TURNSTILE_SITEKEY) -> str:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         time.sleep(0.8)
-        rreq = urllib.request.Request(
-            f"{api}/result?id={urllib.parse.quote(str(task_id), safe='')}",
-            method="GET",
+        rreq = _auth_req(
+            f"{api}/result?id={urllib.parse.quote(str(task_id), safe='')}"
         )
         try:
             with urllib.request.urlopen(rreq, timeout=20) as rresp:
@@ -485,6 +499,7 @@ _write_lock = threading.Lock()
 
 
 def append_account(path: str, email: str, password: str, sso: str) -> None:
+    """SSO-first persist: accounts.txt + grok.txt + auth-sessions (no live CPA)."""
     p = Path(path)
     if not p.is_absolute():
         p = PROJECT_ROOT / p
@@ -492,14 +507,27 @@ def append_account(path: str, email: str, password: str, sso: str) -> None:
     # never touch accounts.cpa.json
     line = f"{email}:{password}:{sso}\n"
     with _write_lock:
-        with p.open("a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
+        # Prefer unified SSO export helper (also writes auth-sessions / grok.txt)
+        try:
+            from grok_register.sso.export import append_sso_artifacts
+
+            # Full SSO pack (accounts + grok + auth-sessions); never accounts.cpa.json
+            append_sso_artifacts(email, password, sso, root=p.parent)
+        except Exception:
+            with p.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
         log_path = p.parent / "accounts.protocol.log"
         with log_path.open("a", encoding="utf-8") as lf:
             lf.write(
                 f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{email}\t{sso[:24]}\n"
             )
+        try:
+            from grok_register.memory_hygiene import note_op_and_maybe_trim
+
+            note_op_and_maybe_trim()
+        except Exception:
+            pass
 
 
 def _jwt_like_from_bytes(data: bytes) -> str:
@@ -633,9 +661,16 @@ def run_protocol_register(
         except Exception:
             return ""
 
+    try:
+        from grok_register.sso.export import sso_only_export_enabled
+
+        sso_mode = sso_only_export_enabled()
+    except Exception:
+        sso_mode = True
     print(
         f"[*] 协议注册 curl_cffi+V2 workers={workers} target={target or '∞'} "
-        f"email={_env('EMAIL_MODE', 'moemail')} (无 accounts.cpa.json)",
+        f"email={_env('EMAIL_MODE', 'moemail')} "
+        f"export={'SSO-only→keys/' if sso_mode else 'legacy'} (无 live CPA)",
         flush=True,
     )
     if fixed_proxy:
@@ -685,6 +720,12 @@ def run_protocol_register(
                     )
                 except Exception:
                     pass
+                try:
+                    from grok_register.memory_hygiene import note_op_and_maybe_trim
+
+                    note_op_and_maybe_trim()
+                except Exception:
+                    pass
                 if stop.wait(1.5):
                     return
 
@@ -703,6 +744,34 @@ def run_protocol_register(
         f"last_error={stats.last_error!r}",
         flush=True,
     )
+    try:
+        from grok_register.memory_hygiene import trim_memory
+
+        info = trim_memory(force=True)
+        print(f"[*] memory trim rss={info.get('rss_after_mb')}MB", flush=True)
+    except Exception:
+        pass
+
+    # Optional: after SSO batch, convert pending → CPA (env SSO_CONVERT_AFTER_REGISTER=1)
+    if stats.success > 0 and _env("SSO_CONVERT_AFTER_REGISTER", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        try:
+            from grok_register.sso.export import convert_sso_to_product
+
+            conv = convert_sso_to_product(
+                only_pending=True,
+                limit=max(stats.success, _env_int("SSO_CONVERT_LIMIT", 200)),
+                enroll=True,
+                rebuild=True,
+            )
+            print(f"[*] SSO→CPA: {conv.get('message')}", flush=True)
+        except Exception as exc:
+            print(f"[!] SSO→CPA convert failed: {exc}", flush=True)
+
     code = 0 if stats.success > 0 or target == 0 else 1
     try:
         from grok_register.run_log import append_fail

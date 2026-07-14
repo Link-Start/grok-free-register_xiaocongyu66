@@ -32,3 +32,7 @@ native/solver-watchdog/solver-watchdog
 native/solver-util/solver-util
 native/solver-util/*.o
 native/solver-util/solver-util.o
+
+# cpp gateway binary
+native/solver-gateway-cpp/solver-gateway
+native/solver-gateway-cpp/**/*.o

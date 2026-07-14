@@ -398,7 +398,7 @@ def build_overview() -> dict:
         polyglot = stack_status()
     except Exception as exc:
         polyglot = {"ok": False, "error": str(exc)}
-    return {
+    out = {
         "ok": True,
         "time": time.time(),
         "public_url": public_dashboard_url(),
@@ -435,7 +435,7 @@ def build_overview() -> dict:
         "engines": {
             "register": (os.environ.get("REGISTER_ENGINE") or "python").strip().lower(),
             "proxy_worker": (os.environ.get("PROXY_WORKER_ENGINE") or "go").strip().lower(),
-            "inventory": (os.environ.get("INVENTORY_ENGINE") or "rust").strip().lower(),
+            "inventory": (os.environ.get("INVENTORY_ENGINE") or "go").strip().lower(),
             "turnstile": (os.environ.get("TURNSTILE_SOLVER") or "hybrid").strip().lower(),
         },
         "summary": {
@@ -470,6 +470,13 @@ def build_overview() -> dict:
         "convert_job": acct_convert.job_status(),
         "cliproxyapi": cpa_sync.job_status(),
     }
+    try:
+        from grok_register.sso.export import job_status as sso_job_status
+
+        out["sso_convert_job"] = sso_job_status()
+    except Exception:
+        out["sso_convert_job"] = {}
+    return out
 
 
 def _run_logs_block() -> dict:
@@ -1207,9 +1214,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <button class="act primary" id="btn-convert-sub2api" data-i18n="btn_convert_sub2api">一键转 sub2api</button>
         <button class="act primary" id="btn-convert-cpa" data-i18n="btn_convert_cpa">一键转 CPA</button>
         <button class="act" id="btn-convert-both" data-i18n="btn_convert_both">转 sub2api + CPA</button>
-        <button class="act" id="btn-convert-pending" data-i18n="btn_convert_pending">仅转换待 OAuth</button>
+        <button class="act" id="btn-convert-pending" data-i18n="btn_convert_pending">SSO→CPA（协议）</button>
+        <button class="act" id="btn-sso-to-cpa" data-i18n="btn_sso_to_cpa">批量 SSO→CPA</button>
       </div>
-      <div class="note" id="convert-note" data-i18n="convert_hint">一键转 CPA/sub2api = 已有 OAuth 文件互转（秒级，默认不走浏览器）。「仅转换待 OAuth」才用 SSO 浏览器（慢，建议少量）。</div>
+      <div class="note" id="convert-note" data-i18n="convert_hint">注册默认只落 SSO。一键 CPA/sub2api=OAuth 文件互转；SSO→CPA=协议批量换成可用 CPA。</div>
       <div class="actions" style="margin-top:12px">
         <button class="act primary" id="btn-cpa-sync" data-i18n="btn_cpa_sync">同步 CLIProxyAPI</button>
         <button class="act" id="btn-cpa-refresh" data-i18n="btn_cpa_refresh">刷新过期 Token</button>
@@ -1356,8 +1364,9 @@ const I18N = {
     btn_convert_sub2api: "一键转 sub2api",
     btn_convert_cpa: "一键转 CPA",
     btn_convert_both: "转 sub2api + CPA",
-    btn_convert_pending: "仅转换待 OAuth",
-    convert_hint: "一键转 CPA/sub2api = 已有 OAuth 文件互转（秒级，默认不走浏览器）。「仅转换待 OAuth」才用 SSO 浏览器（慢，建议少量）。",
+    btn_convert_pending: "SSO→CPA（协议）",
+    btn_sso_to_cpa: "批量 SSO→CPA",
+    convert_hint: "注册默认只落 SSO。一键 CPA/sub2api=OAuth 文件互转；SSO→CPA=协议批量换可用 CPA。",
     convert_starting: "正在启动转换…",
     convert_running: "转换进行中…",
     convert_done: "转换完成",
@@ -1537,8 +1546,9 @@ const I18N = {
     btn_convert_sub2api: "Convert → sub2api",
     btn_convert_cpa: "Convert → CPA",
     btn_convert_both: "Convert → sub2api + CPA",
-    btn_convert_pending: "Convert pending OAuth only",
-    convert_hint: "One-click CPA/sub2api = OAuth file transform (seconds, no browser). “Pending OAuth only” uses SSO browser (slow).",
+    btn_convert_pending: "SSO→CPA (protocol)",
+    btn_sso_to_cpa: "Batch SSO→CPA",
+    convert_hint: "Register writes SSO only. One-click CPA/sub2api = OAuth file transform; SSO→CPA = protocol batch convert.",
     convert_starting: "Starting convert…",
     convert_running: "Convert running…",
     convert_done: "Convert finished",
@@ -1921,7 +1931,7 @@ async function refreshStatus(fromCache){
   const pg=data.polyglot||{};
   const pgMark = pg.ok ? "✓" : "✗";
   $("engines").innerHTML=`
-    <div>${t("eng_polyglot")}<b>${pgMark} Python + Go + Rust</b></div>
+    <div>${t("eng_polyglot")}<b>${pgMark} Python + Go</b></div>
     <div style="margin-top:6px">${t("eng_register")}<b>${fmt(eng.register)}</b></div>
     <div style="margin-top:6px">${t("eng_proxy")}<b>${fmt(eng.proxy_worker)}</b></div>
     <div style="margin-top:6px">${t("eng_inventory")}<b>${fmt(eng.inventory)}</b></div>
@@ -2601,11 +2611,12 @@ async function startConvert(formats, onlyPending, opts){
   if(!note) return;
   note.textContent=t("convert_starting");
   opts = opts || {};
-  // one-click CPA/sub2api: pure OAuth file transform (fast). Browser enroll only for「待 OAuth」.
+  // one-click CPA/sub2api: pure OAuth file transform (fast).
+  // SSO→CPA: protocol batch via sso_pipeline (Go enroll).
   const allowEnroll = opts.allow_enroll != null ? !!opts.allow_enroll : !!onlyPending;
   try{
     const body={
-      action:"convert",
+      action: opts.sso_pipeline ? "sso_to_cpa" : "convert",
       formats: formats,
       only_pending: !!onlyPending,
       allow_enroll: allowEnroll,
@@ -2623,7 +2634,9 @@ async function startConvert(formats, onlyPending, opts){
 $("btn-convert-sub2api")?.addEventListener("click",()=>startConvert(["sub2api"], false, {allow_enroll:false, limit:2000}));
 $("btn-convert-cpa")?.addEventListener("click",()=>startConvert(["cpa"], false, {allow_enroll:false, limit:2000}));
 $("btn-convert-both")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], false, {allow_enroll:false, limit:2000}));
-$("btn-convert-pending")?.addEventListener("click",()=>startConvert(["sub2api","cpa"], true, {allow_enroll:true, limit:20}));
+// SSO→CPA: protocol enroll (Go inventory-worker), batch pending only
+$("btn-convert-pending")?.addEventListener("click",()=>startConvert(["cpa"], true, {allow_enroll:true, limit:200, sso_pipeline:true}));
+$("btn-sso-to-cpa")?.addEventListener("click",()=>startConvert(["cpa"], true, {allow_enroll:true, limit:500, sso_pipeline:true}));
 
 async function runCpaAction(action){
   const note=$("cpa-sync-note");
@@ -2922,6 +2935,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
             _record_last_action("probe_xai", result)
             self._json(200, result)
             return
+        if action in {"sso_to_cpa", "sso_convert", "batch_sso_cpa"}:
+            raw_fmt = (data or {}).get("formats") or (data or {}).get("format") or ["cpa"]
+            if isinstance(raw_fmt, str):
+                formats = [x.strip() for x in raw_fmt.split(",") if x.strip()]
+            else:
+                formats = list(raw_fmt or ["cpa"])
+            try:
+                limit = int((data or {}).get("limit") or 500)
+            except (TypeError, ValueError):
+                limit = 500
+            allow_enroll = (data or {}).get("allow_enroll", True)
+            if isinstance(allow_enroll, str):
+                allow_enroll = allow_enroll.strip().lower() not in {"0", "false", "no", "off"}
+            try:
+                from grok_register import sso_export as sso_ex
+
+                result = sso_ex.start_sso_to_cpa_job(
+                    formats=formats,
+                    only_pending=True,
+                    limit=limit,
+                    allow_enroll=bool(allow_enroll),
+                )
+            except Exception as exc:
+                result = {"ok": False, "message": str(exc)}
+            _record_last_action("sso_to_cpa", result)
+            self._json(200, result)
+            return
         if action in {"convert", "convert_accounts", "to_cpa", "to_sub2api"}:
             # format aliases
             raw_fmt = (data or {}).get("formats") or (data or {}).get("format") or []
@@ -2944,16 +2984,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 allow_enroll = bool(only_pending)
             if isinstance(allow_enroll, str):
                 allow_enroll = allow_enroll.strip().lower() not in {"0", "false", "no", "off"}
+            # Pending + enroll → SSO protocol pipeline (Go), not browser enroller by default
+            use_sso_pipe = bool(only_pending and allow_enroll) or bool(
+                (data or {}).get("sso_pipeline")
+            )
             try:
-                default_limit = 20 if allow_enroll else 2000
+                default_limit = 500 if use_sso_pipe else (20 if allow_enroll else 2000)
                 limit = int((data or {}).get("limit") or default_limit)
             except (TypeError, ValueError):
-                limit = 20 if allow_enroll else 2000
+                limit = 500 if use_sso_pipe else (20 if allow_enroll else 2000)
             background = (data or {}).get("background", True)
             if isinstance(background, str):
                 background = background.strip().lower() not in {"0", "false", "no", "off"}
             try:
-                if background:
+                if use_sso_pipe:
+                    from grok_register import sso_export as sso_ex
+
+                    if background:
+                        result = sso_ex.start_sso_to_cpa_job(
+                            formats=formats or ["cpa"],
+                            only_pending=True,
+                            limit=limit,
+                            allow_enroll=True,
+                        )
+                    else:
+                        result = sso_ex.convert_sso_to_product(
+                            formats=formats or ["cpa"],
+                            only_pending=True,
+                            limit=limit,
+                            enroll=True,
+                            rebuild=True,
+                        )
+                elif background:
                     result = acct_convert.start_convert_job(
                         emails,
                         formats,
@@ -2976,7 +3038,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(200, result)
             return
         if action in {"convert_status", "convert_job"}:
-            self._json(200, {"ok": True, "job": acct_convert.job_status()})
+            try:
+                from grok_register import sso_export as sso_ex
+
+                sso_job = sso_ex.job_status()
+            except Exception:
+                sso_job = {}
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "job": acct_convert.job_status(),
+                    "sso_job": sso_job,
+                },
+            )
             return
         if action in {
             "cliproxy_sync",

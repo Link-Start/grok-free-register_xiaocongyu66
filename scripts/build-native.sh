@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build mandatory native stack: Go (proxy + register) + Rust (inventory).
-# Failure is fatal — project requires Python + Go + Rust.
+# Build mandatory native stack: Go (proxy + register + inventory + solver-gateway)
+# + Rust (watchdog) + C++ util for old hybrid Turnstile.
+# Failure is fatal — project requires Python + Go + Rust + g++.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,7 +17,7 @@ need_cmd() {
   return 0
 }
 
-echo "=== 构建原生组件 (Go + Rust + C++) ==="
+echo "=== 构建原生组件 (Go hybrid + Rust watchdog + C++ util) ==="
 
 need_cmd go || true
 need_cmd cargo || true
@@ -56,7 +57,7 @@ echo "[2/6] Go register-worker ..."
 test -x native/register-worker/register-worker
 echo "    [✓] native/register-worker/register-worker"
 
-echo "[3/6] Go solver-gateway (hybrid Turnstile) ..."
+echo "[3/6] Go solver-gateway (hybrid Turnstile · 旧版) ..."
 (
   cd native/solver-gateway
   go build -trimpath -ldflags="-s -w" -o solver-gateway .
@@ -65,16 +66,13 @@ test -x native/solver-gateway/solver-gateway
 echo "    [✓] native/solver-gateway/solver-gateway"
 ./native/solver-gateway/solver-gateway version
 
-echo "[4/6] Rust inventory-worker ..."
+echo "[4/6] Go inventory-worker (scan / rebuild / protocol convert) ..."
 (
   cd native/inventory-worker
-  cargo build --release
-  # stable path copy for gate / PATH-less callers
-  cp -f target/release/inventory-worker ./inventory-worker
+  go build -trimpath -ldflags="-s -w" -o inventory-worker .
   chmod +x ./inventory-worker
 )
 test -x native/inventory-worker/inventory-worker
-test -x native/inventory-worker/target/release/inventory-worker
 echo "    [✓] native/inventory-worker/inventory-worker"
 ./native/inventory-worker/inventory-worker version
 
@@ -105,6 +103,6 @@ echo ""
 ./native/register-worker/register-worker 2>/dev/null | head -1 || true
 
 echo ""
-echo "[✓] 原生组件构建完成 (Go + Rust + C++ hybrid Turnstile)"
+echo "[✓] 原生组件构建完成 (Go hybrid + Rust watchdog + C++ util + Go inventory)"
 echo "    下一步: bash scripts/polyglot_gate.sh check"
-echo "    Hybrid solver: TURNSTILE_SOLVER=hybrid python -m grok_register.turnstile_solver start"
+echo "    Hybrid: TURNSTILE_SOLVER=hybrid  → Go gateway + Rust watchdog + Python browser"

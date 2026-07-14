@@ -1,16 +1,52 @@
 # 本地认证服务
 
-认证服务把已有的 SSO 会话转换为 CPA 可直接读取的 OAuth 凭据。注册与认证可以在同一台机器，也可以分开运行。
+认证服务把已有的 **SSO 会话** 转为 CPA 可直接使用的 OAuth 凭据（`keys/cpa/xai-*.json`）。  
+**仅协议路径**（Go sso_build）；旧版 Playwright 浏览器确认已移除。
 
-## 默认同机运行
-
-同一个项目目录已经或正在运行注册服务时，直接启动认证：
+## 启动
 
 ```bash
 bash auth-service.sh
 ```
 
-未配置 SSH 主机时，认证服务自动读取本项目 `keys/` 中的完整会话与历史账号。注册可以继续追加，认证服务只安装经过校验的完整快照。
+流程与 [chenyme/grok2api](https://github.com/chenyme/grok2api) 的 **SSO→Build** 相同：
+
+```text
+keys/accounts.txt (SSO cookie)
+  → Go inventory-worker 多并发 + 可选多 IP 代理池
+  → POST device/code（scope 含 offline_access）
+  → verify + approve
+  → POST oauth2/token（device_code）→ access_token + refresh_token + id_token
+  → keys/cpa/xai-*.json
+  → 可选镜像到 ~/Downloads/grok-free-register-auth/authenticated/
+```
+
+### 刷新 token 从哪来？
+
+| 字段 | 来源 |
+|------|------|
+| `access_token` | `POST https://auth.x.ai/oauth2/token` 的 device_code 换票响应 |
+| **`refresh_token`** | **同上响应**（申请 scope 时带了 `offline_access`，xAI 才会下发） |
+| 之后续期 | `grant_type=refresh_token` + 已有 `refresh_token`（`cliproxyapi` 自动做） |
+
+**不是**从 SSO cookie 里“解析”出 refresh；也不是浏览器 enroller。  
+SSO 只用来自动完成 Device Flow 的 verify/approve；真正的 OAuth 票在 **token 端点** 一次性拿到。
+
+常用参数：
+
+```bash
+bash auth-service.sh --once --limit 200 --workers 16
+bash auth-service.sh --sso-file /path/to/old_sso.txt --workers 16
+bash auth-service.sh --proxy-file 代理.txt --interval 30
+```
+
+环境变量：`CONVERT_WORKERS` / `AUTH_PROTOCOL_WORKERS`、`AUTH_PROTOCOL_LIMIT`、`SSO_CONVERT_PROXY_FILE`。
+
+**Turnstile 不在此阶段**：注册时已解过验证码拿到 SSO；协议授权只靠 SSO cookie。
+
+## 同机运行
+
+注册与认证可同目录并行：注册只写 SSO；认证扫 `keys/accounts.txt` 中尚未出 CPA 的号（**最新优先**）。
 
 ## 配置远端同步
 
@@ -42,26 +78,12 @@ export XAI_AUTH_SERVICE_SOURCE=ssh    # 强制使用 SSH，必须配置主机
 ## 运行
 
 ```bash
-bash auth-service.sh
+bash auth-service.sh              # 守护轮转
+bash auth-service.sh --once       # 只转一轮
 ```
 
-首次运行会自动安装项目依赖。该命令在当前终端持续运行并直接接受控制命令；输入 `q` 或按 `Ctrl-C` 停止，再次执行同一命令即可重启。不需要额外的会话管理工具。
+首次运行会自动安装项目依赖（含 Go inventory-worker）。
 
-普通模式只在来源连接、发现新账号、任务开始、认证结果、限流和控制状态变化时输出。查看队列、重试、节拍和冷却探针时使用：
-
-```bash
-bash auth-service.sh --debug
-```
-
-运行中终端底部会保持 `认证> ` 输入行。日志更新不会清掉尚未提交的内容；直接输入命令并回车：
-
-```text
-s       查看状态
-take N  取用 N 个凭据
-p       暂停
-r       恢复
-c       取消当前任务
-q       安全退出
-```
-
-快照默认每 30 秒更新一次；内容无变化时终端保持安静。有效快照和已生成凭据会在重启后继续使用。
+- 实时进度条（与 `sso_export convert` 相同）
+- `Ctrl-C` 完成本轮后退出
+- 成功：`keys/cpa/xai-*.json`（含 `refresh_token`），并镜像到 Downloads `authenticated/`

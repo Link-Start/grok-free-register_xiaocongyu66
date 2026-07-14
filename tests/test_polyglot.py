@@ -1,4 +1,4 @@
-"""Mandatory Python + Go + Rust stack gate."""
+"""Mandatory Python + Go stack gate (inventory is Go)."""
 from __future__ import annotations
 
 import os
@@ -11,6 +11,7 @@ from grok_register import polyglot
 
 
 ROOT = Path(__file__).resolve().parents[1]
+INV_BIN = ROOT / "native" / "inventory-worker" / "inventory-worker"
 
 
 def test_stack_status_shape():
@@ -20,7 +21,7 @@ def test_stack_status_shape():
         "python",
         "go_proxy_worker",
         "go_register_worker",
-        "rust_inventory_worker",
+        "go_inventory_worker",
     }
 
 
@@ -31,12 +32,8 @@ def test_require_polyglot_soft_mode(monkeypatch):
     assert isinstance(st, dict)
 
 
-@pytest.mark.skipif(
-    not (ROOT / "native" / "inventory-worker" / "inventory-worker").is_file()
-    and not (ROOT / "native" / "inventory-worker" / "target" / "release" / "inventory-worker").is_file(),
-    reason="rust inventory-worker not built",
-)
-def test_rust_inventory_scan_and_rebuild(tmp_path):
+@pytest.mark.skipif(not INV_BIN.is_file(), reason="go inventory-worker not built")
+def test_go_inventory_scan_and_rebuild(tmp_path):
     keys = tmp_path / "keys"
     keys.mkdir()
     (keys / "accounts.txt").write_text("a@ex.com:pw:sso\n", encoding="utf-8")
@@ -64,16 +61,43 @@ def test_rust_inventory_scan_and_rebuild(tmp_path):
         encoding="utf-8",
     )
 
-    data = polyglot.rust_scan_accounts(keys)
+    data = polyglot.inventory_scan_accounts(keys)
     assert data.get("ok") is True
-    assert data.get("engine") == "rust"
+    assert data.get("engine") in {"go", "rust"}  # rust legacy binary still ok
     assert data["summary"]["total"] >= 1
 
-    rebuilt = polyglot.rust_rebuild_bundles(keys)
+    rebuilt = polyglot.inventory_rebuild_bundles(keys)
     assert rebuilt.get("ok") is True
     assert (keys / "sub2api" / "accounts.sub2api.json").is_file()
     assert not (keys / "cpa" / "accounts.cpa.json").is_file()
     assert (keys / "cpa" / "xai-test.json").is_file()
+
+
+@pytest.mark.skipif(not INV_BIN.is_file(), reason="go inventory-worker not built")
+def test_go_inventory_convert_oauth_copy(tmp_path):
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    cpa = keys / "cpa"
+    cpa.mkdir()
+    (cpa / "xai-only.json").write_text(
+        '{"type":"xai","email":"b@ex.com","access_token":"at2","refresh_token":"rt2","sub":"sub2"}',
+        encoding="utf-8",
+    )
+    out = polyglot.inventory_convert(keys, formats=["cpa", "sub2api"], enroll=False)
+    assert out.get("engine") in {"go", "rust"}
+    assert out.get("ok_n", 0) >= 1
+    assert (keys / "sub2api").is_dir()
+    assert any((keys / "sub2api").glob("*.sub2api.json"))
+
+
+# back-compat aliases
+@pytest.mark.skipif(not INV_BIN.is_file(), reason="inventory-worker not built")
+def test_rust_inventory_scan_and_rebuild_alias(tmp_path):
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    (keys / "accounts.txt").write_text("a@ex.com:pw:sso\n", encoding="utf-8")
+    data = polyglot.rust_scan_accounts(keys)
+    assert data.get("ok") is True
 
 
 def test_polyglot_gate_shell_script():
@@ -88,3 +112,4 @@ def test_polyglot_gate_shell_script():
     )
     assert completed.returncode == 0
     assert "python" in completed.stdout
+    assert "go_inventory_worker" in completed.stdout

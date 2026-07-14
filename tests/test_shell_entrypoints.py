@@ -83,10 +83,12 @@ def test_start_dispatches_registration_and_email_as_independent_modules(tmp_path
     ]
 
 
-def test_auth_service_keeps_the_supported_python_module_internal(tmp_path):
+def test_auth_service_uses_protocol_module(tmp_path):
     workspace = _entrypoint_workspace(tmp_path)
-    assert _run_entry(workspace, "auth-service.sh", "--debug") == [
+    assert _run_entry(workspace, "auth-service.sh", "--once", "--limit", "1") == [
         "-m",
-        "xai_enroller.service",
-        "--debug",
+        "grok_register.sso.auth_service",
+        "--once",
+        "--limit",
+        "1",
     ]
