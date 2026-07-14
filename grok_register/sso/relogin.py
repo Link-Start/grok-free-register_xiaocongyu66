@@ -1,15 +1,15 @@
 """Re-login with email+password to mint fresh SSO cookies.
 
 Reads:
-  keys/accounts.txt              email:password:sso (password required)
-  keys/auth-sessions.jsonl       optional cookie jar / fingerprint hints
-  keys/browser-fingerprints.json optional per-email fingerprint id (kept on write)
-  keys/grok.txt                  rewritten from new SSO list
+  keys/accounts.txt              email:password  (or legacy email:password:sso)
+  keys/sso.txt                   current email:sso (optional filter source)
+  keys/browser-fingerprints.json optional fingerprint id on session write
 
-Writes (atomic-ish):
-  keys/accounts.txt              updated sso field for successful emails
-  keys/grok.txt                  all SSO tokens (one per line, same order as accounts)
-  keys/auth-sessions.jsonl       append new session lines for successes
+Writes on success (old SSO for that email is removed first):
+  keys/sso.txt                   email:sso  (upsert — one line per email)
+  keys/grok.txt                  regenerated from sso.txt
+  keys/auth-sessions.jsonl       append new session
+  keys/accounts.txt              kept as email:password only
 
 Does NOT convert to CPA — run auth-service / sso.export convert after.
 
@@ -63,7 +63,10 @@ def key_dir() -> Path:
 
 
 def load_accounts(path: Path) -> list[dict[str, str]]:
-    """Parse accounts.txt → [{email, password, sso, line_index}, ...] unique by email (last wins)."""
+    """Parse accounts.txt → [{email, password}, ...] unique by email (last wins).
+
+    Accepts email:password or legacy email:password:sso (password = middle field).
+    """
     if not path.is_file():
         return []
     by: dict[str, dict[str, str]] = {}
@@ -76,11 +79,11 @@ def load_accounts(path: Path) -> list[dict[str, str]]:
         if len(parts) < 2:
             continue
         email = parts[0].strip()
-        if len(parts) == 2:
-            password, sso = parts[1], ""
-        else:
-            password, sso = parts[1], parts[2]
+        password = parts[1].strip() if len(parts) >= 2 else ""
         if not email or "@" not in email or not password:
+            continue
+        # skip if middle field looks like JWT (malformed line)
+        if password.startswith("eyJ") and len(parts) == 2:
             continue
         key = email.lower()
         if key not in by:
@@ -88,7 +91,6 @@ def load_accounts(path: Path) -> list[dict[str, str]]:
         by[key] = {
             "email": email,
             "password": password,
-            "sso": sso.strip(),
             "line_index": str(i),
         }
     return [by[k] for k in order]
@@ -462,38 +464,35 @@ def write_back(
     results_by_email: dict[str, dict[str, Any]],
     fingerprints: dict[str, str],
 ) -> dict[str, str]:
-    """Rewrite accounts.txt / grok.txt; append auth-sessions for successes."""
+    """On success: upsert keys/sso.txt (delete old email line), refresh grok, append sessions.
+
+    accounts.txt stays email:password only (passwords preserved / normalized).
+    """
+    from grok_register.sso.store import (
+        rewrite_grok_from_sso,
+        sso_file_path,
+        upsert_account_password,
+        upsert_sso,
+    )
+
     root.mkdir(parents=True, exist_ok=True)
-    accounts_path = root / "accounts.txt"
-    grok_path = root / "grok.txt"
     sessions_path = root / "auth-sessions.jsonl"
 
-    lines: list[str] = []
-    grok_lines: list[str] = []
+    # Normalize password file for all known accounts
     for acc in accounts:
-        em = acc["email"]
-        key = em.lower()
-        res = results_by_email.get(key)
-        if res and res.get("ok") and res.get("sso"):
-            sso = str(res["sso"])
-            pw = acc.get("password") or ""
-            lines.append(f"{em}:{pw}:{sso}")
-            grok_lines.append(sso)
-        else:
-            # keep old line
-            lines.append(f"{em}:{acc.get('password') or ''}:{acc.get('sso') or ''}")
-            if acc.get("sso"):
-                grok_lines.append(acc["sso"])
+        if acc.get("email") and acc.get("password"):
+            upsert_account_password(acc["email"], acc["password"], root=root)
 
-    tmp_a = accounts_path.with_suffix(".txt.tmp")
-    tmp_a.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    tmp_a.replace(accounts_path)
+    # Upsert SSO for successes only (removes previous email:sso line)
+    for key, res in results_by_email.items():
+        if not res.get("ok") or not res.get("sso"):
+            continue
+        email = str(res.get("email") or key)
+        upsert_sso(email, str(res["sso"]), root=root)
 
-    tmp_g = grok_path.with_suffix(".txt.tmp")
-    tmp_g.write_text("\n".join(grok_lines) + ("\n" if grok_lines else ""), encoding="utf-8")
-    tmp_g.replace(grok_path)
+    grok_path = rewrite_grok_from_sso(root)
+    sso_path = sso_file_path(root)
 
-    # append sessions
     with sessions_path.open("a", encoding="utf-8") as f:
         for key, res in results_by_email.items():
             if not res.get("ok"):
@@ -538,7 +537,8 @@ def write_back(
             f.write(json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     return {
-        "accounts": str(accounts_path),
+        "sso": str(sso_path),
+        "accounts": str(root / "accounts.txt"),
         "grok": str(grok_path),
         "auth_sessions": str(sessions_path),
     }
@@ -554,11 +554,17 @@ def relogin_batch(
     only_without_cpa: bool = False,
     progress: bool = True,
 ) -> dict[str, Any]:
-    """Production entry: merge successes into full accounts.txt without dropping others."""
+    """Production entry: password from accounts.txt → upsert keys/sso.txt email:sso."""
     root = root or key_dir()
+    from grok_register.sso.store import migrate_from_accounts_txt, sso_file_path
+
+    # Ensure sso.txt exists for visibility; passwords still from accounts.txt
+    if not sso_file_path(root).is_file():
+        migrate_from_accounts_txt(root)
+
     full_accounts = load_accounts(root / "accounts.txt")
     if not full_accounts:
-        return {"ok": False, "message": "no accounts in accounts.txt", "ok_n": 0, "fail_n": 0}
+        return {"ok": False, "message": "no accounts in accounts.txt (need email:password)", "ok_n": 0, "fail_n": 0}
 
     batch = list(full_accounts)
     if emails:
@@ -587,8 +593,8 @@ def relogin_batch(
 
     if progress:
         print(
-            f"[*] SSO relogin batch={len(batch)} / total_file={len(full_accounts)} "
-            f"workers={workers} proxies={len(pool)}",
+            f"[*] SSO relogin batch={len(batch)} / passwords={len(full_accounts)} "
+            f"workers={workers} proxies={len(pool)} → keys/sso.txt",
             flush=True,
         )
 
@@ -624,23 +630,7 @@ def relogin_batch(
                     err = f" {str(res.get('error') or '')[:70]}" if not res.get("ok") else ""
                     print(f"[{done}/{total}] {mark} {acc['email']}{err}", flush=True)
 
-    # merge into full list
-    merged: list[dict[str, str]] = []
-    for acc in full_accounts:
-        key = acc["email"].lower()
-        res = results_by.get(key)
-        if res and res.get("ok") and res.get("sso"):
-            merged.append(
-                {
-                    "email": acc["email"],
-                    "password": acc.get("password") or "",
-                    "sso": str(res["sso"]),
-                }
-            )
-        else:
-            merged.append(acc)
-
-    written = write_back(root, merged, results_by, fps)
+    written = write_back(root, full_accounts, results_by, fps)
     elapsed = round(time.time() - t0, 2)
     return {
         "ok": ok_n > 0 and fail_n == 0,

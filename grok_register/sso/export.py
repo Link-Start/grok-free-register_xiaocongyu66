@@ -119,6 +119,18 @@ def append_sso_artifacts(
     browser_fingerprint_id: str | None = None,
     root: Path | None = None,
 ) -> dict[str, str]:
+    """Persist registration success.
+
+    Canonical SSO: keys/sso.txt as email:sso (upsert — old line for email removed).
+    Password: keys/accounts.txt as email:password (for relogin).
+    Also refresh grok.txt + append auth-sessions.jsonl.
+    """
+    from grok_register.sso.store import (
+        rewrite_grok_from_sso,
+        upsert_account_password,
+        upsert_sso,
+    )
+
     root = root or key_export_dir()
     root.mkdir(parents=True, exist_ok=True)
     written: dict[str, str] = {}
@@ -128,17 +140,18 @@ def append_sso_artifacts(
     if not email or not sso:
         return written
 
-    accounts = root / "accounts.txt"
-    with accounts.open("a", encoding="utf-8") as f:
-        f.write(f"{email}:{password}:{sso}\n")
-        f.flush()
-    written["legacy"] = str(accounts)
+    # 1) Canonical SSO store — email:sso only, replace previous for same email
+    sso_path = upsert_sso(email, sso, root=root)
+    written["sso"] = str(sso_path)
 
-    grok = root / "grok.txt"
-    with grok.open("a", encoding="utf-8") as f:
-        f.write(sso + "\n")
-        f.flush()
-    written["grok"] = str(grok)
+    # 2) Password vault for relogin (no SSO column)
+    if password:
+        acc_path = upsert_account_password(email, password, root=root)
+        written["accounts"] = str(acc_path)
+
+    # 3) grok.txt regenerated from sso.txt (easy visual list of tokens)
+    grok_path = rewrite_grok_from_sso(root)
+    written["grok"] = str(grok_path)
 
     sess_cookies = cookies or [
         {
@@ -177,9 +190,46 @@ def append_sso_artifacts(
 
 
 def list_pending_sso(root: Path | None = None, *, limit: int = 5000) -> list[dict[str, Any]]:
+    """Pending = in sso.txt but no CPA yet (preferred), else inventory scan."""
     root = root or key_export_dir()
+    from grok_register.sso.store import load_sso_list, migrate_from_accounts_txt, sso_file_path
+
+    if not sso_file_path(root).is_file():
+        migrate_from_accounts_txt(root)
+
+    cpa_emails: set[str] = set()
+    cpa_dir = root / "cpa"
+    if cpa_dir.is_dir():
+        for p in cpa_dir.glob("xai-*.json"):
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+                em = str(doc.get("email") or "").strip().lower()
+                if em:
+                    cpa_emails.add(em)
+            except Exception:
+                continue
+
+    out: list[dict[str, Any]] = []
+    for row in reversed(load_sso_list(root)):  # newest-ish last in file → show recent first
+        em = row["email"].lower()
+        if em in cpa_emails:
+            continue
+        out.append(
+            {
+                "email": row["email"],
+                "status": "oauth_pending",
+                "has_sso": True,
+                "formats": ["sso"],
+                "source": "sso.txt",
+            }
+        )
+        if len(out) >= limit:
+            break
+    if out:
+        return out
+
+    # fallback inventory
     records = scan_accounts(root)
-    out = []
     for r in records:
         if r.status in {"oauth_pending", "legacy_sso"} or (
             r.has_sso and "cpa" not in r.formats and "sub2api" not in r.formats
@@ -380,11 +430,19 @@ def convert_sso_to_product(
         cand = PROJECT_ROOT / "代理.txt"
         if cand.is_file():
             proxy_file = str(cand)
+
+    # Canonical convert input: keys/sso.txt (email:sso). Migrate once from accounts if needed.
+    if not sso_file:
+        from grok_register.sso.store import default_sso_file_for_convert
+
+        sso_file = default_sso_file_for_convert(root)
+
     try:
         go_out = inventory_convert(
             root,
             formats=formats,
-            pending=only_pending and not bool(sso_file),
+            # when using sso.txt, Go builds targets from that file
+            pending=only_pending,
             enroll=enroll,
             limit=limit,
             workers=workers,
@@ -474,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument(
         "--sso-file",
         default="",
-        help="batch SSO file: email:password:sso or email:sso per line",
+        help="SSO file email:sso per line (default: keys/sso.txt)",
     )
     p_conv.add_argument(
         "--emails-file",

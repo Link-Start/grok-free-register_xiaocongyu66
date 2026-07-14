@@ -152,7 +152,7 @@ def run_watch(
         f"[✓] 协议认证服务 (Go sso_build / Chrome TLS)\n"
         f"    keys={keys}\n"
         f"    workers={workers} batch_limit={limit} interval={interval}s\n"
-        f"    sso_file={sso_file or '(keys/accounts.txt pending)'}\n"
+        f"    sso_file={sso_file or '(keys/sso.txt email:sso)'}\n"
         f"    mirror={mirror_dir or '(off)'}\n"
         f"    命令: 一轮转换后等待；Ctrl-C 停止",
         flush=True,

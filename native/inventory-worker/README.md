@@ -46,6 +46,7 @@ go build -trimpath -ldflags="-s -w" -o inventory-worker .
 | 变量 | 说明 |
 |------|------|
 | `KEY_EXPORT_DIR` | 默认 keys 目录 |
+| `keys/sso.txt` | 规范 SSO 源：`email:sso`（convert 默认读取） |
 | `XAI_ENROLLER_SOURCE_SALT` | 文件名 HMAC salt（可选，缺则自动生成） |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 协议 enroll 代理 |
 

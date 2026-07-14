@@ -6,11 +6,14 @@
 
 ```text
 注册 (start.sh / protocol_register)
-  → keys/accounts.txt + grok.txt + auth-sessions   （仅 SSO）
-认证 (auth-service.sh / sso.export convert)
-  → Go inventory-worker 多并发 sso_build
-  → keys/cpa/xai-*.json  (access + refresh_token)
-CLIProxy (cliproxyapi)
+  → keys/sso.txt          email:sso   （规范 SSO，upsert）
+  → keys/accounts.txt     email:password
+  → keys/grok.txt / auth-sessions.jsonl
+重登 (sso.relogin)
+  → 删该邮箱旧 sso 行 → 写新 email:sso
+认证 (auth-service / sso.export convert)
+  → 读 keys/sso.txt → Go sso_build → keys/cpa/xai-*.json
+CLIProxy
   → refresh_token 续 access
 ```
 

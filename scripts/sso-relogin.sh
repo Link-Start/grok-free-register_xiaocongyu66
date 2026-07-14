@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 用 accounts.txt 里的 email:password 重新登录，刷新 SSO
-# 写入 accounts.txt / grok.txt / auth-sessions.jsonl
+# 用 accounts.txt 的 email:password 重登，刷新 keys/sso.txt（email:sso）
+# 成功时删除该邮箱旧 SSO 行，写入新行；并刷新 grok.txt / 追加 auth-sessions
 #
 #   bash scripts/sso-relogin.sh --limit 10 --workers 2
 #   bash scripts/sso-relogin.sh --only-without-cpa --limit 50

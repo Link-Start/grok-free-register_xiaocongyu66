@@ -81,25 +81,35 @@ logs/proxy-auto-cpa.json
 
 `proxy-auto-active.txt` 会自动混入运行时代理池；`sub2api` 和 `cpa` JSON 用于导入支持同类数据格式的面板。
 
-成功注册后**只落 SSO 包**（不再 live 浏览器 OAuth）：
+成功注册后**只落 SSO / 账密**（不再 live 浏览器 OAuth）：
 
 ```text
-keys/accounts.txt
-keys/grok.txt
-keys/auth-sessions.jsonl
+keys/sso.txt                 # 规范 SSO：email:sso（一邮箱一行，upsert）
+keys/accounts.txt            # 账密：email:password（供重登）
+keys/grok.txt                # 纯 token 列表（由 sso.txt 生成）
+keys/auth-sessions.jsonl     # 会话 cookie 备份
+keys/browser-fingerprints.json
 ```
 
-最终成品 CPA 走 **grok2api 同款纯协议授权**（Go `inventory-worker`：device_code → verify → approve → token）：
+最终成品 CPA 读 **`keys/sso.txt`**，走 **grok2api 同款纯协议授权**（Go `inventory-worker`：device_code → verify → approve → token）：
 
 ```bash
 bash scripts/build-native.sh
-python -m grok_register.sso_export pending
-python -m grok_register.sso_export convert --formats cpa --limit 200
-# 或面板「SSO→CPA」；协议注册结束后自动转换：
-# SSO_CONVERT_AFTER_REGISTER=1
+python -m grok_register.sso.export pending
+python -m grok_register.sso.export convert --formats cpa --limit 200
+# 或
+bash auth-service.sh --once --limit 200 --workers 16
+# 面板「SSO→CPA」；协议注册结束后自动转换：SSO_CONVERT_AFTER_REGISTER=1
 ```
 
 写出单账号 `keys/cpa/xai-*.json`（`type: xai`，CLIProxyAPI 可用；无合并包）。可选 `SSO_CONVERT_FORMATS=cpa,sub2api` 同时写 sub2api。
+
+SSO 过期但账密还在时，可重登刷新 `sso.txt`（删旧行、写新 `email:sso`）：
+
+```bash
+bash scripts/sso-relogin.sh --limit 20 --workers 2
+bash scripts/sso-relogin.sh --limit 20 --workers 2 --convert   # 重登后立刻转 CPA
+```
 
 如果邮箱服务接口或 xAI HTTP 接口偶发 Cloudflare 拦截，可以开启 CF-Ares 兜底；项目已内置 `vendor/CF-Ares`，默认会从本地源码安装和优先导入：
 
@@ -124,4 +134,4 @@ bash start.sh --email-service
 
 性能参数默认会根据 CPU 和可用内存估算。除非正在压测，否则保持 `.env.example` 中的默认值即可。
 
-成功结果写入 `keys/`；默认 SSO 包为 `accounts.txt`、`grok.txt`、`auth-sessions.jsonl`。协议转换后另有 `keys/cpa/xai-*.json`。`keys/` 默认不提交到 Git。
+成功结果写入 `keys/`：规范 SSO 为 **`sso.txt`（email:sso）**，账密为 `accounts.txt`，另有 `grok.txt`、`auth-sessions.jsonl`。协议转换后另有 `keys/cpa/xai-*.json`。`keys/` 默认不提交到 Git。

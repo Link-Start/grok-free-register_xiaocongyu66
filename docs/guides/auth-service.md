@@ -12,13 +12,13 @@ bash auth-service.sh
 流程与 [chenyme/grok2api](https://github.com/chenyme/grok2api) 的 **SSO→Build** 相同：
 
 ```text
-keys/accounts.txt (SSO cookie)
-  → Go inventory-worker 多并发 + 可选多 IP 代理池
+keys/sso.txt          # 规范 SSO：email:sso（一行一个邮箱，重登会删旧换新）
+keys/accounts.txt     # 账密：email:password（供重登）
+  → Go inventory-worker 读 sso.txt，多并发 + 可选多 IP
   → POST device/code（scope 含 offline_access）
   → verify + approve
-  → POST oauth2/token（device_code）→ access_token + refresh_token + id_token
+  → POST oauth2/token → access_token + refresh_token
   → keys/cpa/xai-*.json
-  → 可选镜像到 ~/Downloads/grok-free-register-auth/authenticated/
 ```
 
 ### 刷新 token 从哪来？
@@ -46,7 +46,16 @@ bash auth-service.sh --proxy-file 代理.txt --interval 30
 
 ## 同机运行
 
-注册与认证可同目录并行：注册只写 SSO；认证扫 `keys/accounts.txt` 中尚未出 CPA 的号（**最新优先**）。
+注册与认证可同目录并行：注册写 **`keys/sso.txt`**（`email:sso`）；认证默认读该文件中尚未出 CPA 的号（**最新优先**）。
+
+### SSO 过期：重登
+
+账密在 `keys/accounts.txt`（`email:password`）。重登成功后**删除该邮箱旧 SSO 行**，写入新的 `email:sso`：
+
+```bash
+bash scripts/sso-relogin.sh --limit 50 --workers 2
+bash scripts/sso-relogin.sh --only-without-cpa --limit 100 --workers 2 --convert
+```
 
 ## 配置远端同步
 
@@ -84,6 +93,7 @@ bash auth-service.sh --once       # 只转一轮
 
 首次运行会自动安装项目依赖（含 Go inventory-worker）。
 
-- 实时进度条（与 `sso_export convert` 相同）
+- 实时进度条（与 `python -m grok_register.sso.export convert` 相同）
+- 默认 SSO 源：`keys/sso.txt`（`email:sso`）
 - `Ctrl-C` 完成本轮后退出
 - 成功：`keys/cpa/xai-*.json`（含 `refresh_token`），并镜像到 Downloads `authenticated/`

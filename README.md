@@ -225,13 +225,22 @@ Python 会 `fetch_config` 拿到 `SITE_KEY/ACTION_ID/STATE_TREE` 后拉起 `nati
 
 注意：Go 路径不跑 Playwright，风控/页面变更时需继续完善；成功账号写入 `keys/accounts.go.txt`。
 
-注册成功后**只写 SSO 包**（`accounts.txt` / `grok.txt` / `auth-sessions.jsonl`）。  
-最终成品 CPA 用 **grok2api 同款协议授权**（Go `inventory-worker`，非浏览器 enroller）：
+注册成功后写入：
+
+| 文件 | 格式 | 用途 |
+|------|------|------|
+| **`keys/sso.txt`** | `email:sso` | **规范 SSO**（convert 默认源；一邮箱一行，重登删旧换新） |
+| `keys/accounts.txt` | `email:password` | 重登账密 |
+| `keys/grok.txt` | 纯 token | 由 `sso.txt` 生成 |
+| `keys/auth-sessions.jsonl` | JSONL | 会话备份 |
+
+最终成品 CPA 用 **grok2api 同款协议授权**（Go `inventory-worker`，读 `sso.txt`）：
 
 ```bash
 bash scripts/build-native.sh
-python -m grok_register.sso_export convert --formats cpa
-# 或面板「SSO→CPA」；批次结束后自动转换：SSO_CONVERT_AFTER_REGISTER=1
+python -m grok_register.sso.export convert --formats cpa --limit 200 --workers 16
+# 或 bash auth-service.sh --once
+# 面板「SSO→CPA」；批次结束后自动：SSO_CONVERT_AFTER_REGISTER=1
 ```
 
 写出 `keys/cpa/xai-*.json`。可选 `SSO_CONVERT_FORMATS=cpa,sub2api`。
@@ -459,25 +468,31 @@ PY
 
 ## 输出文件
 
-成功结果写入 `keys/`。默认包括：
+成功结果写入 `keys/`（默认不提交 Git）：
 
 ```text
-keys/accounts.txt
-keys/grok.txt
+keys/sso.txt                 # email:sso          ← convert 唯一 SSO 源
+keys/accounts.txt            # email:password     ← 重登
+keys/grok.txt                # SSO token 列表（由 sso.txt 生成）
 keys/auth-sessions.jsonl
-keys/sub2api/accounts.sub2api.json
-keys/sub2api/xai-*.sub2api.json
+keys/browser-fingerprints.json
+keys/cpa/xai-*.json          # 协议授权后的成品 CPA
+keys/sub2api/…               # 可选
 ```
 
-`accounts.txt` 每行格式：
+`sso.txt` 每行：
 
 ```text
-email:password:sso_token
+email:sso_token
 ```
 
-`keys/` 目录包含运行结果，默认不会提交到 Git。
+`accounts.txt` 每行（仅账密）：
 
-协议授权（`sso_export convert` / 面板 SSO→CPA）成功后写入：
+```text
+email:password
+```
+
+协议授权（`sso.export convert` / `auth-service` / 面板 SSO→CPA）成功后写入：
 
 ```text
 keys/cpa/xai-*.json
@@ -557,12 +572,17 @@ python3 -m pytest tests -q
 ## xAI 协议认证（SSO→CPA）
 
 `bash auth-service.sh` = **Go 协议**（grok2api `sso_build`，多并发 + 可选多 IP），  
-把注册产出的 SSO 转成 `keys/cpa/xai-*.json`（含 **access + refresh**）。
+读取 **`keys/sso.txt`**（`email:sso`）转成 `keys/cpa/xai-*.json`（含 **access + refresh**）。
 
 ```bash
-bash auth-service.sh                              # 守护：有 pending 就转
+# 文件分工
+# keys/sso.txt       email:sso          ← convert 唯一 SSO 源（一邮箱一行）
+# keys/accounts.txt  email:password     ← 重登用
+# keys/grok.txt      纯 token 列表      ← 由 sso.txt 生成
+
 bash auth-service.sh --once --limit 500 --workers 16
-bash auth-service.sh --sso-file old_accounts.txt --proxy-file 代理.txt
+bash scripts/sso-relogin.sh --limit 20 --workers 2   # 重登：删旧 SSO 写新 email:sso
+python -m grok_register.sso.export convert --formats cpa --limit 500 --workers 16
 ```
 
 **refresh_token 怎么来的**：Device Flow 申请 scope 带 `offline_access`，  

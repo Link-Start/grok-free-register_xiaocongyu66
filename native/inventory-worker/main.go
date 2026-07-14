@@ -271,6 +271,13 @@ func cmdConvert(args []string) int {
 	legacy := loadLegacyAccounts(keys)
 	sessions := loadAuthSessions(keys)
 
+	// Default SSO source: keys/sso.txt (email:sso). Explicit --sso-file overrides path.
+	if *ssoFile == "" {
+		def := filepath.Join(keys, "sso.txt")
+		if fileExists(def) {
+			*ssoFile = def
+		}
+	}
 	// Optional batch SSO file overrides / injects tokens (newest-last order).
 	if *ssoFile != "" {
 		batch := loadSSOBatchFile(*ssoFile)
